@@ -171,7 +171,13 @@ async def _clear_inactive_connections(
         state = await diagnose_stuck_state(
             device.address, adapter, adapters=search_adapters
         )
-        if state != StuckState.NOT_STUCK:
+        # Only clear actual connection anomalies pre-attempt.
+        # STALE_CACHE (device in D-Bus, not connected, no HCI handle)
+        # is the normal state of a freshly-scanned device — clearing it
+        # here would invalidate the BLEDevice reference and cause the
+        # connection attempt to fail with "device disappeared".
+        # STALE_CACHE is handled post-failure instead.
+        if state not in (StuckState.NOT_STUCK, StuckState.STALE_CACHE):
             _LOGGER.info(
                 "%s: Pre-attempt diagnostics found %s, clearing",
                 device.address,
