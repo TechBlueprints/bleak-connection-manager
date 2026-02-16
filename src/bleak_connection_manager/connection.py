@@ -267,7 +267,10 @@ async def _execute_escalation(
         state = await diagnose_stuck_state(
             device.address, adapter, adapters=adapters
         )
-        if state != StuckState.NOT_STUCK:
+        # Only clear actual connection anomalies, not STALE_CACHE.
+        # STALE_CACHE is the normal state of a freshly-scanned device;
+        # removing it invalidates the BLEDevice reference.
+        if state not in (StuckState.NOT_STUCK, StuckState.STALE_CACHE):
             await clear_stuck_state(
                 device.address, adapter, state, adapters=adapters
             )
