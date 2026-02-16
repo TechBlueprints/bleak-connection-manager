@@ -476,8 +476,12 @@ async def establish_connection(
                 # --- InProgress classification ---
                 if "InProgress" in str(exc):
                     await _handle_inprogress(device, adapter)
-                else:
-                    # --- Clear stale state for next retry ---
+                elif attempt == max_attempts:
+                    # Only clear stale state on the final attempt.
+                    # Clearing between retries removes the device from
+                    # BlueZ D-Bus, invalidating the BLEDevice reference
+                    # and causing all subsequent attempts to fail with
+                    # "device disappeared".
                     await _clear_stale_state(device)
 
                 # --- Escalation ---
