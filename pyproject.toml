@@ -1,0 +1,37 @@
+[project]
+name = "bleak-connection-manager"
+version = "0.1.0"
+description = "Robust BLE connection lifecycle manager wrapping bleak-retry-connector with BlueZ workarounds"
+authors = [{ name = "TechBlueprints" }]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bleak>=0.21.0",
+    "bleak-retry-connector>=4.0.0",
+    "bluetooth-adapters>=0.16.0",
+    "bluetooth-auto-recovery>=1.2.0",
+    "dbus-fast>=1.86.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+"Repository" = "https://github.com/TechBlueprints/bleak-connection-manager"
+"Bug Tracker" = "https://github.com/TechBlueprints/bleak-connection-manager/issues"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
