@@ -129,7 +129,7 @@ async def acquire_scan_lock(
         if elapsed >= config.lock_timeout:
             _LOGGER.warning(
                 "Timed out waiting for scan lock on %s after %.1f s "
-                "— proceeding without lock",
+                "— scan lock not acquired",
                 adapter,
                 elapsed,
             )

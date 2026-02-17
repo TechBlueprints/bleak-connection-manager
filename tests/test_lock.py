@@ -10,6 +10,7 @@ from bleak_connection_manager.const import LockConfig
 from bleak_connection_manager.lock import (
     acquire_lock,
     acquire_slot,
+    probe_free_slots,
     release_lock,
     release_slot,
 )
@@ -237,3 +238,64 @@ def test_lock_config_custom():
     )
     assert config.max_slots == 4
     assert config.lock_dir == "/tmp/test"
+
+
+# ── probe_free_slots tests ─────────────────────────────────────────
+
+
+def test_probe_free_slots_all_free():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = LockConfig(
+            enabled=True,
+            lock_dir=tmpdir,
+            max_slots=3,
+        )
+        free = probe_free_slots(config, "hci0")
+        assert free == 3
+
+
+@pytest.mark.asyncio
+async def test_probe_free_slots_some_held():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = LockConfig(
+            enabled=True,
+            lock_dir=tmpdir,
+            max_slots=3,
+        )
+        # Hold 2 of 3 slots
+        fd1 = await acquire_slot(config, "hci0")
+        fd2 = await acquire_slot(config, "hci0")
+        assert fd1 is not None
+        assert fd2 is not None
+
+        free = probe_free_slots(config, "hci0")
+        assert free == 1
+
+        release_slot(fd1)
+        release_slot(fd2)
+
+
+@pytest.mark.asyncio
+async def test_probe_free_slots_all_held():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = LockConfig(
+            enabled=True,
+            lock_dir=tmpdir,
+            max_slots=2,
+        )
+        fd1 = await acquire_slot(config, "hci0")
+        fd2 = await acquire_slot(config, "hci0")
+        assert fd1 is not None
+        assert fd2 is not None
+
+        free = probe_free_slots(config, "hci0")
+        assert free == 0
+
+        release_slot(fd1)
+        release_slot(fd2)
+
+
+def test_probe_free_slots_disabled():
+    config = LockConfig(enabled=False, max_slots=3)
+    free = probe_free_slots(config, "hci0")
+    assert free == 3  # assumes all free when disabled

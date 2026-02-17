@@ -175,6 +175,13 @@ class EscalationPolicy:
         """Record a success — resets the failure counter for *adapter*."""
         self._failures[adapter] = 0
 
+    def failure_count(self, adapter: str) -> int:
+        """Return the current consecutive failure count for *adapter*.
+
+        Used by adapter scoring to penalize adapters with recent failures.
+        """
+        return self._failures.get(adapter, 0)
+
     def record_reset(self, adapter: str) -> None:
         """Record that an adapter reset was performed."""
         self._last_reset[adapter] = time.monotonic()

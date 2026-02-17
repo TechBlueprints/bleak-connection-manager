@@ -403,12 +403,6 @@ async def establish_connection(
     """
     display_name = name or device.name or device.address
 
-    # Ensure BlueZ is available before any BLE operations.  On Venus OS
-    # our service may start before bluetoothd registers on D-Bus.
-    if IS_LINUX:
-        from .dbus_bus import wait_for_bluez
-        await wait_for_bluez()
-
     async def _do_establish() -> BleakClient:
         # Auto-discover adapters if not provided
         nonlocal adapters
@@ -520,27 +514,18 @@ async def establish_connection(
                 if validate_connection is not None:
                     valid = await _safe_validate(validate_connection, client)
 
-                    if not valid:
-                        # Some BLE peripherals (especially budget chips like
-                        # Telink TLSR8266) resolve standard services quickly
-                        # but need additional time for vendor-specific GATT
-                        # services to appear.  BlueZ may fire ServicesResolved
-                        # after discovering only the mandatory Generic Attribute
-                        # service, before vendor-specific services are ready.
+                    if not valid and IS_LINUX:
+                        # Some BLE devices (especially Telink-based chips)
+                        # report ServicesResolved before all GATT services
+                        # are registered on D-Bus.  The Generic Attribute
+                        # service appears first, then vendor-specific
+                        # services arrive 2-10s later via InterfacesAdded
+                        # or Service Changed indication.
                         #
-                        # The device may send a "Service Changed" indication
-                        # which triggers BlueZ to re-discover services.  Or
-                        # the InterfacesAdded signals for vendor services may
-                        # arrive slightly after ServicesResolved.  Either way,
-                        # we wait and re-read the service table from the BlueZ
-                        # manager (which is updated in real-time via D-Bus).
-                        #
-                        # Waits escalate: 2s, 4s, 8s (14s total).  Telink
-                        # chips in particular can take 5-10s for vendor
-                        # services to register after ServicesResolved fires.
+                        # Wait with escalating delays and re-read the GATT
+                        # service table from BlueZ each time.
                         cumulative = 0.0
                         for retry_wait in (2.0, 4.0, 8.0):
-                            # Check the BLE link is still alive before waiting.
                             if not client.is_connected:
                                 _LOGGER.info(
                                     "%s: BLE link dropped during GATT retry "
@@ -564,12 +549,12 @@ async def establish_connection(
                             await asyncio.sleep(retry_wait)
 
                             # Force bleak to re-read services from BlueZ.
-                            # Clear the cached service collection so
-                            # _get_services() rebuilds it from the manager's
-                            # current D-Bus property state.
+                            # Clear the backend's cached service collection
+                            # (not the wrapper's @property) so _get_services()
+                            # rebuilds it from BlueZ's current D-Bus state.
                             try:
-                                client.services = None  # type: ignore[assignment]
-                                await client._get_services(  # type: ignore[attr-defined]
+                                client._backend.services = None  # type: ignore[union-attr]
+                                await client._backend._get_services(  # type: ignore[union-attr]
                                     dangerous_use_bleak_cache=False,
                                 )
                             except Exception:
@@ -622,17 +607,7 @@ async def establish_connection(
 
                         await _clear_stale_state(device)
                         if attempt < max_attempts:
-                            # After disconnecting a device whose GATT
-                            # validation failed even after retries, the
-                            # peripheral needs time to notice the link is
-                            # gone and restart advertising.  BLE peripherals
-                            # typically need 5+ seconds for this.
-                            _LOGGER.debug(
-                                "%s: Waiting for peripheral to restart "
-                                "advertising after validation failure",
-                                display_name,
-                            )
-                            await asyncio.sleep(5.0)
+                            await asyncio.sleep(0.25)
                         continue
 
                 # --- Success ---

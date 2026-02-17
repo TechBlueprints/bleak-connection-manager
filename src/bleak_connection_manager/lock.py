@@ -137,6 +137,43 @@ def release_slot(fd: int | None) -> None:
         _LOGGER.debug("Failed to release BLE slot", exc_info=True)
 
 
+def probe_free_slots(lock_config: LockConfig, adapter: str | None) -> int:
+    """Count how many connection slots are currently free for *adapter*.
+
+    Tries each slot file with ``flock(LOCK_NB)``.  Slots that can be
+    locked are immediately unlocked and counted as free.  Slots held by
+    other processes are counted as busy.
+
+    This is a **non-blocking snapshot** — the counts may change by the
+    time the caller acts on them.  Use this for scoring / prioritization,
+    not for hard guarantees.
+
+    Returns the number of free slots (0 … max_slots).
+    """
+    if not _HAS_FCNTL or not lock_config.enabled:
+        return lock_config.max_slots  # assume all free when locking disabled
+
+    free = 0
+    for slot_idx in range(lock_config.max_slots):
+        slot_path = lock_config.path_for_slot(adapter, slot_idx)
+        try:
+            fd = os.open(slot_path, os.O_CREAT | os.O_RDWR, 0o666)
+        except OSError:
+            continue
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Got the lock — slot is free.  Release immediately.
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            free += 1
+        except OSError:
+            pass  # Slot held by another process
+        finally:
+            os.close(fd)
+
+    return free
+
+
 # Backwards-compatible aliases
 acquire_lock = acquire_slot
 release_lock = release_slot

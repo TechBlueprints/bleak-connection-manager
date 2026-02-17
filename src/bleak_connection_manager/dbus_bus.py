@@ -49,6 +49,7 @@ from .const import IS_LINUX
 _LOGGER = logging.getLogger(__name__)
 
 _bus: object | None = None  # dbus_fast.aio.MessageBus, typed loosely to avoid import on non-Linux
+_bus_loop: object | None = None  # The event loop the bus was created on
 _bluez_ready = False  # Set True once we've confirmed org.bluez is on D-Bus
 
 
@@ -57,10 +58,16 @@ async def get_bus():
 
     Returns a connected ``dbus_fast.aio.MessageBus`` instance.
 
+    If the running event loop differs from the one the bus was created
+    on, the old bus is discarded and a fresh one is created.  This
+    prevents ``Future attached to a different loop`` RuntimeErrors when
+    the caller's event loop changes (e.g. ``asyncio.run()`` creates a
+    new loop between calls).
+
     Raises ``ImportError`` if ``dbus-fast`` is not available, or
     ``RuntimeError`` on non-Linux platforms.
     """
-    global _bus
+    global _bus, _bus_loop
 
     if not IS_LINUX:
         raise RuntimeError("Shared D-Bus bus is only available on Linux")
@@ -68,12 +75,26 @@ async def get_bus():
     from dbus_fast.aio import MessageBus
     from dbus_fast.constants import BusType
 
+    current_loop = asyncio.get_running_loop()
+
     if _bus is not None:
-        if _bus.connected:
+        if _bus_loop is not current_loop:
+            _LOGGER.debug(
+                "Shared D-Bus bus was created on a different event loop, "
+                "reconnecting on current loop"
+            )
+            try:
+                _bus.disconnect()
+            except Exception:
+                pass
+            _bus = None
+        elif _bus.connected:
             return _bus
-        _LOGGER.debug("Shared D-Bus bus disconnected, reconnecting")
+        else:
+            _LOGGER.debug("Shared D-Bus bus disconnected, reconnecting")
 
     _bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    _bus_loop = current_loop
     _LOGGER.debug("Shared D-Bus bus connected")
     return _bus
 
@@ -168,10 +189,11 @@ async def close_bus() -> None:
 
     Safe to call even if no bus was ever created.
     """
-    global _bus
+    global _bus, _bus_loop
     if _bus is not None:
         try:
             _bus.disconnect()
         except Exception:
             pass
         _bus = None
+        _bus_loop = None
