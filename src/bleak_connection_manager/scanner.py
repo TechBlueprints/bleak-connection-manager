@@ -74,40 +74,66 @@ async def _diagnose_inprogress(adapter: str, address: str) -> None:
       previous scan that was never properly cleaned up.
     - Connected device count can reveal if the adapter is saturated.
 
-    This is diagnostic-only — it never modifies state.
+    This is diagnostic-only — it never modifies state.  Uses the shared
+    bus from :mod:`.dbus_bus` with raw ``bus.call()`` — no proxy objects,
+    no introspection, no fire-and-forget ``AddMatch``.
     """
     if not IS_LINUX:
         return
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
+        from dbus_fast import Message, MessageType
 
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            adapter_path = f"/org/bluez/{adapter}"
-            introspect = await bus.introspect("org.bluez", adapter_path)
-            proxy = bus.get_proxy_object("org.bluez", adapter_path, introspect)
-            props = proxy.get_interface("org.freedesktop.DBus.Properties")
+        from .dbus_bus import get_bus
 
-            discovering = await props.call_get(
-                "org.bluez.Adapter1", "Discovering"
-            )
-            powered = await props.call_get(
-                "org.bluez.Adapter1", "Powered"
-            )
-            disc_val = discovering.value if hasattr(discovering, "value") else discovering
-            pow_val = powered.value if hasattr(powered, "value") else powered
+        bus = await get_bus()
+        adapter_path = f"/org/bluez/{adapter}"
 
-            _LOGGER.warning(
-                "%s: InProgress on %s — adapter state: "
-                "Powered=%s, Discovering=%s. "
-                "If Discovering=False, BlueZ has stale internal scan state "
-                "from a previous failed scan (likely our own code or vesmart). "
-                "If Discovering=True, another process holds a discovery session.",
-                address, adapter, pow_val, disc_val,
+        discovering_reply = await bus.call(
+            Message(
+                destination="org.bluez",
+                path=adapter_path,
+                interface="org.freedesktop.DBus.Properties",
+                member="Get",
+                signature="ss",
+                body=["org.bluez.Adapter1", "Discovering"],
             )
-        finally:
-            bus.disconnect()
+        )
+        powered_reply = await bus.call(
+            Message(
+                destination="org.bluez",
+                path=adapter_path,
+                interface="org.freedesktop.DBus.Properties",
+                member="Get",
+                signature="ss",
+                body=["org.bluez.Adapter1", "Powered"],
+            )
+        )
+
+        if (
+            discovering_reply.message_type == MessageType.ERROR
+            or powered_reply.message_type == MessageType.ERROR
+        ):
+            _LOGGER.debug(
+                "%s: D-Bus error querying adapter %s state",
+                address, adapter,
+            )
+            return
+
+        disc_val = discovering_reply.body[0]
+        if hasattr(disc_val, "value"):
+            disc_val = disc_val.value
+        pow_val = powered_reply.body[0]
+        if hasattr(pow_val, "value"):
+            pow_val = pow_val.value
+
+        _LOGGER.warning(
+            "%s: InProgress on %s — adapter state: "
+            "Powered=%s, Discovering=%s. "
+            "If Discovering=False, BlueZ has stale internal scan state "
+            "from a previous failed scan (likely our own code or vesmart). "
+            "If Discovering=True, another process holds a discovery session.",
+            address, adapter, pow_val, disc_val,
+        )
     except Exception:
         _LOGGER.debug(
             "%s: Could not query %s adapter state for InProgress diagnosis",
@@ -117,45 +143,55 @@ async def _diagnose_inprogress(adapter: str, address: str) -> None:
 
 
 async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
-    """Check if BlueZ already has a cached device entry from another scanner."""
+    """Check if BlueZ already has a cached device entry from another scanner.
+
+    Uses the shared bus from :mod:`.dbus_bus` with raw ``bus.call()`` —
+    no proxy objects, no introspection, no fire-and-forget ``AddMatch``.
+    """
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast import BusType
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
     except ImportError:
         return None
 
     addr_path_suffix = address.upper().replace(":", "_")
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-    try:
-        introspect = await bus.introspect("org.bluez", "/")
-        proxy = bus.get_proxy_object("org.bluez", "/", introspect)
-        iface = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
-        objects = await iface.call_get_managed_objects()
+    bus = await get_bus()
 
-        for path, interfaces in objects.items():
-            if not path.endswith(addr_path_suffix):
-                continue
-            dev_props = interfaces.get("org.bluez.Device1", {})
-            if not dev_props:
-                continue
-            dev_addr = dev_props.get("Address", {})
-            if hasattr(dev_addr, "value"):
-                dev_addr = dev_addr.value
-            dev_name = dev_props.get("Name", {})
-            if hasattr(dev_name, "value"):
-                dev_name = dev_name.value
-            dev_rssi = dev_props.get("RSSI", {})
-            if hasattr(dev_rssi, "value"):
-                dev_rssi = dev_rssi.value
-            if isinstance(dev_addr, str) and dev_addr.upper() == address.upper():
-                return BLEDevice(
-                    address=dev_addr,
-                    name=dev_name if isinstance(dev_name, str) else None,
-                    rssi=dev_rssi if isinstance(dev_rssi, int) else 0,
-                    details={"path": path},
-                )
-    finally:
-        bus.disconnect()
+    reply = await bus.call(
+        Message(
+            destination="org.bluez",
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="GetManagedObjects",
+        )
+    )
+    if reply.message_type == MessageType.ERROR:
+        return None
+
+    objects = reply.body[0]
+    for path, interfaces in objects.items():
+        if not path.endswith(addr_path_suffix):
+            continue
+        dev_props = interfaces.get("org.bluez.Device1", {})
+        if not dev_props:
+            continue
+        dev_addr = dev_props.get("Address", {})
+        if hasattr(dev_addr, "value"):
+            dev_addr = dev_addr.value
+        dev_name = dev_props.get("Name", {})
+        if hasattr(dev_name, "value"):
+            dev_name = dev_name.value
+        dev_rssi = dev_props.get("RSSI", {})
+        if hasattr(dev_rssi, "value"):
+            dev_rssi = dev_rssi.value
+        if isinstance(dev_addr, str) and dev_addr.upper() == address.upper():
+            return BLEDevice(
+                address=dev_addr,
+                name=dev_name if isinstance(dev_name, str) else None,
+                rssi=dev_rssi if isinstance(dev_rssi, int) else 0,
+                details={"path": path},
+            )
 
     return None
 
@@ -197,6 +233,12 @@ async def find_device(
     BLEDevice | None
         The found device, or ``None`` if not found after all attempts.
     """
+    # Ensure BlueZ is available before any BLE operations.  On Venus OS
+    # our service may start before bluetoothd registers on D-Bus.
+    if IS_LINUX:
+        from .dbus_bus import wait_for_bluez
+        await wait_for_bluez()
+
     if adapters is None and IS_LINUX:
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]
@@ -401,6 +443,11 @@ async def discover(
     list[BLEDevice]
         List of discovered devices.  May be empty if all attempts fail.
     """
+    # Ensure BlueZ is available before any BLE operations.
+    if IS_LINUX:
+        from .dbus_bus import wait_for_bluez
+        await wait_for_bluez()
+
     if adapters is None and IS_LINUX:
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]

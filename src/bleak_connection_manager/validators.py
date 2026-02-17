@@ -79,8 +79,9 @@ def validate_char_exists(
 
     async def _validator(client: BleakClient) -> bool:
         if not client.services:
-            _LOGGER.debug(
-                "validate_char_exists(%s): GATT services empty for %s",
+            _LOGGER.warning(
+                "validate_char_exists(%s): GATT services empty for %s — "
+                "ServicesResolved fired but no services discovered",
                 uuid,
                 client.address,
             )
@@ -91,10 +92,23 @@ def validate_char_exists(
                 if char.uuid.lower() == target:
                     return True
 
-        _LOGGER.debug(
-            "validate_char_exists(%s): characteristic not found for %s",
+        found_services = []
+        found_chars = []
+        for service in client.services:
+            found_services.append(service.uuid)
+            for char in service.characteristics:
+                found_chars.append(char.uuid)
+
+        _LOGGER.warning(
+            "validate_char_exists(%s): characteristic NOT FOUND for %s — "
+            "GATT has %d services, %d characteristics. "
+            "Services: %s | Characteristics: %s",
             uuid,
             client.address,
+            len(found_services),
+            len(found_chars),
+            ", ".join(found_services),
+            ", ".join(found_chars),
         )
         return False
 

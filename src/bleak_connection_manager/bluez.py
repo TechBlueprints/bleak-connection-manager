@@ -1,8 +1,9 @@
 """BlueZ D-Bus utilities for connection state inspection.
 
 Provides functions to detect phantom/inactive BLE connections and
-construct BlueZ D-Bus object paths.  Uses ``dbus-fast`` directly
-for D-Bus queries — the same library bleak uses internally.
+construct BlueZ D-Bus object paths.  Uses the shared ``MessageBus``
+from :mod:`.dbus_bus` and raw ``bus.call()`` for all queries — no
+proxy objects, no introspection, no fire-and-forget ``AddMatch``.
 
 These functions fill a gap: ``bleak-retry-connector`` does not expose
 connection state inspection, and ``bleak`` itself does not provide
@@ -22,6 +23,8 @@ _LOGGER = logging.getLogger(__name__)
 # D-Bus constants
 _BLUEZ_SERVICE = "org.bluez"
 _DEVICE_INTERFACE = "org.bluez.Device1"
+_ADAPTER_INTERFACE = "org.bluez.Adapter1"
+_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 _OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 
 
@@ -49,8 +52,9 @@ async def _get_device_properties(
         return None
 
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
     except ImportError:
         _LOGGER.debug("dbus-fast not available, cannot query D-Bus")
         return None
@@ -58,17 +62,20 @@ async def _get_device_properties(
     path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            introspection = await bus.introspect(_BLUEZ_SERVICE, path)
-            proxy = bus.get_proxy_object(_BLUEZ_SERVICE, path, introspection)
-            props_iface = proxy.get_interface(
-                "org.freedesktop.DBus.Properties"
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path=path,
+                interface=_PROPERTIES_INTERFACE,
+                member="GetAll",
+                signature="s",
+                body=[_DEVICE_INTERFACE],
             )
-            props = await props_iface.call_get_all(_DEVICE_INTERFACE)
-            return {k: v.value for k, v in props.items()}
-        finally:
-            bus.disconnect()
+        )
+        if reply.message_type == MessageType.ERROR:
+            return None
+        return {k: v.value for k, v in reply.body[0].items()}
     except Exception:
         _LOGGER.debug(
             "Failed to get D-Bus properties for %s on %s",
@@ -133,8 +140,9 @@ async def remove_device(address: str, adapter: str = "hci0") -> bool:
         return False
 
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
     except ImportError:
         return False
 
@@ -142,18 +150,26 @@ async def remove_device(address: str, adapter: str = "hci0") -> bool:
     device_path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            introspection = await bus.introspect(_BLUEZ_SERVICE, adapter_path)
-            proxy = bus.get_proxy_object(
-                _BLUEZ_SERVICE, adapter_path, introspection
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path=adapter_path,
+                interface=_ADAPTER_INTERFACE,
+                member="RemoveDevice",
+                signature="o",
+                body=[device_path],
             )
-            adapter_iface = proxy.get_interface("org.bluez.Adapter1")
-            await adapter_iface.call_remove_device(device_path)
-            _LOGGER.debug("Removed device %s from %s", address, adapter)
-            return True
-        finally:
-            bus.disconnect()
+        )
+        if reply.message_type == MessageType.ERROR:
+            _LOGGER.debug(
+                "RemoveDevice D-Bus error for %s: %s",
+                address,
+                reply.body[0] if reply.body else "unknown",
+            )
+            return False
+        _LOGGER.debug("Removed device %s from %s", address, adapter)
+        return True
     except Exception:
         _LOGGER.debug(
             "Failed to remove %s from %s",
@@ -173,24 +189,33 @@ async def disconnect_device(address: str, adapter: str = "hci0") -> bool:
         return False
 
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
     except ImportError:
         return False
 
     path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            introspection = await bus.introspect(_BLUEZ_SERVICE, path)
-            proxy = bus.get_proxy_object(_BLUEZ_SERVICE, path, introspection)
-            device_iface = proxy.get_interface(_DEVICE_INTERFACE)
-            await device_iface.call_disconnect()
-            _LOGGER.debug("Disconnected %s on %s via D-Bus", address, adapter)
-            return True
-        finally:
-            bus.disconnect()
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path=path,
+                interface=_DEVICE_INTERFACE,
+                member="Disconnect",
+            )
+        )
+        if reply.message_type == MessageType.ERROR:
+            _LOGGER.debug(
+                "Disconnect D-Bus error for %s: %s",
+                address,
+                reply.body[0] if reply.body else "unknown",
+            )
+            return False
+        _LOGGER.debug("Disconnected %s on %s via D-Bus", address, adapter)
+        return True
     except Exception:
         _LOGGER.debug(
             "Failed to disconnect %s on %s",
