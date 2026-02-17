@@ -32,7 +32,12 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-from .adapters import discover_adapters, make_device_for_adapter, pick_adapter
+from .adapters import (
+    discover_adapters,
+    make_device_for_adapter,
+    pick_adapter,
+    select_best_adapter,
+)
 from .bluez import (
     disconnect_device,
     is_inactive_connection,
@@ -425,7 +430,21 @@ async def establish_connection(
 
         async with device_lock:
             for attempt in range(1, max_attempts + 1):
-                adapter = pick_adapter(effective_adapters, attempt)
+                # Score-based adapter selection when we have enough
+                # context (escalation policy provides failure data,
+                # lock_config provides slot data).  Falls back to
+                # round-robin for the simple single-adapter case.
+                if (
+                    len(effective_adapters) > 1
+                    and escalation_policy is not None
+                ):
+                    adapter = select_best_adapter(
+                        effective_adapters,
+                        escalation_policy=escalation_policy,
+                        lock_config=lock_config,
+                    )
+                else:
+                    adapter = pick_adapter(effective_adapters, attempt)
 
                 # --- Pre-attempt: phantom detection ---
                 if close_inactive_connections and IS_LINUX:

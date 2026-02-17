@@ -196,6 +196,39 @@ async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
     return None
 
 
+# How often to re-check the BlueZ cache while waiting for another
+# process's scan to populate it.
+_CACHE_POLL_INTERVAL = 0.5
+
+
+async def _poll_cache_while_locked(
+    address: str,
+    wait_seconds: float,
+) -> BLEDevice | None:
+    """Poll the BlueZ D-Bus cache while another process holds the scan lock.
+
+    When the scan lock is busy, we know another process is running
+    ``StartDiscovery``.  Its results will appear in the shared BlueZ
+    D-Bus object tree.  Rather than wait for the lock and scan again
+    ourselves, we poll the cache — if the other process finds our
+    device, we can return it without ever scanning.
+
+    Returns the cached ``BLEDevice`` if found, or ``None`` after
+    *wait_seconds* expires.
+    """
+    elapsed = 0.0
+    while elapsed < wait_seconds:
+        await asyncio.sleep(_CACHE_POLL_INTERVAL)
+        elapsed += _CACHE_POLL_INTERVAL
+        try:
+            cached = await _find_in_bluez_cache(address)
+            if cached is not None:
+                return cached
+        except Exception:
+            pass  # Cache lookup failed — keep polling
+    return None
+
+
 async def find_device(
     address: str,
     *,
@@ -205,10 +238,26 @@ async def find_device(
     scan_lock_config: ScanLockConfig | None = None,
     **scanner_kwargs: Any,
 ) -> BLEDevice | None:
-    """Find a BLE device by address with automatic adapter rotation.
+    """Find a BLE device by address with cache-first strategy.
 
-    Drop-in replacement for ``BleakScanner.find_device_by_address()``
-    with scan lock, adapter rotation, and InProgress retry built in.
+    **Cache-first approach** (avoids ``StartDiscovery`` when possible):
+
+    1. Check the BlueZ D-Bus cache first.  If another process (or a
+       previous scan by this process) already discovered the device,
+       its ``Device1`` entry persists in BlueZ's object tree and we
+       return it immediately — **zero scanning overhead**.
+
+    2. If the cache misses, try to acquire the scan lock.  If the lock
+       is busy (another process is actively scanning), poll the cache
+       while waiting — that other process's scan results will appear
+       in the shared BlueZ cache.
+
+    3. Only if the cache remains empty *and* we hold the scan lock do
+       we actually call ``BleakScanner.find_device_by_address()``
+       (which triggers ``StartDiscovery``).
+
+    This eliminates the vast majority of ``StartDiscovery`` calls and
+    ``InProgress`` errors in multi-process environments.
 
     Parameters
     ----------
@@ -243,10 +292,33 @@ async def find_device(
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]
 
-    # Pre-scan phantom check: if BlueZ has a stale "Connected" entry
-    # for this device but HCI shows no actual connection, clear it.
-    # Without this, the peripheral thinks it's still connected and
-    # won't advertise, making all scan attempts fail.
+    # ── Step 1: Cache-first — check BlueZ D-Bus cache ─────────────
+    #
+    # If any process has previously scanned and found this device,
+    # BlueZ keeps a Device1 object in its cache.  We can return it
+    # directly without triggering StartDiscovery.
+    if IS_LINUX:
+        try:
+            cached = await _find_in_bluez_cache(address)
+            if cached is not None:
+                _LOGGER.debug(
+                    "%s: Found in BlueZ cache — scan avoided",
+                    address,
+                )
+                return cached
+        except Exception:
+            _LOGGER.debug(
+                "%s: BlueZ cache lookup failed, will scan",
+                address,
+                exc_info=True,
+            )
+
+    # ── Step 2: Pre-scan phantom check ─────────────────────────────
+    #
+    # If BlueZ has a stale "Connected" entry for this device but HCI
+    # shows no actual connection, clear it.  Without this, the
+    # peripheral thinks it's still connected and won't advertise,
+    # making all scan attempts fail.
     if IS_LINUX:
         try:
             primary_adapter = effective_adapters[0]
@@ -277,6 +349,13 @@ async def find_device(
                 exc_info=True,
             )
 
+    # ── Step 3: Scan with lock coordination ────────────────────────
+    #
+    # If the scan lock is busy, another process is scanning.  Poll
+    # the BlueZ cache while we wait — their scan results will show
+    # up in the shared cache.  Only scan ourselves if the cache
+    # stays empty and we acquire the lock.
+
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     last_error: Exception | None = None
 
@@ -286,22 +365,55 @@ async def find_device(
         # --- Try to acquire the scan lock for this adapter ---
         fd: int | None = None
         if scan_lock_config is not None and scan_lock_config.enabled:
-            lock_cfg_for_attempt = ScanLockConfig(
+            # Try non-blocking first (timeout=0)
+            instant_cfg = ScanLockConfig(
                 enabled=True,
                 lock_dir=scan_lock_config.lock_dir,
                 lock_template=scan_lock_config.lock_template,
-                lock_timeout=min(_LOCK_ATTEMPT_TIMEOUT, scan_lock_config.lock_timeout),
+                lock_timeout=0.0,
             )
-            fd = await acquire_scan_lock(lock_cfg_for_attempt, adapter)
-            if fd is None and len(effective_adapters) > 1:
+            fd = await acquire_scan_lock(instant_cfg, adapter)
+
+            if fd is None:
+                # Lock is busy — another process is scanning on this
+                # adapter.  Poll the BlueZ cache while waiting; their
+                # scan results will appear in the shared cache.
                 _LOGGER.debug(
-                    "%s: Scan lock busy on %s, rotating (attempt %d/%d)",
+                    "%s: Scan lock busy on %s, polling cache (attempt %d/%d)",
                     address,
                     adapter,
                     attempt,
                     max_attempts,
                 )
-                continue
+                cached = await _poll_cache_while_locked(
+                    address, _LOCK_ATTEMPT_TIMEOUT,
+                )
+                if cached is not None:
+                    _LOGGER.debug(
+                        "%s: Found in cache while another process scanned",
+                        address,
+                    )
+                    return cached
+
+                # Cache still empty — try the lock one more time with
+                # a short timeout before rotating.
+                short_cfg = ScanLockConfig(
+                    enabled=True,
+                    lock_dir=scan_lock_config.lock_dir,
+                    lock_template=scan_lock_config.lock_template,
+                    lock_timeout=min(
+                        _LOCK_ATTEMPT_TIMEOUT,
+                        scan_lock_config.lock_timeout,
+                    ),
+                )
+                fd = await acquire_scan_lock(short_cfg, adapter)
+                if fd is None and len(effective_adapters) > 1:
+                    _LOGGER.debug(
+                        "%s: Scan lock still busy on %s, rotating",
+                        address,
+                        adapter,
+                    )
+                    continue
 
         try:
             _LOGGER.debug(

@@ -114,6 +114,36 @@ def test_record_reset():
     assert action == EscalationAction.DIAGNOSE  # fresh start
 
 
+# ── failure_count tests ────────────────────────────────────────────
+
+
+def test_failure_count_initial():
+    policy = EscalationPolicy(["hci0", "hci1"])
+    assert policy.failure_count("hci0") == 0
+    assert policy.failure_count("hci1") == 0
+
+
+def test_failure_count_tracks():
+    policy = EscalationPolicy(["hci0"])
+    policy.on_failure("hci0")
+    assert policy.failure_count("hci0") == 1
+    policy.on_failure("hci0")
+    assert policy.failure_count("hci0") == 2
+
+
+def test_failure_count_resets_on_success():
+    policy = EscalationPolicy(["hci0"])
+    policy.on_failure("hci0")
+    policy.on_failure("hci0")
+    policy.on_success("hci0")
+    assert policy.failure_count("hci0") == 0
+
+
+def test_failure_count_unknown_adapter():
+    policy = EscalationPolicy(["hci0"])
+    assert policy.failure_count("hci99") == 0
+
+
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.recovery.IS_LINUX", False)
 async def test_reset_adapter_non_linux():
