@@ -61,6 +61,51 @@ def _is_inprogress(exc: BaseException) -> bool:
     return "inprogress" in err_str or "in progress" in err_str
 
 
+
+async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
+    """Check if BlueZ already has a cached device entry from another scanner."""
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast import BusType
+    except ImportError:
+        return None
+
+    addr_path_suffix = address.upper().replace(":", "_")
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        introspect = await bus.introspect("org.bluez", "/")
+        proxy = bus.get_proxy_object("org.bluez", "/", introspect)
+        iface = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+        objects = await iface.call_get_managed_objects()
+
+        for path, interfaces in objects.items():
+            if not path.endswith(addr_path_suffix):
+                continue
+            dev_props = interfaces.get("org.bluez.Device1", {})
+            if not dev_props:
+                continue
+            dev_addr = dev_props.get("Address", {})
+            if hasattr(dev_addr, "value"):
+                dev_addr = dev_addr.value
+            dev_name = dev_props.get("Name", {})
+            if hasattr(dev_name, "value"):
+                dev_name = dev_name.value
+            dev_rssi = dev_props.get("RSSI", {})
+            if hasattr(dev_rssi, "value"):
+                dev_rssi = dev_rssi.value
+            if isinstance(dev_addr, str) and dev_addr.upper() == address.upper():
+                return BLEDevice(
+                    address=dev_addr,
+                    name=dev_name if isinstance(dev_name, str) else None,
+                    rssi=dev_rssi if isinstance(dev_rssi, int) else 0,
+                    details={"path": path},
+                )
+    finally:
+        bus.disconnect()
+
+    return None
+
+
 async def find_device(
     address: str,
     *,
@@ -238,6 +283,25 @@ async def find_device(
 
         if attempt < max_attempts:
             await asyncio.sleep(_RETRY_BACKOFF)
+
+    # Last resort: if all scans hit InProgress, check BlueZ cache
+    if IS_LINUX and last_error is not None and _is_inprogress(last_error):
+        _LOGGER.info(
+            "%s: All scans failed with InProgress, checking BlueZ cache",
+            address,
+        )
+        try:
+            cached = await _find_in_bluez_cache(address)
+            if cached is not None:
+                _LOGGER.info(
+                    "%s: Found in BlueZ cache (bypassed InProgress)",
+                    address,
+                )
+                return cached
+        except Exception:
+            _LOGGER.debug(
+                "%s: BlueZ cache lookup failed", address, exc_info=True,
+            )
 
     if last_error is not None:
         _LOGGER.warning(
