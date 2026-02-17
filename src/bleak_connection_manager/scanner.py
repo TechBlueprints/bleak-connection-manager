@@ -29,6 +29,7 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
 from .adapters import discover_adapters, pick_adapter
+from .bluez import ensure_adapter_scan_ready, power_cycle_adapter
 from .const import IS_LINUX, ScanLockConfig
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .scan_lock import acquire_scan_lock, release_scan_lock
@@ -415,6 +416,36 @@ async def find_device(
                     )
                     continue
 
+        # ── Pre-scan adapter health check ──────────────────────────
+        #
+        # Verify the adapter is ready for scanning.  Detects and
+        # repairs stale Discovering=True and hidden InProgress states
+        # before BleakScanner runs.  Most reliable when holding the
+        # scan lock (no concurrent interference), but still useful
+        # without it to catch obviously stale adapters.
+        if IS_LINUX:
+            try:
+                ready = await ensure_adapter_scan_ready(adapter)
+                if not ready:
+                    _LOGGER.warning(
+                        "%s: Adapter %s not scan-ready, rotating "
+                        "(attempt %d/%d)",
+                        address,
+                        adapter,
+                        attempt,
+                        max_attempts,
+                    )
+                    release_scan_lock(fd)
+                    fd = None
+                    continue
+            except Exception:
+                _LOGGER.debug(
+                    "%s: Pre-scan health check failed on %s, proceeding",
+                    address,
+                    adapter,
+                    exc_info=True,
+                )
+
         try:
             _LOGGER.debug(
                 "%s: Scanning on %s (attempt %d/%d, timeout=%.1f s)",
@@ -467,6 +498,10 @@ async def find_device(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, address)
+                # Repair the adapter so the next attempt (or next
+                # process) doesn't hit the same stale state.
+                if IS_LINUX:
+                    await power_cycle_adapter(adapter)
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "%s: Scanner hard timeout on %s after %.0f s "
@@ -477,6 +512,11 @@ async def find_device(
                     attempt,
                     max_attempts,
                 )
+                # Hard timeout means BleakScanner never called
+                # StopDiscovery — the adapter is left in
+                # Discovering=True.  Power-cycle to clean up.
+                if IS_LINUX:
+                    await power_cycle_adapter(adapter)
             else:
                 _LOGGER.debug(
                     "%s: Scan error on %s: %s (attempt %d/%d)",
@@ -587,6 +627,28 @@ async def discover(
                 )
                 continue
 
+        # Pre-scan adapter health check
+        if IS_LINUX:
+            try:
+                ready = await ensure_adapter_scan_ready(adapter)
+                if not ready:
+                    _LOGGER.warning(
+                        "Adapter %s not scan-ready, rotating "
+                        "(attempt %d/%d)",
+                        adapter,
+                        attempt,
+                        max_attempts,
+                    )
+                    release_scan_lock(fd)
+                    fd = None
+                    continue
+            except Exception:
+                _LOGGER.debug(
+                    "Pre-scan health check failed on %s, proceeding",
+                    adapter,
+                    exc_info=True,
+                )
+
         try:
             _LOGGER.debug(
                 "Discovering on %s (attempt %d/%d, timeout=%.1f s)",
@@ -626,6 +688,8 @@ async def discover(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, "discover")
+                if IS_LINUX:
+                    await power_cycle_adapter(adapter)
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "Scanner hard timeout on %s after %.0f s "
@@ -635,6 +699,8 @@ async def discover(
                     attempt,
                     max_attempts,
                 )
+                if IS_LINUX:
+                    await power_cycle_adapter(adapter)
             else:
                 _LOGGER.debug(
                     "Scan error on %s: %s (attempt %d/%d)",
