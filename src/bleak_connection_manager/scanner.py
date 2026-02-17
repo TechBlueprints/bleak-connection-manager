@@ -29,7 +29,10 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
 from .adapters import discover_adapters, pick_adapter
-from .bluez import ensure_adapter_scan_ready, power_cycle_adapter
+from .bluez import (
+    _power_cycle_adapter_with_cooldown,
+    ensure_adapter_scan_ready,
+)
 from .const import IS_LINUX, ScanLockConfig
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .scan_lock import acquire_scan_lock, release_scan_lock
@@ -501,7 +504,7 @@ async def find_device(
                 # Repair the adapter so the next attempt (or next
                 # process) doesn't hit the same stale state.
                 if IS_LINUX:
-                    await power_cycle_adapter(adapter)
+                    await _power_cycle_adapter_with_cooldown(adapter)
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "%s: Scanner hard timeout on %s after %.0f s "
@@ -516,7 +519,7 @@ async def find_device(
                 # StopDiscovery — the adapter is left in
                 # Discovering=True.  Power-cycle to clean up.
                 if IS_LINUX:
-                    await power_cycle_adapter(adapter)
+                    await _power_cycle_adapter_with_cooldown(adapter)
             else:
                 _LOGGER.debug(
                     "%s: Scan error on %s: %s (attempt %d/%d)",
@@ -689,7 +692,7 @@ async def discover(
                 )
                 await _diagnose_inprogress(adapter, "discover")
                 if IS_LINUX:
-                    await power_cycle_adapter(adapter)
+                    await _power_cycle_adapter_with_cooldown(adapter)
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "Scanner hard timeout on %s after %.0f s "
@@ -700,7 +703,7 @@ async def discover(
                     max_attempts,
                 )
                 if IS_LINUX:
-                    await power_cycle_adapter(adapter)
+                    await _power_cycle_adapter_with_cooldown(adapter)
             else:
                 _LOGGER.debug(
                     "Scan error on %s: %s (attempt %d/%d)",

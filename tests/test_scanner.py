@@ -460,7 +460,7 @@ async def test_discover_extra_kwargs_passed(mock_scanner_cls):
 
 
 @pytest.mark.asyncio
-@patch("bleak_connection_manager.scanner.power_cycle_adapter", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
@@ -488,7 +488,7 @@ async def test_find_device_pre_scan_check_repairs(
 
 
 @pytest.mark.asyncio
-@patch("bleak_connection_manager.scanner.power_cycle_adapter", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
@@ -519,14 +519,14 @@ async def test_find_device_pre_scan_not_ready_rotates(
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
-@patch("bleak_connection_manager.scanner.power_cycle_adapter", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
 @patch("bleak_connection_manager.scanner.IS_LINUX", True)
 async def test_find_device_post_timeout_power_cycles(
     mock_scanner_cls, mock_cache, mock_cycle, mock_ready,
 ):
-    """Hard timeout triggers power-cycle cleanup."""
+    """Hard timeout triggers power-cycle cleanup via cooldown wrapper."""
     mock_cache.return_value = None
     mock_ready.return_value = True
     mock_cycle.return_value = True
@@ -549,14 +549,14 @@ async def test_find_device_post_timeout_power_cycles(
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
-@patch("bleak_connection_manager.scanner.power_cycle_adapter", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
 @patch("bleak_connection_manager.scanner.IS_LINUX", True)
 async def test_find_device_post_inprogress_power_cycles(
     mock_scanner_cls, mock_cache, mock_cycle, mock_ready,
 ):
-    """InProgress error triggers power-cycle repair."""
+    """InProgress error triggers power-cycle repair via cooldown wrapper."""
     mock_cache.return_value = None
     mock_ready.return_value = True
     mock_cycle.return_value = True
