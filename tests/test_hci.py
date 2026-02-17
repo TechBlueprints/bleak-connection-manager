@@ -1,99 +1,101 @@
-"""Tests for the hci module.
+"""Tests for the hci module (hcitool-based implementation).
 
-Since HCI sockets require Linux + CAP_NET_ADMIN, all tests mock the
-socket/ioctl layer.  This verifies the struct parsing, address
-formatting, and error handling without needing root privileges.
+All tests mock subprocess.run to simulate hcitool output, so they
+can run on any platform without root or hcitool installed.
 """
 
 from __future__ import annotations
 
-import ctypes
-import struct
-from unittest.mock import MagicMock, call, patch
+import subprocess
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bleak_connection_manager.hci import (
-    LE_LINK,
-    ACL_LINK,
-    MAX_CONN,
-    HCI_COMMAND_PKT,
-    HCI_OE_USER_ENDED,
-    OGF_LE_CTL,
-    OCF_LE_CREATE_CONN_CANCEL,
-    cancel_le_connect,
     HciConnection,
-    _adapter_to_dev_id,
-    _bdaddr_t,
-    _hci_conn_info,
-    _hci_conn_list_req,
+    _parse_hcitool_con,
+    cancel_le_connect,
     disconnect_by_address,
     disconnect_handle,
+    disconnect_reason_str,
     find_connection_by_address,
     get_connections,
+    hci_available,
 )
 
 
-# ── Helper to build mock ioctl data ────────────────────────────────
+# ── _parse_hcitool_con ────────────────────────────────────────────
 
 
-def _make_conn_list_buf(dev_id: int, connections: list[dict]) -> bytes:
-    """Build raw bytes matching _hci_conn_list_req with filled conn_info.
-
-    Each connection dict should have:
-      handle, address (str like "AA:BB:CC:DD:EE:FF"), type, out, state, link_mode
-    """
-    buf = _hci_conn_list_req()
-    buf.dev_id = dev_id
-    buf.conn_num = len(connections)
-    for i, conn in enumerate(connections):
-        info = buf.conn_info[i]
-        info.handle = conn["handle"]
-        addr_bytes = bytes(
-            int(x, 16) for x in reversed(conn["address"].split(":"))
-        )
-        ctypes.memmove(info.bdaddr.b, addr_bytes, 6)
-        info.type = conn["type"]
-        info.out = conn["out"]
-        info.state = conn["state"]
-        info.link_mode = conn["link_mode"]
-    return bytes(buf)
+def test_parse_empty_output():
+    assert _parse_hcitool_con("Connections:\n", "hci0") == []
 
 
-def _mock_ioctl_factory(dev_id: int, connections: list[dict]):
-    """Return a side_effect for fcntl.ioctl that fills the buffer."""
-    raw = _make_conn_list_buf(dev_id, connections)
-
-    def _ioctl(fd, request, buf):
-        ctypes.memmove(ctypes.addressof(buf), raw, len(raw))
-        return 0
-
-    return _ioctl
-
-
-# ── _adapter_to_dev_id ─────────────────────────────────────────────
-
-
-def test_adapter_to_dev_id():
-    assert _adapter_to_dev_id("hci0") == 0
-    assert _adapter_to_dev_id("hci1") == 1
-    assert _adapter_to_dev_id("hci12") == 12
+def test_parse_one_le_connection():
+    output = (
+        "Connections:\n"
+        "\t< LE AA:BB:CC:DD:EE:FF handle 64 state 1 lm MASTER\n"
+    )
+    result = _parse_hcitool_con(output, "hci0")
+    assert len(result) == 1
+    conn = result[0]
+    assert conn.handle == 64
+    assert conn.address == "AA:BB:CC:DD:EE:FF"
+    assert conn.link_type == 0x80
+    assert conn.link_type_name == "LE"
+    assert conn.outgoing is True
+    assert conn.state == 1
+    assert conn.adapter == "hci0"
 
 
-# ── _bdaddr_t.__str__ ─────────────────────────────────────────────
+def test_parse_incoming_acl():
+    output = (
+        "Connections:\n"
+        "\t> ACL 11:22:33:44:55:66 handle 42 state 1 lm SLAVE\n"
+    )
+    result = _parse_hcitool_con(output, "hci1")
+    assert len(result) == 1
+    conn = result[0]
+    assert conn.handle == 42
+    assert conn.address == "11:22:33:44:55:66"
+    assert conn.link_type == 0x01
+    assert conn.link_type_name == "ACL"
+    assert conn.outgoing is False
+    assert conn.adapter == "hci1"
 
 
-def test_bdaddr_str():
-    addr = _bdaddr_t()
-    # BlueZ stores addresses in little-endian byte order,
-    # so AA:BB:CC:DD:EE:FF is stored as [FF, EE, DD, CC, BB, AA]
-    addr.b[0] = 0xFF
-    addr.b[1] = 0xEE
-    addr.b[2] = 0xDD
-    addr.b[3] = 0xCC
-    addr.b[4] = 0xBB
-    addr.b[5] = 0xAA
-    assert str(addr) == "AA:BB:CC:DD:EE:FF"
+def test_parse_multiple_connections():
+    output = (
+        "Connections:\n"
+        "\t< LE AA:BB:CC:DD:EE:01 handle 64 state 1 lm MASTER\n"
+        "\t> ACL AA:BB:CC:DD:EE:02 handle 65 state 1 lm SLAVE\n"
+        "\t< LE AA:BB:CC:DD:EE:03 handle 66 state 1 lm MASTER\n"
+    )
+    result = _parse_hcitool_con(output, "hci0")
+    assert len(result) == 3
+    assert result[0].handle == 64
+    assert result[1].handle == 65
+    assert result[2].handle == 66
+
+
+def test_parse_lowercase_address():
+    output = (
+        "Connections:\n"
+        "\t< LE aa:bb:cc:dd:ee:ff handle 64 state 1 lm MASTER\n"
+    )
+    result = _parse_hcitool_con(output, "hci0")
+    assert len(result) == 1
+    assert result[0].address == "AA:BB:CC:DD:EE:FF"
+
+
+def test_parse_no_lm_field():
+    output = (
+        "Connections:\n"
+        "\t< LE AA:BB:CC:DD:EE:FF handle 64 state 1\n"
+    )
+    result = _parse_hcitool_con(output, "hci0")
+    assert len(result) == 1
+    assert result[0].handle == 64
 
 
 # ── HciConnection dataclass ───────────────────────────────────────
@@ -103,7 +105,7 @@ def test_hci_connection_frozen():
     conn = HciConnection(
         handle=64,
         address="AA:BB:CC:DD:EE:FF",
-        link_type=LE_LINK,
+        link_type=0x80,
         link_type_name="LE",
         outgoing=True,
         state=1,
@@ -117,131 +119,113 @@ def test_hci_connection_frozen():
         conn.handle = 99  # type: ignore[misc]
 
 
+# ── disconnect_reason_str ─────────────────────────────────────────
+
+
+def test_disconnect_reason_known():
+    assert "Connection Timeout" in disconnect_reason_str(0x08)
+    assert "0x08" in disconnect_reason_str(0x08)
+
+
+def test_disconnect_reason_unknown():
+    assert "Unknown" in disconnect_reason_str(0xFF)
+    assert "0xFF" in disconnect_reason_str(0xFF)
+
+
+# ── hci_available ─────────────────────────────────────────────────
+
+
+@patch("bleak_connection_manager.hci._HCITOOL", None)
+def test_hci_available_no_hcitool():
+    assert hci_available("hci0") is False
+
+
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_hci_available_success(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(returncode=0)
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+    assert hci_available("hci0") is True
+    mock_subprocess.run.assert_called_once()
+
+
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_hci_available_failure(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(returncode=1)
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+    assert hci_available("hci0") is False
+
+
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_hci_available_timeout(mock_subprocess):
+    mock_subprocess.run.side_effect = subprocess.TimeoutExpired(
+        cmd="hcitool", timeout=5.0,
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+    assert hci_available("hci0") is False
+
+
 # ── get_connections ────────────────────────────────────────────────
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", False)
-def test_get_connections_not_linux():
+@patch("bleak_connection_manager.hci._HCITOOL", None)
+def test_get_connections_no_hcitool():
     assert get_connections("hci0") == []
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", False)
-def test_get_connections_no_fcntl():
-    assert get_connections("hci0") == []
-
-
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-@patch("bleak_connection_manager.hci.fcntl")
-def test_get_connections_empty(mock_fcntl, mock_socket_mod):
-    """No connections on the adapter."""
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
-    mock_fcntl.ioctl.side_effect = _mock_ioctl_factory(0, [])
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_get_connections_empty(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(
+        returncode=0, stdout="Connections:\n",
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = get_connections("hci0")
     assert result == []
-    mock_sock.bind.assert_called_once_with((0,))
-    mock_sock.close.assert_called_once()
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-@patch("bleak_connection_manager.hci.fcntl")
-def test_get_connections_one_le(mock_fcntl, mock_socket_mod):
-    """One LE connection."""
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
-    mock_fcntl.ioctl.side_effect = _mock_ioctl_factory(0, [
-        {
-            "handle": 64,
-            "address": "AA:BB:CC:DD:EE:FF",
-            "type": LE_LINK,
-            "out": 1,
-            "state": 1,
-            "link_mode": 0,
-        }
-    ])
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_get_connections_one_le(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "Connections:\n"
+            "\t< LE AA:BB:CC:DD:EE:FF handle 64 state 1 lm MASTER\n"
+        ),
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
     result = get_connections("hci0")
     assert len(result) == 1
     conn = result[0]
     assert conn.handle == 64
     assert conn.address == "AA:BB:CC:DD:EE:FF"
-    assert conn.link_type == LE_LINK
     assert conn.link_type_name == "LE"
-    assert conn.outgoing is True
-    assert conn.adapter == "hci0"
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-@patch("bleak_connection_manager.hci.fcntl")
-def test_get_connections_multiple(mock_fcntl, mock_socket_mod):
-    """Multiple connections on different adapters."""
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
-    mock_fcntl.ioctl.side_effect = _mock_ioctl_factory(1, [
-        {
-            "handle": 64,
-            "address": "AA:BB:CC:DD:EE:01",
-            "type": LE_LINK,
-            "out": 1,
-            "state": 1,
-            "link_mode": 0,
-        },
-        {
-            "handle": 65,
-            "address": "AA:BB:CC:DD:EE:02",
-            "type": ACL_LINK,
-            "out": 0,
-            "state": 1,
-            "link_mode": 0,
-        },
-    ])
-
-    result = get_connections("hci1")
-    assert len(result) == 2
-    assert result[0].handle == 64
-    assert result[0].link_type_name == "LE"
-    assert result[1].handle == 65
-    assert result[1].link_type_name == "ACL"
-    assert result[1].outgoing is False
-
-
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_get_connections_permission_error(mock_socket_mod):
-    """PermissionError returns empty list, not exception."""
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.bind.side_effect = PermissionError("Operation not permitted")
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_get_connections_failure(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(
+        returncode=1, stderr="Can't get connection list",
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = get_connections("hci0")
     assert result == []
-    mock_sock.close.assert_called_once()
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_get_connections_os_error(mock_socket_mod):
-    """OSError (e.g. adapter not found) returns empty list."""
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.bind.side_effect = OSError("No such device")
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_get_connections_timeout(mock_subprocess):
+    mock_subprocess.run.side_effect = subprocess.TimeoutExpired(
+        cmd="hcitool", timeout=5.0,
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = get_connections("hci0")
     assert result == []
-    mock_sock.close.assert_called_once()
 
 
 # ── find_connection_by_address ─────────────────────────────────────
@@ -253,7 +237,7 @@ def test_find_connection_default_adapter(mock_get):
         HciConnection(
             handle=64,
             address="AA:BB:CC:DD:EE:FF",
-            link_type=LE_LINK,
+            link_type=0x80,
             link_type_name="LE",
             outgoing=True,
             state=1,
@@ -274,7 +258,7 @@ def test_find_connection_case_insensitive(mock_get):
         HciConnection(
             handle=64,
             address="AA:BB:CC:DD:EE:FF",
-            link_type=LE_LINK,
+            link_type=0x80,
             link_type_name="LE",
             outgoing=True,
             state=1,
@@ -294,7 +278,7 @@ def test_find_connection_not_found(mock_get):
         HciConnection(
             handle=64,
             address="11:22:33:44:55:66",
-            link_type=LE_LINK,
+            link_type=0x80,
             link_type_name="LE",
             outgoing=True,
             state=1,
@@ -309,14 +293,13 @@ def test_find_connection_not_found(mock_get):
 
 @patch("bleak_connection_manager.hci.get_connections")
 def test_find_connection_multiple_adapters(mock_get):
-    """Search across multiple adapters, found on second."""
     mock_get.side_effect = [
-        [],  # hci0 has no connections
+        [],
         [
             HciConnection(
                 handle=99,
                 address="AA:BB:CC:DD:EE:FF",
-                link_type=LE_LINK,
+                link_type=0x80,
                 link_type_name="LE",
                 outgoing=True,
                 state=1,
@@ -347,65 +330,31 @@ def test_find_connection_specific_adapter(mock_get):
 # ── disconnect_handle ──────────────────────────────────────────────
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", False)
-def test_disconnect_handle_not_linux():
+@patch("bleak_connection_manager.hci._HCITOOL", None)
+def test_disconnect_handle_no_hcitool():
     assert disconnect_handle("hci0", 64) is False
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_disconnect_handle_sends_command(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
-    result = disconnect_handle("hci0", 64, reason=HCI_OE_USER_ENDED)
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_disconnect_handle_success(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(returncode=0)
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+    result = disconnect_handle("hci0", 64)
     assert result is True
-
-    mock_sock.bind.assert_called_once_with((0,))
-    mock_sock.send.assert_called_once()
-
-    # Verify the command packet structure
-    sent_data = mock_sock.send.call_args[0][0]
-    assert sent_data[0] == HCI_COMMAND_PKT
-    # Opcode 0x0406 little-endian
-    assert sent_data[1] == 0x06
-    assert sent_data[2] == 0x04
-    # Param length = 3
-    assert sent_data[3] == 3
-    # Handle = 64 (0x0040) little-endian, masked to 12 bits
-    handle_bytes = struct.unpack("<H", sent_data[4:6])[0]
-    assert handle_bytes == 64
-    # Reason
-    assert sent_data[6] == HCI_OE_USER_ENDED
-
-    mock_sock.close.assert_called_once()
+    args = mock_subprocess.run.call_args[0][0]
+    assert args == ["/usr/bin/hcitool", "-i", "hci0", "ledc", "64"]
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_disconnect_handle_permission_error(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.bind.side_effect = PermissionError("Operation not permitted")
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_disconnect_handle_failure(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(
+        returncode=1, stderr="Disconnect failed",
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = disconnect_handle("hci0", 64)
     assert result is False
-    mock_sock.close.assert_called_once()
-
-
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_disconnect_handle_os_error(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.send.side_effect = OSError("Connection reset")
-
-    result = disconnect_handle("hci0", 64)
-    assert result is False
-    mock_sock.close.assert_called_once()
 
 
 # ── disconnect_by_address ──────────────────────────────────────────
@@ -417,7 +366,7 @@ def test_disconnect_by_address_found(mock_find, mock_disc):
     mock_find.return_value = HciConnection(
         handle=64,
         address="AA:BB:CC:DD:EE:FF",
-        link_type=LE_LINK,
+        link_type=0x80,
         link_type_name="LE",
         outgoing=True,
         state=1,
@@ -442,71 +391,39 @@ def test_disconnect_by_address_not_found(mock_find):
 # ── cancel_le_connect ──────────────────────────────────────────────
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", False)
-def test_cancel_le_connect_not_linux():
+@patch("bleak_connection_manager.hci._HCITOOL", None)
+def test_cancel_le_connect_no_hcitool():
     assert cancel_le_connect("hci0") is False
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_cancel_le_connect_sends_command(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_cancel_le_connect_success(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(returncode=0)
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = cancel_le_connect("hci0")
     assert result is True
-
-    mock_sock.bind.assert_called_once_with((0,))
-    mock_sock.send.assert_called_once()
-
-    # Verify the command packet structure
-    sent_data = mock_sock.send.call_args[0][0]
-    assert sent_data[0] == HCI_COMMAND_PKT
-    # Opcode = (0x08 << 10) | 0x000E = 0x200E, little-endian
-    opcode = (OGF_LE_CTL << 10) | OCF_LE_CREATE_CONN_CANCEL
-    assert struct.unpack("<H", sent_data[1:3])[0] == opcode
-    # Param length = 0 (no parameters)
-    assert sent_data[3] == 0
-    # Total packet length = 4 bytes (type + opcode + param_len)
-    assert len(sent_data) == 4
-
-    mock_sock.close.assert_called_once()
+    args = mock_subprocess.run.call_args[0][0]
+    assert args == ["/usr/bin/hcitool", "-i", "hci0", "cmd", "0x08", "0x000E"]
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_cancel_le_connect_permission_error(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.bind.side_effect = PermissionError("Operation not permitted")
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_cancel_le_connect_failure(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(
+        returncode=1, stderr="Command failed",
+    )
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = cancel_le_connect("hci0")
     assert result is False
-    mock_sock.close.assert_called_once()
 
 
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_cancel_le_connect_os_error(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-    mock_sock.send.side_effect = OSError("Network is down")
-
-    result = cancel_le_connect("hci0")
-    assert result is False
-    mock_sock.close.assert_called_once()
-
-
-@patch("bleak_connection_manager.hci.IS_LINUX", True)
-@patch("bleak_connection_manager.hci._HAS_FCNTL", True)
-@patch("bleak_connection_manager.hci.socket")
-def test_cancel_le_connect_specific_adapter(mock_socket_mod):
-    mock_sock = MagicMock()
-    mock_socket_mod.socket.return_value = mock_sock
-
+@patch("bleak_connection_manager.hci._HCITOOL", "/usr/bin/hcitool")
+@patch("bleak_connection_manager.hci.subprocess")
+def test_cancel_le_connect_specific_adapter(mock_subprocess):
+    mock_subprocess.run.return_value = MagicMock(returncode=0)
+    mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
     result = cancel_le_connect("hci1")
     assert result is True
-    mock_sock.bind.assert_called_once_with((1,))
+    args = mock_subprocess.run.call_args[0][0]
+    assert args == ["/usr/bin/hcitool", "-i", "hci1", "cmd", "0x08", "0x000E"]

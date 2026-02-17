@@ -29,14 +29,13 @@ from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .hci import (
     HCI_DISCONNECT_REASONS,
     HciConnection,
-    HciDisconnectEvent,
-    HciDisconnectMonitor,
     cancel_le_connect,
     disconnect_by_address,
     disconnect_handle,
     disconnect_reason_str,
     find_connection_by_address,
     get_connections,
+    hci_available,
 )
 from .lock import acquire_lock, acquire_slot, release_lock, release_slot
 from .scan_lock import ScanLock, acquire_scan_lock, release_scan_lock
@@ -85,12 +84,11 @@ __all__ = [
     "StuckState",
     "clear_stuck_state",
     "diagnose_stuck_state",
-    # HCI layer (raw kernel connection state)
+    # HCI layer (connection state via hcitool)
     "HciConnection",
-    "HciDisconnectEvent",
-    "HciDisconnectMonitor",
     "HCI_DISCONNECT_REASONS",
     "disconnect_reason_str",
+    "hci_available",
     "get_connections",
     "find_connection_by_address",
     "disconnect_handle",

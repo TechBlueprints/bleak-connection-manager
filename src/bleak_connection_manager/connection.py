@@ -334,6 +334,7 @@ async def establish_connection(
     validate_connection: Callable[[BleakClient], Awaitable[bool]] | None = None,
     lock_config: LockConfig | None = None,
     escalation_policy: EscalationPolicy | None = None,
+    overall_timeout: float | None = None,
     **kwargs: Any,
 ) -> BleakClient:
     """Establish a BLE connection with full lifecycle management.
@@ -377,6 +378,13 @@ async def establish_connection(
     escalation_policy:
         Failure escalation policy.  If ``None``, a default policy
         with ``reset_adapter=False`` is used.
+    overall_timeout:
+        Hard ceiling (in seconds) for the entire connection process
+        including all retry attempts and escalation.  If ``None``
+        (the default), there is no overall timeout — only per-attempt
+        timeouts apply.  Recommended values: 240 s for critical BMS
+        connections, 300 s for sensors/switches.  When the timeout
+        fires, an ``asyncio.TimeoutError`` is raised.
     **kwargs:
         Additional keyword arguments passed through to
         ``bleak_retry_connector.establish_connection()``.
@@ -395,172 +403,169 @@ async def establish_connection(
     """
     display_name = name or device.name or device.address
 
-    # Auto-discover adapters if not provided
-    if adapters is None and IS_LINUX:
-        adapters = discover_adapters()
+    async def _do_establish() -> BleakClient:
+        # Auto-discover adapters if not provided
+        nonlocal adapters
+        if adapters is None and IS_LINUX:
+            adapters = discover_adapters()
 
-    effective_adapters = adapters or ["hci0"]
-    loop = asyncio.get_running_loop()
-    last_error: Exception | None = None
+        effective_adapters = adapters or ["hci0"]
+        loop = asyncio.get_running_loop()
+        last_error: Exception | None = None
 
-    # Per-device in-process lock — prevents two coroutines from
-    # racing to connect to the same BLE device simultaneously
-    device_lock = await _get_device_lock(device.address)
+        # Per-device in-process lock — prevents two coroutines from
+        # racing to connect to the same BLE device simultaneously
+        device_lock = await _get_device_lock(device.address)
 
-    async with device_lock:
-        for attempt in range(1, max_attempts + 1):
-            adapter = pick_adapter(effective_adapters, attempt)
+        async with device_lock:
+            for attempt in range(1, max_attempts + 1):
+                adapter = pick_adapter(effective_adapters, attempt)
 
-            # --- Pre-attempt: phantom detection ---
-            if close_inactive_connections and IS_LINUX:
-                await _clear_inactive_connections(
-                    device, adapter, adapters=effective_adapters
-                )
-
-            # --- Adapter rotation: create device for this adapter ---
-            if len(effective_adapters) > 1:
-                attempt_device = make_device_for_adapter(device, adapter)
-            else:
-                attempt_device = device
-
-            # --- Cross-process slot-based lock ---
-            fd: int | None = None
-            if lock_config is not None:
-                fd = await acquire_slot(lock_config, adapter)
-
-            timer: threading.Timer | None = None
-            try:
-                # --- Single attempt via upstream bleak-retry-connector ---
-                # On the first attempt with try_direct_first, pass
-                # use_services_cache=True so bleak-retry-connector uses the
-                # BlueZ cache path (fast, no scan).  On subsequent attempts,
-                # use whatever the caller specified (default behavior).
-                attempt_kwargs = dict(kwargs)
-                if try_direct_first and attempt == 1:
-                    attempt_kwargs.setdefault("use_services_cache", True)
-                    _LOGGER.debug(
-                        "%s: Attempt 1 — trying direct connect (cache path)",
-                        display_name,
+                # --- Pre-attempt: phantom detection ---
+                if close_inactive_connections and IS_LINUX:
+                    await _clear_inactive_connections(
+                        device, adapter, adapters=effective_adapters
                     )
 
-                connect_coro = _brc_establish_connection(
-                    client_class,
-                    attempt_device,
-                    display_name,
-                    max_attempts=1,
-                    **attempt_kwargs,
-                )
-
-                if safety_timer:
-                    connect_task = asyncio.ensure_future(connect_coro)
-                    timer = _create_safety_timer(
-                        THREAD_SAFETY_TIMEOUT, loop, connect_task
-                    )
-                    timer.start()
-                    try:
-                        client = await connect_task
-                    finally:
-                        timer.cancel()
-                        timer = None
+                # --- Adapter rotation: create device for this adapter ---
+                if len(effective_adapters) > 1:
+                    attempt_device = make_device_for_adapter(device, adapter)
                 else:
-                    client = await connect_coro
+                    attempt_device = device
 
-            except (BleakError, BleakAbortedError, asyncio.TimeoutError, EOFError, BrokenPipeError, asyncio.CancelledError) as exc:
-                last_error = exc
-                _LOGGER.debug(
-                    "%s: Attempt %d/%d on %s failed: %s",
-                    display_name,
-                    attempt,
-                    max_attempts,
-                    adapter,
-                    exc,
-                )
+                # --- Cross-process slot-based lock ---
+                fd: int | None = None
+                if lock_config is not None:
+                    fd = await acquire_slot(lock_config, adapter)
 
-                # --- InProgress classification ---
-                if "InProgress" in str(exc):
-                    await _handle_inprogress(device, adapter)
-                elif attempt == max_attempts:
-                    # Only clear stale state on the final attempt.
-                    # Clearing between retries removes the device from
-                    # BlueZ D-Bus, invalidating the BLEDevice reference
-                    # and causing all subsequent attempts to fail with
-                    # "device disappeared".
-                    await _clear_stale_state(device)
+                timer: threading.Timer | None = None
+                try:
+                    # --- Single attempt via upstream bleak-retry-connector ---
+                    attempt_kwargs = dict(kwargs)
+                    if try_direct_first and attempt == 1:
+                        attempt_kwargs.setdefault("use_services_cache", True)
+                        _LOGGER.debug(
+                            "%s: Attempt 1 — trying direct connect (cache path)",
+                            display_name,
+                        )
 
-                # --- Escalation ---
-                if escalation_policy is not None:
-                    action = escalation_policy.on_failure(adapter)
-                    await _execute_escalation(
-                        action, adapter, device, escalation_policy,
-                        adapters=effective_adapters,
+                    connect_coro = _brc_establish_connection(
+                        client_class,
+                        attempt_device,
+                        display_name,
+                        max_attempts=1,
+                        **attempt_kwargs,
                     )
 
-                # Brief backoff before retry
-                if attempt < max_attempts:
-                    await asyncio.sleep(0.25)
+                    if safety_timer:
+                        connect_task = asyncio.ensure_future(connect_coro)
+                        timer = _create_safety_timer(
+                            THREAD_SAFETY_TIMEOUT, loop, connect_task
+                        )
+                        timer.start()
+                        try:
+                            client = await connect_task
+                        finally:
+                            timer.cancel()
+                            timer = None
+                    else:
+                        client = await connect_coro
 
-                continue
-
-            except BleakNotFoundError:
-                raise
-
-            finally:
-                if timer is not None:
-                    timer.cancel()
-                release_slot(fd)
-
-            # --- Post-connect validation ---
-            if validate_connection is not None:
-                if not await _safe_validate(validate_connection, client):
-                    _LOGGER.info(
-                        "%s: Attempt %d/%d on %s — validation failed, "
-                        "tearing down",
+                except (BleakError, BleakAbortedError, asyncio.TimeoutError, EOFError, BrokenPipeError, asyncio.CancelledError) as exc:
+                    last_error = exc
+                    _LOGGER.debug(
+                        "%s: Attempt %d/%d on %s failed: %s",
                         display_name,
                         attempt,
                         max_attempts,
                         adapter,
+                        exc,
                     )
-                    # Use verified_disconnect: disconnect + confirm
-                    # Connected=False via D-Bus, escalate to remove if
-                    # still connected (Stuck State 8 fix, no hcitool)
-                    try:
-                        await asyncio.wait_for(
-                            client.disconnect(), timeout=DISCONNECT_TIMEOUT
-                        )
-                    except Exception:
-                        _LOGGER.debug(
-                            "Disconnect after failed validation raised",
-                            exc_info=True,
+
+                    # --- InProgress classification ---
+                    if "InProgress" in str(exc):
+                        await _handle_inprogress(device, adapter)
+                    elif attempt == max_attempts:
+                        await _clear_stale_state(device)
+
+                    # --- Escalation ---
+                    if escalation_policy is not None:
+                        action = escalation_policy.on_failure(adapter)
+                        await _execute_escalation(
+                            action, adapter, device, escalation_policy,
+                            adapters=effective_adapters,
                         )
 
-                    # Verify D-Bus agrees the device is disconnected
-                    if IS_LINUX:
-                        await verified_disconnect(
-                            device.address,
-                            adapter,
-                            timeout=DISCONNECT_TIMEOUT,
-                        )
-
-                    await _clear_stale_state(device)
+                    # Brief backoff before retry
                     if attempt < max_attempts:
                         await asyncio.sleep(0.25)
+
                     continue
 
-            # --- Success ---
-            if escalation_policy is not None:
-                escalation_policy.on_success(adapter)
+                except BleakNotFoundError:
+                    raise
 
-            _LOGGER.debug(
-                "%s: Connected on attempt %d/%d via %s",
-                display_name,
-                attempt,
-                max_attempts,
-                adapter,
-            )
-            return client
+                finally:
+                    if timer is not None:
+                        timer.cancel()
+                    release_slot(fd)
 
-    # All attempts exhausted
-    raise BleakAbortedError(
-        f"{display_name}: Failed to connect after {max_attempts} attempts"
-        + (f": {last_error}" if last_error else "")
-    )
+                # --- Post-connect validation ---
+                if validate_connection is not None:
+                    if not await _safe_validate(validate_connection, client):
+                        _LOGGER.info(
+                            "%s: Attempt %d/%d on %s — validation failed, "
+                            "tearing down",
+                            display_name,
+                            attempt,
+                            max_attempts,
+                            adapter,
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                client.disconnect(), timeout=DISCONNECT_TIMEOUT
+                            )
+                        except Exception:
+                            _LOGGER.debug(
+                                "Disconnect after failed validation raised",
+                                exc_info=True,
+                            )
+
+                        if IS_LINUX:
+                            await verified_disconnect(
+                                device.address,
+                                adapter,
+                                timeout=DISCONNECT_TIMEOUT,
+                            )
+
+                        await _clear_stale_state(device)
+                        if attempt < max_attempts:
+                            await asyncio.sleep(0.25)
+                        continue
+
+                # --- Success ---
+                if escalation_policy is not None:
+                    escalation_policy.on_success(adapter)
+
+                _LOGGER.debug(
+                    "%s: Connected on attempt %d/%d via %s",
+                    display_name,
+                    attempt,
+                    max_attempts,
+                    adapter,
+                )
+                return client
+
+        # All attempts exhausted
+        raise BleakAbortedError(
+            f"{display_name}: Failed to connect after {max_attempts} attempts"
+            + (f": {last_error}" if last_error else "")
+        )
+
+    # Apply overall_timeout if specified
+    if overall_timeout is not None:
+        _LOGGER.debug(
+            "%s: overall_timeout=%.0fs", display_name, overall_timeout,
+        )
+        return await asyncio.wait_for(_do_establish(), timeout=overall_timeout)
+    return await _do_establish()

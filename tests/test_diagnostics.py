@@ -40,9 +40,10 @@ async def test_diagnose_device_not_found(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address", return_value=None)
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_phantom_no_handle(mock_props, mock_hci):
+async def test_diagnose_phantom_no_handle(mock_props, mock_hci, mock_avail):
     """D-Bus Connected=True, ServicesResolved=False, but NO HCI handle."""
     mock_props.return_value = {"Connected": True, "ServicesResolved": False}
     result = await diagnose_stuck_state("AA:BB:CC:DD:EE:FF", "hci0")
@@ -51,9 +52,10 @@ async def test_diagnose_phantom_no_handle(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address", return_value=None)
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_phantom_services_key_absent(mock_props, mock_hci):
+async def test_diagnose_phantom_services_key_absent(mock_props, mock_hci, mock_avail):
     """D-Bus Connected=True, ServicesResolved absent, no HCI handle."""
     mock_props.return_value = {"Connected": True}
     result = await diagnose_stuck_state("AA:BB:CC:DD:EE:FF", "hci0")
@@ -70,9 +72,10 @@ class _FakeHciConn:
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address")
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_inactive_connection(mock_props, mock_hci):
+async def test_diagnose_inactive_connection(mock_props, mock_hci, mock_avail):
     """D-Bus Connected=True, ServicesResolved=False, WITH HCI handle."""
     mock_hci.return_value = _FakeHciConn()
     mock_props.return_value = {"Connected": True, "ServicesResolved": False}
@@ -82,9 +85,10 @@ async def test_diagnose_inactive_connection(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address")
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_inactive_services_missing(mock_props, mock_hci):
+async def test_diagnose_inactive_services_missing(mock_props, mock_hci, mock_avail):
     """D-Bus Connected=True, ServicesResolved key absent, HCI handle exists."""
     mock_hci.return_value = _FakeHciConn()
     mock_props.return_value = {"Connected": True}
@@ -94,9 +98,10 @@ async def test_diagnose_inactive_services_missing(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address")
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_healthy_connection(mock_props, mock_hci):
+async def test_diagnose_healthy_connection(mock_props, mock_hci, mock_avail):
     """D-Bus Connected=True, ServicesResolved=True, HCI handle exists."""
     mock_hci.return_value = _FakeHciConn()
     mock_props.return_value = {"Connected": True, "ServicesResolved": True}
@@ -128,9 +133,10 @@ async def test_diagnose_stale_cache_not_connected_key_missing(mock_props, mock_h
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address")
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_orphan_hci_handle(mock_props, mock_hci):
+async def test_diagnose_orphan_hci_handle(mock_props, mock_hci, mock_avail):
     """D-Bus says not connected, but HCI handle exists."""
     mock_hci.return_value = _FakeHciConn()
     mock_props.return_value = {"Connected": False}
@@ -140,9 +146,10 @@ async def test_diagnose_orphan_hci_handle(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address")
 @patch("bleak_connection_manager.diagnostics._get_device_properties", return_value=None)
-async def test_diagnose_orphan_hci_no_dbus(mock_props, mock_hci):
+async def test_diagnose_orphan_hci_no_dbus(mock_props, mock_hci, mock_avail):
     """Device not in D-Bus at all, but HCI handle exists."""
     mock_hci.return_value = _FakeHciConn()
     result = await diagnose_stuck_state("AA:BB:CC:DD:EE:FF", "hci0")
@@ -151,9 +158,10 @@ async def test_diagnose_orphan_hci_no_dbus(mock_props, mock_hci):
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.diagnostics.IS_LINUX", True)
+@patch("bleak_connection_manager.diagnostics.hci_available", return_value=True)
 @patch("bleak_connection_manager.diagnostics.find_connection_by_address", return_value=None)
 @patch("bleak_connection_manager.diagnostics._get_device_properties")
-async def test_diagnose_passes_adapters(mock_props, mock_hci):
+async def test_diagnose_passes_adapters(mock_props, mock_hci, mock_avail):
     """Verify adapters list is forwarded to find_connection_by_address."""
     mock_props.return_value = None
     await diagnose_stuck_state(
@@ -191,7 +199,10 @@ async def test_clear_phantom_no_handle(mock_remove, mock_disconnect):
         "AA:BB:CC:DD:EE:FF", "hci0", StuckState.PHANTOM_NO_HANDLE
     )
     assert result is True
-    mock_disconnect.assert_called_once_with("AA:BB:CC:DD:EE:FF", "hci0")
+    # Phantoms have no real HCI link — disconnect_device is skipped
+    # because BlueZ would hang waiting for a link teardown that can
+    # never happen.  Only remove_device should be called.
+    mock_disconnect.assert_not_called()
     mock_remove.assert_called_once_with("AA:BB:CC:DD:EE:FF", "hci0")
 
 

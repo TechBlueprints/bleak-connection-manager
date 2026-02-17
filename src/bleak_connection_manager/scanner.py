@@ -30,9 +30,16 @@ from bleak.exc import BleakError
 
 from .adapters import discover_adapters, pick_adapter
 from .const import IS_LINUX, ScanLockConfig
+from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .scan_lock import acquire_scan_lock, release_scan_lock
 
 _LOGGER = logging.getLogger(__name__)
+
+# Time to wait after clearing a phantom connection to let the
+# peripheral's supervision timer expire and start advertising again.
+# The clear itself includes a power cycle with its own wait, so this
+# additional wait is just for the peripheral side.
+_PHANTOM_CLEAR_WAIT = 3.0
 
 # Extra seconds added to the BleakScanner timeout to form the hard
 # asyncio.wait_for timeout.  This gives BleakScanner a chance to
@@ -94,6 +101,40 @@ async def find_device(
     if adapters is None and IS_LINUX:
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]
+
+    # Pre-scan phantom check: if BlueZ has a stale "Connected" entry
+    # for this device but HCI shows no actual connection, clear it.
+    # Without this, the peripheral thinks it's still connected and
+    # won't advertise, making all scan attempts fail.
+    if IS_LINUX:
+        try:
+            primary_adapter = effective_adapters[0]
+            state = await diagnose_stuck_state(
+                address, primary_adapter, adapters=effective_adapters,
+            )
+            if state in (
+                StuckState.PHANTOM_NO_HANDLE,
+                StuckState.INACTIVE_CONNECTION,
+                StuckState.ORPHAN_HCI_HANDLE,
+            ):
+                _LOGGER.info(
+                    "%s: Pre-scan detected %s, clearing before scan",
+                    address,
+                    state.value,
+                )
+                await clear_stuck_state(
+                    address, primary_adapter, state,
+                    adapters=effective_adapters,
+                )
+                # Give the peripheral time to notice the link is gone
+                # and start advertising again (supervision timeout).
+                await asyncio.sleep(_PHANTOM_CLEAR_WAIT)
+        except Exception:
+            _LOGGER.debug(
+                "%s: Pre-scan phantom check failed, proceeding",
+                address,
+                exc_info=True,
+            )
 
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     last_error: Exception | None = None
