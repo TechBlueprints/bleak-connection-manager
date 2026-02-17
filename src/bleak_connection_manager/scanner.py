@@ -61,6 +61,60 @@ def _is_inprogress(exc: BaseException) -> bool:
     return "inprogress" in err_str or "in progress" in err_str
 
 
+async def _diagnose_inprogress(adapter: str, address: str) -> None:
+    """Log BlueZ adapter state when InProgress occurs.
+
+    Queries the adapter's ``Discovering`` property and connected device
+    count via D-Bus to help identify *why* the adapter returned
+    InProgress.  Possible causes:
+
+    - ``Discovering: true`` — another process or a previous scan left
+      the adapter in discovery mode.
+    - ``Discovering: false`` — BlueZ has stale internal state from a
+      previous scan that was never properly cleaned up.
+    - Connected device count can reveal if the adapter is saturated.
+
+    This is diagnostic-only — it never modifies state.
+    """
+    if not IS_LINUX:
+        return
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.constants import BusType
+
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            adapter_path = f"/org/bluez/{adapter}"
+            introspect = await bus.introspect("org.bluez", adapter_path)
+            proxy = bus.get_proxy_object("org.bluez", adapter_path, introspect)
+            props = proxy.get_interface("org.freedesktop.DBus.Properties")
+
+            discovering = await props.call_get(
+                "org.bluez.Adapter1", "Discovering"
+            )
+            powered = await props.call_get(
+                "org.bluez.Adapter1", "Powered"
+            )
+            disc_val = discovering.value if hasattr(discovering, "value") else discovering
+            pow_val = powered.value if hasattr(powered, "value") else powered
+
+            _LOGGER.warning(
+                "%s: InProgress on %s — adapter state: "
+                "Powered=%s, Discovering=%s. "
+                "If Discovering=False, BlueZ has stale internal scan state "
+                "from a previous failed scan (likely our own code or vesmart). "
+                "If Discovering=True, another process holds a discovery session.",
+                address, adapter, pow_val, disc_val,
+            )
+        finally:
+            bus.disconnect()
+    except Exception:
+        _LOGGER.debug(
+            "%s: Could not query %s adapter state for InProgress diagnosis",
+            address, adapter, exc_info=True,
+        )
+
+
 
 async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
     """Check if BlueZ already has a cached device entry from another scanner."""
@@ -251,13 +305,14 @@ async def find_device(
         except (BleakError, asyncio.TimeoutError) as exc:
             last_error = exc
             if _is_inprogress(exc):
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "%s: InProgress on %s, rotating (attempt %d/%d)",
                     address,
                     adapter,
                     attempt,
                     max_attempts,
                 )
+                await _diagnose_inprogress(adapter, address)
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "%s: Scanner hard timeout on %s after %.0f s "
@@ -405,12 +460,13 @@ async def discover(
 
         except (BleakError, asyncio.TimeoutError) as exc:
             if _is_inprogress(exc):
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "InProgress on %s, rotating (attempt %d/%d)",
                     adapter,
                     attempt,
                     max_attempts,
                 )
+                await _diagnose_inprogress(adapter, "discover")
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "Scanner hard timeout on %s after %.0f s "
