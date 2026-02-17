@@ -27,10 +27,14 @@ from .const import (
 )
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .hci import (
+    HCI_DISCONNECT_REASONS,
     HciConnection,
+    HciDisconnectEvent,
+    HciDisconnectMonitor,
     cancel_le_connect,
     disconnect_by_address,
     disconnect_handle,
+    disconnect_reason_str,
     find_connection_by_address,
     get_connections,
 )
@@ -83,6 +87,10 @@ __all__ = [
     "diagnose_stuck_state",
     # HCI layer (raw kernel connection state)
     "HciConnection",
+    "HciDisconnectEvent",
+    "HciDisconnectMonitor",
+    "HCI_DISCONNECT_REASONS",
+    "disconnect_reason_str",
     "get_connections",
     "find_connection_by_address",
     "disconnect_handle",

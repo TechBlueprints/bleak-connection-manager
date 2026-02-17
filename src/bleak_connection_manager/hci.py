@@ -58,6 +58,9 @@ import ctypes
 import logging
 import socket
 import struct
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +109,54 @@ HCI_OE_USER_ENDED = 0x13  # "Remote User Terminated Connection"
 
 OGF_LE_CTL = 0x08
 OCF_LE_CREATE_CONN_CANCEL = 0x000E
+
+# ── HCI event constants ────────────────────────────────────────────
+
+HCI_EVENT_PKT = 0x04
+EVT_DISCONN_COMPLETE = 0x05
+
+# setsockopt level and option for HCI event filter
+SOL_HCI = 0
+HCI_FILTER = 2
+
+# ── HCI disconnect reason codes ───────────────────────────────────
+# From Bluetooth Core Spec Vol 1 Part F (Error Codes).
+# Only the codes commonly seen in practice are listed; the rest
+# fall through to "Unknown (0xNN)".
+
+HCI_DISCONNECT_REASONS: dict[int, str] = {
+    0x05: "Authentication Failure",
+    0x06: "PIN or Key Missing",
+    0x07: "Memory Capacity Exceeded",
+    0x08: "Connection Timeout",
+    0x09: "Connection Limit Exceeded",
+    0x0A: "Synchronous Connection Limit Exceeded",
+    0x0C: "Command Disallowed",
+    0x0D: "Rejected Limited Resources",
+    0x0E: "Rejected Security Reasons",
+    0x0F: "Rejected Unacceptable BD_ADDR",
+    0x10: "Connection Accept Timeout Exceeded",
+    0x13: "Remote User Terminated Connection",
+    0x14: "Remote Device Terminated Low Resources",
+    0x15: "Remote Device Terminated Power Off",
+    0x16: "Connection Terminated by Local Host",
+    0x1A: "Unsupported Remote Feature",
+    0x1F: "Unspecified Error",
+    0x22: "LMP/LL Response Timeout",
+    0x28: "Instant Passed",
+    0x2A: "Different Transaction Collision",
+    0x3B: "Unacceptable Connection Parameters",
+    0x3E: "Connection Failed to be Established",
+}
+
+
+def disconnect_reason_str(reason: int) -> str:
+    """Return a human-readable string for an HCI disconnect reason code."""
+    name = HCI_DISCONNECT_REASONS.get(reason)
+    if name:
+        return f"{name} (0x{reason:02X})"
+    return f"Unknown (0x{reason:02X})"
+
 
 # Maximum connections to query per adapter
 MAX_CONN = 20
@@ -457,6 +508,282 @@ def disconnect_by_address(
         conn.link_type_name,
     )
     return disconnect_handle(conn.adapter, conn.handle)
+
+
+# ── HCI Disconnect Monitor ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class HciDisconnectEvent:
+    """Parsed HCI Disconnection Complete event.
+
+    Attributes
+    ----------
+    handle:
+        The HCI connection handle that was disconnected.
+    reason:
+        The HCI reason code (e.g. ``0x08`` for Connection Timeout).
+    reason_str:
+        Human-readable reason string.
+    address:
+        The BLE MAC address of the disconnected device, or ``None``
+        if the handle could not be mapped to an address.
+    adapter:
+        The adapter the event was received on.
+    timestamp:
+        Monotonic timestamp when the event was received.
+    """
+
+    handle: int
+    reason: int
+    reason_str: str
+    address: str | None
+    adapter: str
+    timestamp: float
+
+
+class HciDisconnectMonitor:
+    """Monitor HCI Disconnection Complete events on a raw socket.
+
+    Listens for ``EVT_DISCONN_COMPLETE`` (event code ``0x05``) on the
+    specified adapter and logs the disconnect reason code for each
+    event.  Optionally invokes a callback with the parsed event.
+
+    The monitor takes a snapshot of active HCI connections periodically
+    to map handles back to device addresses.  This is best-effort —
+    if the handle is not in the snapshot, the address will be ``None``.
+
+    Usage::
+
+        monitor = HciDisconnectMonitor("hci0")
+        monitor.start()
+        # ... later ...
+        monitor.stop()
+
+    Or as a context manager::
+
+        with HciDisconnectMonitor("hci0") as monitor:
+            # monitor is running
+            ...
+
+    Parameters
+    ----------
+    adapter:
+        The adapter to monitor (e.g. ``"hci0"``).
+    on_disconnect:
+        Optional callback invoked for each disconnect event.
+        Called from the monitor thread — must be thread-safe.
+    snapshot_interval:
+        How often (seconds) to refresh the handle→address mapping.
+        Default is 5 seconds.
+    """
+
+    def __init__(
+        self,
+        adapter: str = "hci0",
+        on_disconnect: Callable[[HciDisconnectEvent], None] | None = None,
+        snapshot_interval: float = 5.0,
+    ) -> None:
+        self._adapter = adapter
+        self._on_disconnect = on_disconnect
+        self._snapshot_interval = snapshot_interval
+        self._running = False
+        self._thread: threading.Thread | None = None
+        # handle → address mapping, refreshed periodically
+        self._handle_map: dict[int, str] = {}
+        self._last_snapshot: float = 0.0
+
+    @property
+    def adapter(self) -> str:
+        return self._adapter
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        """Start monitoring in a background daemon thread."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            name=f"HciDisconnMon_{self._adapter}",
+            target=self._run,
+            daemon=True,
+        )
+        self._thread.start()
+        _LOGGER.info(
+            "HciDisconnectMonitor: started on %s", self._adapter
+        )
+
+    def stop(self) -> None:
+        """Stop monitoring.
+
+        Safe to call multiple times or before ``start()``.
+        """
+        self._running = False
+        # The thread blocks on socket recv with a timeout, so it will
+        # notice _running=False within ~1 second.
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    def __enter__(self) -> HciDisconnectMonitor:
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def _refresh_handle_map(self) -> None:
+        """Refresh the handle→address mapping from active connections."""
+        now = time.monotonic()
+        if now - self._last_snapshot < self._snapshot_interval:
+            return
+        self._last_snapshot = now
+        try:
+            connections = get_connections(self._adapter)
+            self._handle_map = {
+                conn.handle: conn.address for conn in connections
+            }
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        """Background thread: open HCI socket, filter for events, read."""
+        if not IS_LINUX or not _HAS_FCNTL:
+            _LOGGER.debug(
+                "HciDisconnectMonitor: not available on this platform"
+            )
+            return
+
+        dev_id = _adapter_to_dev_id(self._adapter)
+        sock: socket.socket | None = None
+
+        try:
+            sock = socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
+            sock.bind((dev_id,))
+
+            # Set up HCI event filter to only receive event packets
+            # and only the EVT_DISCONN_COMPLETE event.
+            #
+            # struct hci_filter {
+            #   uint32_t type_mask;       // bit 4 = HCI_EVENT_PKT
+            #   uint32_t event_mask[2];   // bit 5 = EVT_DISCONN_COMPLETE
+            #   uint16_t opcode;          // 0 = don't filter by opcode
+            # };
+            type_mask = 1 << HCI_EVENT_PKT  # only event packets
+            event_mask_lo = 1 << EVT_DISCONN_COMPLETE  # only disconnect events
+            event_mask_hi = 0
+            opcode = 0
+            hci_filter = struct.pack(
+                "<III H",
+                type_mask,
+                event_mask_lo,
+                event_mask_hi,
+                opcode,
+            )
+            sock.setsockopt(SOL_HCI, HCI_FILTER, hci_filter)
+
+            # Set a read timeout so we can check _running periodically
+            sock.settimeout(1.0)
+
+            _LOGGER.debug(
+                "HciDisconnectMonitor: listening on %s", self._adapter
+            )
+
+            while self._running:
+                self._refresh_handle_map()
+
+                try:
+                    data = sock.recv(64)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._running:
+                        _LOGGER.debug(
+                            "HciDisconnectMonitor: socket error on %s",
+                            self._adapter,
+                            exc_info=True,
+                        )
+                    break
+
+                if len(data) < 3:
+                    continue
+
+                # HCI event packet: [pkt_type=0x04][evt_code][plen][params...]
+                pkt_type = data[0]
+                evt_code = data[1]
+                plen = data[2]
+
+                if pkt_type != HCI_EVENT_PKT or evt_code != EVT_DISCONN_COMPLETE:
+                    continue
+
+                if plen < 4 or len(data) < 7:
+                    continue
+
+                # EVT_DISCONN_COMPLETE params: [status:1][handle:2LE][reason:1]
+                status = data[3]
+                handle = struct.unpack_from("<H", data, 4)[0] & 0x0FFF
+                reason = data[6]
+
+                # Map handle to address (best-effort)
+                address = self._handle_map.pop(handle, None)
+
+                event = HciDisconnectEvent(
+                    handle=handle,
+                    reason=reason,
+                    reason_str=disconnect_reason_str(reason),
+                    address=address,
+                    adapter=self._adapter,
+                    timestamp=time.monotonic(),
+                )
+
+                if status == 0x00:
+                    addr_str = address or f"handle={handle}"
+                    _LOGGER.info(
+                        "HCI disconnect: %s reason=%s on %s",
+                        addr_str,
+                        event.reason_str,
+                        self._adapter,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "HCI disconnect event with non-zero status "
+                        "0x%02X for handle %d on %s",
+                        status,
+                        handle,
+                        self._adapter,
+                    )
+
+                if self._on_disconnect is not None:
+                    try:
+                        self._on_disconnect(event)
+                    except Exception:
+                        _LOGGER.debug(
+                            "HciDisconnectMonitor: callback error",
+                            exc_info=True,
+                        )
+
+        except PermissionError:
+            _LOGGER.warning(
+                "HciDisconnectMonitor: insufficient permissions on %s "
+                "(needs CAP_NET_ADMIN / root)",
+                self._adapter,
+            )
+        except OSError as ex:
+            _LOGGER.warning(
+                "HciDisconnectMonitor: failed to open socket on %s: %s",
+                self._adapter,
+                ex,
+            )
+        finally:
+            if sock is not None:
+                sock.close()
+            self._running = False
+            _LOGGER.debug(
+                "HciDisconnectMonitor: stopped on %s", self._adapter
+            )
 
 
 # ── Helpers ────────────────────────────────────────────────────────
