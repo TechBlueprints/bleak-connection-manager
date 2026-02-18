@@ -19,9 +19,13 @@ def _make_char(uuid: str) -> MagicMock:
     return char
 
 
-def _make_service(char_uuids: list[str]) -> MagicMock:
+def _make_service(
+    char_uuids: list[str],
+    service_uuid: str = "0000fff0-0000-1000-8000-00805f9b34fb",
+) -> MagicMock:
     """Create a mock BleakGATTService with the given characteristics."""
     service = MagicMock()
+    service.uuid = service_uuid
     service.characteristics = [_make_char(u) for u in char_uuids]
     return service
 

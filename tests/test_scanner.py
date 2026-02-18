@@ -518,18 +518,19 @@ async def test_find_device_pre_scan_not_ready_rotates(
 
 
 @pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner._last_resort_power_cycle", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._try_recover_adapter", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
-@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
 @patch("bleak_connection_manager.scanner.IS_LINUX", True)
-async def test_find_device_post_timeout_power_cycles(
-    mock_scanner_cls, mock_cache, mock_cycle, mock_ready,
+async def test_find_device_post_timeout_tries_recover(
+    mock_scanner_cls, mock_cache, mock_ready, mock_recover, mock_last_resort,
 ):
-    """Hard timeout triggers power-cycle cleanup via cooldown wrapper."""
+    """Hard timeout calls _try_recover_adapter, then _last_resort_power_cycle."""
     mock_cache.return_value = None
     mock_ready.return_value = True
-    mock_cycle.return_value = True
+    mock_last_resort.return_value = None
 
     mock_scanner_cls.find_device_by_address = AsyncMock(
         side_effect=asyncio.TimeoutError()
@@ -544,22 +545,25 @@ async def test_find_device_post_timeout_power_cycles(
     )
 
     assert result is None
-    mock_cycle.assert_called_with("hci0")
+    mock_recover.assert_called_once()
+    assert mock_recover.call_args[0][0] == "hci0"
+    mock_last_resort.assert_called_once()
 
 
 @pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner._last_resort_power_cycle", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._try_recover_adapter", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
-@patch("bleak_connection_manager.scanner._power_cycle_adapter_with_cooldown", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.BleakScanner")
 @patch("bleak_connection_manager.scanner.IS_LINUX", True)
-async def test_find_device_post_inprogress_power_cycles(
-    mock_scanner_cls, mock_cache, mock_cycle, mock_ready,
+async def test_find_device_post_inprogress_tries_recover(
+    mock_scanner_cls, mock_cache, mock_ready, mock_recover, mock_last_resort,
 ):
-    """InProgress error triggers power-cycle repair via cooldown wrapper."""
+    """InProgress error calls _try_recover_adapter, then _last_resort_power_cycle."""
     mock_cache.return_value = None
     mock_ready.return_value = True
-    mock_cycle.return_value = True
+    mock_last_resort.return_value = None
 
     mock_scanner_cls.find_device_by_address = AsyncMock(
         side_effect=BleakError("org.bluez.Error.InProgress")
@@ -574,4 +578,40 @@ async def test_find_device_post_inprogress_power_cycles(
     )
 
     assert result is None
-    mock_cycle.assert_called_with("hci0")
+    mock_recover.assert_called_once()
+    assert mock_recover.call_args[0][0] == "hci0"
+    mock_last_resort.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner._last_resort_power_cycle", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._try_recover_adapter", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", True)
+async def test_find_device_no_power_cycle_when_other_adapter_available(
+    mock_scanner_cls, mock_cache, mock_ready, mock_recover, mock_last_resort,
+):
+    """With two adapters, InProgress on one rotates without power-cycle."""
+    mock_cache.return_value = None
+    mock_ready.return_value = True
+    mock_last_resort.return_value = None
+
+    mock_device = _make_device()
+    mock_scanner_cls.find_device_by_address = AsyncMock(
+        side_effect=[BleakError("org.bluez.Error.InProgress"), mock_device]
+    )
+
+    result = await find_device(
+        "AA:BB:CC:DD:EE:FF",
+        max_attempts=2,
+        adapters=["hci0", "hci1"],
+        scan_lock_config=ScanLockConfig(enabled=False),
+        timeout=0.1,
+    )
+
+    assert result is mock_device
+    mock_recover.assert_called_once()
+    # No last-resort power-cycle because scan succeeded on second adapter
+    mock_last_resort.assert_not_called()

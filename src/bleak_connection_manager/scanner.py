@@ -32,6 +32,8 @@ from .adapters import discover_adapters, pick_adapter
 from .bluez import (
     _power_cycle_adapter_with_cooldown,
     ensure_adapter_scan_ready,
+    get_connected_devices,
+    try_stop_discovery,
 )
 from .const import IS_LINUX, ScanLockConfig
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
@@ -63,6 +65,99 @@ def _is_inprogress(exc: BaseException) -> bool:
     """Check if an exception is an InProgress error."""
     err_str = str(exc).lower()
     return "inprogress" in err_str or "in progress" in err_str
+
+
+async def _try_recover_adapter(
+    adapter: str,
+    effective_adapters: list[str],
+    reason: str,
+) -> None:
+    """Attempt non-destructive recovery of a stuck adapter.
+
+    Uses the tiered strategy:
+    - **Tier 1**: Try ``StopDiscovery`` from our bus (zero-cost).
+    - **Tier 2**: If other adapters exist, just log and let the
+      scan loop rotate.  Do NOT power-cycle.
+    - Power-cycling (Tier 3) is NOT done here — it is deferred
+      to ``_last_resort_power_cycle`` after all adapters are
+      exhausted.
+
+    Parameters
+    ----------
+    adapter:
+        The adapter that is stuck.
+    effective_adapters:
+        All available adapters (used to decide whether rotation
+        is possible).
+    reason:
+        Human-readable description of why recovery is needed
+        (for log messages).
+    """
+    if not IS_LINUX:
+        return
+
+    # Tier 1: try StopDiscovery
+    cleared = await try_stop_discovery(adapter)
+    if cleared:
+        return
+
+    # Tier 2: if we have other adapters, rotation handles it
+    if len(effective_adapters) > 1:
+        _LOGGER.info(
+            "%s: %s — will rotate to another adapter "
+            "(avoiding power-cycle to preserve connections)",
+            adapter,
+            reason,
+        )
+    else:
+        _LOGGER.warning(
+            "%s: %s — single adapter, no rotation possible",
+            adapter,
+            reason,
+        )
+
+
+async def _last_resort_power_cycle(
+    stuck_adapters: set[str],
+    effective_adapters: list[str],
+) -> str | None:
+    """Power-cycle the best candidate adapter as a last resort.
+
+    Called when all adapters are stuck and no scan can proceed.
+    Picks the adapter with the fewest active BLE connections to
+    minimize disruption.
+
+    Returns the adapter name that was power-cycled, or ``None``
+    if none could be cycled (cooldown, errors, etc.).
+    """
+    if not IS_LINUX or not stuck_adapters:
+        return None
+
+    # Score each stuck adapter: prefer the one with fewest connections
+    best_adapter: str | None = None
+    best_count: int | None = None
+
+    for adapter in effective_adapters:
+        if adapter not in stuck_adapters:
+            continue
+        connected = await get_connected_devices(adapter)
+        count = len(connected)
+        if best_count is None or count < best_count:
+            best_adapter = adapter
+            best_count = count
+
+    if best_adapter is None:
+        return None
+
+    _LOGGER.warning(
+        "All adapters stuck — power-cycling %s as last resort "
+        "(%d active connection(s))",
+        best_adapter,
+        best_count,
+    )
+    if await _power_cycle_adapter_with_cooldown(best_adapter):
+        return best_adapter
+    return None
 
 
 async def _diagnose_inprogress(adapter: str, address: str) -> None:
@@ -362,6 +457,7 @@ async def find_device(
 
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     last_error: Exception | None = None
+    stuck_adapters: set[str] = set()
 
     for attempt in range(1, max_attempts + 1):
         adapter = pick_adapter(effective_adapters, attempt)
@@ -420,12 +516,6 @@ async def find_device(
                     continue
 
         # ── Pre-scan adapter health check ──────────────────────────
-        #
-        # Verify the adapter is ready for scanning.  Detects and
-        # repairs stale Discovering=True and hidden InProgress states
-        # before BleakScanner runs.  Most reliable when holding the
-        # scan lock (no concurrent interference), but still useful
-        # without it to catch obviously stale adapters.
         if IS_LINUX:
             try:
                 ready = await ensure_adapter_scan_ready(adapter)
@@ -438,6 +528,7 @@ async def find_device(
                         attempt,
                         max_attempts,
                     )
+                    stuck_adapters.add(adapter)
                     release_scan_lock(fd)
                     fd = None
                     continue
@@ -501,10 +592,11 @@ async def find_device(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, address)
-                # Repair the adapter so the next attempt (or next
-                # process) doesn't hit the same stale state.
-                if IS_LINUX:
-                    await _power_cycle_adapter_with_cooldown(adapter)
+                stuck_adapters.add(adapter)
+                await _try_recover_adapter(
+                    adapter, effective_adapters,
+                    "InProgress during scan",
+                )
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "%s: Scanner hard timeout on %s after %.0f s "
@@ -515,11 +607,11 @@ async def find_device(
                     attempt,
                     max_attempts,
                 )
-                # Hard timeout means BleakScanner never called
-                # StopDiscovery — the adapter is left in
-                # Discovering=True.  Power-cycle to clean up.
-                if IS_LINUX:
-                    await _power_cycle_adapter_with_cooldown(adapter)
+                stuck_adapters.add(adapter)
+                await _try_recover_adapter(
+                    adapter, effective_adapters,
+                    "hard timeout (Stuck State 16)",
+                )
             else:
                 _LOGGER.debug(
                     "%s: Scan error on %s: %s (attempt %d/%d)",
@@ -536,7 +628,15 @@ async def find_device(
         if attempt < max_attempts:
             await asyncio.sleep(_RETRY_BACKOFF)
 
-    # Last resort: if all scans hit InProgress, check BlueZ cache
+    # ── Last resort: all attempts exhausted ────────────────────────
+    #
+    # If adapters are stuck, try power-cycling the one with fewest
+    # active connections as a last resort, then check the cache.
+    if IS_LINUX and stuck_adapters:
+        await _last_resort_power_cycle(stuck_adapters, effective_adapters)
+
+    # Check BlueZ cache — another process's scan or the power-cycle
+    # may have populated it.
     if IS_LINUX and last_error is not None and _is_inprogress(last_error):
         _LOGGER.info(
             "%s: All scans failed with InProgress, checking BlueZ cache",
@@ -608,6 +708,7 @@ async def discover(
     effective_adapters = adapters or ["hci0"]
 
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
+    stuck_adapters: set[str] = set()
 
     for attempt in range(1, max_attempts + 1):
         adapter = pick_adapter(effective_adapters, attempt)
@@ -642,6 +743,7 @@ async def discover(
                         attempt,
                         max_attempts,
                     )
+                    stuck_adapters.add(adapter)
                     release_scan_lock(fd)
                     fd = None
                     continue
@@ -691,8 +793,11 @@ async def discover(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, "discover")
-                if IS_LINUX:
-                    await _power_cycle_adapter_with_cooldown(adapter)
+                stuck_adapters.add(adapter)
+                await _try_recover_adapter(
+                    adapter, effective_adapters,
+                    "InProgress during discover",
+                )
             elif isinstance(exc, asyncio.TimeoutError):
                 _LOGGER.warning(
                     "Scanner hard timeout on %s after %.0f s "
@@ -702,8 +807,11 @@ async def discover(
                     attempt,
                     max_attempts,
                 )
-                if IS_LINUX:
-                    await _power_cycle_adapter_with_cooldown(adapter)
+                stuck_adapters.add(adapter)
+                await _try_recover_adapter(
+                    adapter, effective_adapters,
+                    "hard timeout (Stuck State 16)",
+                )
             else:
                 _LOGGER.debug(
                     "Scan error on %s: %s (attempt %d/%d)",
@@ -718,5 +826,9 @@ async def discover(
 
         if attempt < max_attempts:
             await asyncio.sleep(_RETRY_BACKOFF)
+
+    # Last resort: power-cycle the least-connected stuck adapter
+    if IS_LINUX and stuck_adapters:
+        await _last_resort_power_cycle(stuck_adapters, effective_adapters)
 
     return []

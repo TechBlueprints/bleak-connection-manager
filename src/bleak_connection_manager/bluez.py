@@ -441,6 +441,12 @@ async def _power_cycle_adapter_with_cooldown(adapter: str) -> bool:
     rapid cascading cycles when multiple processes detect stale state
     within a short window.
 
+    Before cycling, queries D-Bus for active connections on the adapter
+    and logs a WARNING listing affected devices.  The caller is
+    responsible for deciding that power-cycling is necessary (e.g. no
+    other adapter available); this function always proceeds if the
+    cooldown allows.
+
     Returns ``True`` if the power-cycle ran, ``False`` if skipped or
     failed.
     """
@@ -454,10 +460,140 @@ async def _power_cycle_adapter_with_cooldown(adapter: str) -> bool:
         )
         return False
 
+    connected = await get_connected_devices(adapter)
+    if connected:
+        _LOGGER.warning(
+            "%s: Power-cycling adapter with %d active connection(s) "
+            "that will be dropped: %s",
+            adapter,
+            len(connected),
+            ", ".join(connected),
+        )
+    else:
+        _LOGGER.debug("%s: No active connections, safe to power-cycle", adapter)
+
     result = await power_cycle_adapter(adapter)
     if result:
         _last_power_cycle[adapter] = time.monotonic()
     return result
+
+
+async def try_stop_discovery(adapter: str) -> bool:
+    """Attempt to clear a discovery session from our shared D-Bus bus.
+
+    BlueZ ties each discovery session to the D-Bus connection that
+    called ``StartDiscovery``.  If *our* bus started a session that
+    was never stopped (e.g. ``BleakScanner`` cancelled mid-scan),
+    calling ``StopDiscovery`` from the same bus will clear it.
+
+    If the orphaned session belongs to a *different* D-Bus connection,
+    this call will fail harmlessly with an error.
+
+    Returns ``True`` if ``StopDiscovery`` succeeded (session cleared),
+    ``False`` otherwise.
+    """
+    if not IS_LINUX:
+        return False
+
+    try:
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
+    except ImportError:
+        return False
+
+    adapter_path = f"/org/bluez/{adapter}"
+
+    try:
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path=adapter_path,
+                interface=_ADAPTER_INTERFACE,
+                member="StopDiscovery",
+            )
+        )
+        if reply.message_type == MessageType.ERROR:
+            _LOGGER.debug(
+                "%s: StopDiscovery from our bus failed (expected if "
+                "session belongs to another connection): %s",
+                adapter,
+                reply.body[0] if reply.body else "unknown",
+            )
+            return False
+        _LOGGER.info(
+            "%s: StopDiscovery from our bus succeeded — "
+            "cleared orphaned session without power-cycle",
+            adapter,
+        )
+        return True
+    except Exception:
+        _LOGGER.debug(
+            "%s: StopDiscovery call failed", adapter, exc_info=True,
+        )
+        return False
+
+
+async def get_connected_devices(adapter: str) -> list[str]:
+    """Return MAC addresses of devices connected on *adapter*.
+
+    Queries BlueZ ``GetManagedObjects`` and filters for
+    ``org.bluez.Device1`` entries under this adapter where
+    ``Connected=True``.
+
+    Returns an empty list on error or non-Linux platforms.
+    """
+    if not IS_LINUX:
+        return []
+
+    try:
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
+    except ImportError:
+        return []
+
+    adapter_prefix = f"/org/bluez/{adapter}/"
+
+    try:
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path="/",
+                interface=_OBJECT_MANAGER_INTERFACE,
+                member="GetManagedObjects",
+            )
+        )
+        if reply.message_type == MessageType.ERROR:
+            return []
+
+        connected: list[str] = []
+        objects = reply.body[0]
+        for path, interfaces in objects.items():
+            if not path.startswith(adapter_prefix):
+                continue
+            dev_props = interfaces.get(_DEVICE_INTERFACE)
+            if dev_props is None:
+                continue
+            conn_val = dev_props.get("Connected")
+            if conn_val is not None and hasattr(conn_val, "value"):
+                conn_val = conn_val.value
+            if conn_val is True:
+                addr_val = dev_props.get("Address")
+                if addr_val is not None and hasattr(addr_val, "value"):
+                    addr_val = addr_val.value
+                if isinstance(addr_val, str):
+                    connected.append(addr_val)
+        return connected
+    except Exception:
+        _LOGGER.debug(
+            "%s: Failed to enumerate connected devices",
+            adapter,
+            exc_info=True,
+        )
+        return []
 
 
 async def _probe_start_discovery(adapter: str) -> bool | None:
@@ -536,24 +672,24 @@ async def _probe_start_discovery(adapter: str) -> bool | None:
 async def ensure_adapter_scan_ready(adapter: str) -> bool:
     """Pre-scan health check: detect and repair stale adapter state.
 
-    Must be called **while holding the scan lock** so that no other
-    process can interfere during the probe.
+    Uses a tiered recovery strategy that avoids power-cycling
+    whenever possible:
 
-    Detects two failure modes:
+    **Tier 1** — Try ``StopDiscovery`` from our shared D-Bus bus.
+    If the orphaned session belongs to *our* bus, this clears it
+    without disrupting any connections.
 
-    1. **Discovering=True** — An orphaned discovery session from a
-       previous ``BleakScanner`` that was cancelled without calling
-       ``StopDiscovery`` (e.g. hard timeout / Stuck State 16).  Since
-       BlueZ ties sessions to D-Bus connections, ``StopDiscovery``
-       from our bus won't help.  Fix: power-cycle the adapter.
+    **Tier 2** — If Tier 1 fails, return ``False`` so the scanner
+    can rotate to another adapter.  The caller is responsible for
+    deciding when to escalate to power-cycling (Tier 3).
 
-    2. **Discovering=False + InProgress** — The originating D-Bus
-       connection died and BlueZ auto-stopped the discovery, but left
-       stale internal state.  Detected by probing with a test
-       ``StartDiscovery``.  Fix: power-cycle the adapter.
+    This function never power-cycles the adapter directly.  That
+    decision is deferred to the scanner loop which has visibility
+    into whether alternative adapters are available and whether
+    the stuck adapter has active connections.
 
     Returns ``True`` if the adapter is ready for scanning, ``False``
-    if the adapter could not be repaired.
+    if it is stuck and the caller should try another adapter.
     """
     if not IS_LINUX:
         return True
@@ -564,16 +700,18 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
     if discovering is True:
         _LOGGER.warning(
             "%s: Discovering=True with scan lock held — "
-            "orphaned scan session, power-cycling adapter",
+            "orphaned scan session, attempting StopDiscovery",
             adapter,
         )
-        if not await _power_cycle_adapter_with_cooldown(adapter):
-            return False
+        # Tier 1: try to clear from our bus (zero-cost attempt)
+        await try_stop_discovery(adapter)
 
         discovering = await get_adapter_discovering(adapter)
         if discovering is True:
-            _LOGGER.error(
-                "%s: Still Discovering=True after power-cycle", adapter,
+            _LOGGER.warning(
+                "%s: Still Discovering=True after StopDiscovery — "
+                "session belongs to another D-Bus connection",
+                adapter,
             )
             return False
         return True
@@ -584,10 +722,20 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
     if probe_ok is False:
         _LOGGER.warning(
             "%s: Discovering=False but StartDiscovery returns InProgress "
-            "— stale internal state, power-cycling adapter",
+            "— stale internal state",
             adapter,
         )
-        if not await _power_cycle_adapter_with_cooldown(adapter):
+        # Tier 1: try StopDiscovery in case our bus owns the session
+        await try_stop_discovery(adapter)
+
+        # Re-probe after the attempt
+        probe_ok = await _probe_start_discovery(adapter)
+        if probe_ok is False:
+            _LOGGER.warning(
+                "%s: Still InProgress after StopDiscovery — "
+                "needs power-cycle (deferred to caller)",
+                adapter,
+            )
             return False
 
     return True
