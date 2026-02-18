@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Any
 
-from .const import IS_LINUX
+from .const import IS_LINUX, AdapterScanState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -354,22 +354,52 @@ async def get_adapter_discovering(adapter: str) -> bool | None:
         return None
 
 
-async def power_cycle_adapter(adapter: str) -> bool:
-    """Power-cycle a BlueZ adapter via D-Bus ``Powered`` property.
+async def _get_adapter_powered(adapter: str) -> bool | None:
+    """Read the ``Powered`` property of a BlueZ adapter.
 
-    Sets ``Powered=False``, waits briefly, then ``Powered=True``.
-    This drops ALL connections and discovery sessions on the adapter,
-    clearing any stale BlueZ state.
+    Returns ``True``/``False`` or ``None`` on error.
+    """
+    if not IS_LINUX:
+        return None
+    try:
+        from dbus_fast import Message, MessageType
 
-    Less disruptive than ``bluetooth-auto-recovery`` (no USB reset
-    or rfkill).  Suitable for clearing orphaned discovery sessions
-    without needing external tools.
+        from .dbus_bus import get_bus
+    except ImportError:
+        return None
 
-    Returns ``True`` if the power-cycle completed, ``False`` on error.
+    try:
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination=_BLUEZ_SERVICE,
+                path=f"/org/bluez/{adapter}",
+                interface=_PROPERTIES_INTERFACE,
+                member="Get",
+                signature="ss",
+                body=[_ADAPTER_INTERFACE, "Powered"],
+            )
+        )
+        if reply.message_type == MessageType.ERROR:
+            return None
+        val = reply.body[0]
+        if hasattr(val, "value"):
+            val = val.value
+        return bool(val)
+    except Exception:
+        _LOGGER.debug(
+            "Failed to read Powered on %s", adapter, exc_info=True,
+        )
+        return None
+
+
+async def _set_adapter_powered(adapter: str, powered: bool) -> bool:
+    """Set the ``Powered`` property via D-Bus.
+
+    Returns ``True`` if the call succeeded, ``False`` on error.
     """
     if not IS_LINUX:
         return False
-
     try:
         from dbus_fast import Message, MessageType, Variant
 
@@ -377,60 +407,171 @@ async def power_cycle_adapter(adapter: str) -> bool:
     except ImportError:
         return False
 
-    adapter_path = f"/org/bluez/{adapter}"
-
     try:
         bus = await get_bus()
-
-        # Powered = False
         reply = await bus.call(
             Message(
                 destination=_BLUEZ_SERVICE,
-                path=adapter_path,
+                path=f"/org/bluez/{adapter}",
                 interface=_PROPERTIES_INTERFACE,
                 member="Set",
                 signature="ssv",
-                body=[_ADAPTER_INTERFACE, "Powered", Variant("b", False)],
+                body=[_ADAPTER_INTERFACE, "Powered", Variant("b", powered)],
             )
         )
         if reply.message_type == MessageType.ERROR:
             _LOGGER.warning(
-                "%s: Failed to set Powered=False: %s",
+                "%s: Failed to set Powered=%s: %s",
                 adapter,
+                powered,
                 reply.body[0] if reply.body else "unknown",
             )
             return False
-
-        await asyncio.sleep(0.5)
-
-        # Powered = True
-        reply = await bus.call(
-            Message(
-                destination=_BLUEZ_SERVICE,
-                path=adapter_path,
-                interface=_PROPERTIES_INTERFACE,
-                member="Set",
-                signature="ssv",
-                body=[_ADAPTER_INTERFACE, "Powered", Variant("b", True)],
-            )
+        return True
+    except Exception:
+        _LOGGER.debug(
+            "Failed to set Powered=%s on %s", powered, adapter, exc_info=True,
         )
-        if reply.message_type == MessageType.ERROR:
-            _LOGGER.warning(
-                "%s: Failed to set Powered=True: %s",
-                adapter,
-                reply.body[0] if reply.body else "unknown",
-            )
-            return False
+        return False
 
+
+def _hciconfig_up(adapter: str) -> bool:
+    """Bring an adapter up via ``hciconfig`` as a subprocess fallback.
+
+    This bypasses BlueZ's D-Bus path and talks directly to the kernel,
+    which succeeds even when the D-Bus ``Powered=True`` fails (e.g.
+    after an HCI_Reset timeout).
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["hciconfig", adapter, "up"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            _LOGGER.info(
+                "%s: Brought adapter up via hciconfig fallback", adapter,
+            )
+            return True
+        _LOGGER.warning(
+            "%s: hciconfig up failed (rc=%d): %s",
+            adapter,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return False
+    except Exception:
+        _LOGGER.warning(
+            "%s: hciconfig up subprocess failed", adapter, exc_info=True,
+        )
+        return False
+
+
+async def power_cycle_adapter(adapter: str) -> bool:
+    """Power-cycle a BlueZ adapter via D-Bus ``Powered`` property.
+
+    Sets ``Powered=False``, waits briefly, then ``Powered=True``.
+    This drops ALL connections and discovery sessions on the adapter,
+    clearing any stale BlueZ state.
+
+    After setting ``Powered=True``, verifies the adapter actually
+    came back up.  If D-Bus power-on fails (e.g. HCI_Reset timeout
+    left the controller in a bad state), retries once via D-Bus
+    then falls back to ``hciconfig <adapter> up``.
+
+    Returns ``True`` if the adapter is powered on when this function
+    returns, ``False`` if all recovery attempts failed.
+    """
+    if not IS_LINUX:
+        return False
+
+    # ── Step 1: Power off ──────────────────────────────────────────
+    if not await _set_adapter_powered(adapter, False):
+        return False
+
+    await asyncio.sleep(0.5)
+
+    # ── Step 2: Power on with verification ─────────────────────────
+    await _set_adapter_powered(adapter, True)
+
+    await asyncio.sleep(0.5)
+    powered = await _get_adapter_powered(adapter)
+    if powered is True:
         _LOGGER.info("%s: Power-cycled adapter via D-Bus", adapter)
         await asyncio.sleep(_POWER_CYCLE_SETTLE)
         return True
 
-    except Exception:
-        _LOGGER.warning(
-            "Failed to power-cycle %s", adapter, exc_info=True,
+    # ── Step 3: D-Bus retry ────────────────────────────────────────
+    _LOGGER.warning(
+        "%s: Adapter still DOWN after Powered=True, retrying D-Bus", adapter,
+    )
+    await asyncio.sleep(1.0)
+    await _set_adapter_powered(adapter, True)
+    await asyncio.sleep(0.5)
+    powered = await _get_adapter_powered(adapter)
+    if powered is True:
+        _LOGGER.info("%s: Power-cycled adapter via D-Bus (retry succeeded)", adapter)
+        await asyncio.sleep(_POWER_CYCLE_SETTLE)
+        return True
+
+    # ── Step 4: hciconfig fallback ─────────────────────────────────
+    _LOGGER.warning(
+        "%s: D-Bus Powered=True failed twice, falling back to hciconfig",
+        adapter,
+    )
+    _hciconfig_up(adapter)
+    await asyncio.sleep(1.0)
+    powered = await _get_adapter_powered(adapter)
+    if powered is True:
+        _LOGGER.info(
+            "%s: Adapter recovered via hciconfig fallback", adapter,
         )
-        return False
+        await asyncio.sleep(_POWER_CYCLE_SETTLE)
+        return True
+
+    _LOGGER.error(
+        "%s: Adapter LEFT DOWN after all recovery attempts — "
+        "manual intervention may be required",
+        adapter,
+    )
+    return False
+
+
+async def ensure_adapters_up(adapters: list[str]) -> None:
+    """Self-heal: bring up any adapters that are currently DOWN.
+
+    Called at the start of scan operations to recover from failed
+    power-cycles or other conditions that left an adapter powered off.
+    Tries D-Bus first, then falls back to ``hciconfig`` if needed.
+    """
+    if not IS_LINUX:
+        return
+
+    for adapter in adapters:
+        powered = await _get_adapter_powered(adapter)
+        if powered is False:
+            _LOGGER.warning(
+                "%s: Adapter is DOWN, attempting self-heal", adapter,
+            )
+            if await _set_adapter_powered(adapter, True):
+                await asyncio.sleep(0.5)
+                powered = await _get_adapter_powered(adapter)
+            if powered is not True:
+                _LOGGER.warning(
+                    "%s: D-Bus power-on failed, trying hciconfig", adapter,
+                )
+                _hciconfig_up(adapter)
+                await asyncio.sleep(1.0)
+                powered = await _get_adapter_powered(adapter)
+            if powered is True:
+                _LOGGER.info("%s: Self-healed — adapter is back UP", adapter)
+            else:
+                _LOGGER.error(
+                    "%s: Self-heal FAILED — adapter remains DOWN", adapter,
+                )
 
 
 async def _power_cycle_adapter_with_cooldown(adapter: str) -> bool:
@@ -669,7 +810,7 @@ async def _probe_start_discovery(adapter: str) -> bool | None:
         return None
 
 
-async def ensure_adapter_scan_ready(adapter: str) -> bool:
+async def ensure_adapter_scan_ready(adapter: str) -> AdapterScanState:
     """Pre-scan health check: detect and repair stale adapter state.
 
     Uses a tiered recovery strategy that avoids power-cycling
@@ -679,20 +820,28 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
     If the orphaned session belongs to *our* bus, this clears it
     without disrupting any connections.
 
-    **Tier 2** — If Tier 1 fails, return ``False`` so the scanner
-    can rotate to another adapter.  The caller is responsible for
-    deciding when to escalate to power-cycling (Tier 3).
+    **Tier 2** — If Tier 1 fails, return a non-READY state so the
+    scanner can adapt.  The caller is responsible for deciding
+    whether to cache-poll, rotate, or escalate.
 
     This function never power-cycles the adapter directly.  That
     decision is deferred to the scanner loop which has visibility
     into whether alternative adapters are available and whether
     the stuck adapter has active connections.
 
-    Returns ``True`` if the adapter is ready for scanning, ``False``
-    if it is stuck and the caller should try another adapter.
+    Returns
+    -------
+    AdapterScanState
+        ``READY`` if the adapter can scan normally.
+        ``STUCK`` if ``Discovering=True`` and can't be cleared
+        (orphaned BlueZ session — rotation/power-cycle may help).
+        ``EXTERNAL_SCAN`` if ``Discovering=False`` but
+        ``StartDiscovery`` returns ``InProgress`` (external raw
+        HCI scan corruption — cache polling is the correct
+        response, power-cycling is futile).
     """
     if not IS_LINUX:
-        return True
+        return AdapterScanState.READY
 
     # ── Check 1: Orphaned Discovering=True ─────────────────────────
     discovering = await get_adapter_discovering(adapter)
@@ -703,7 +852,6 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
             "orphaned scan session, attempting StopDiscovery",
             adapter,
         )
-        # Tier 1: try to clear from our bus (zero-cost attempt)
         await try_stop_discovery(adapter)
 
         discovering = await get_adapter_discovering(adapter)
@@ -713,8 +861,8 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
                 "session belongs to another D-Bus connection",
                 adapter,
             )
-            return False
-        return True
+            return AdapterScanState.STUCK
+        return AdapterScanState.READY
 
     # ── Check 2: Hidden stale InProgress ───────────────────────────
     probe_ok = await _probe_start_discovery(adapter)
@@ -722,20 +870,18 @@ async def ensure_adapter_scan_ready(adapter: str) -> bool:
     if probe_ok is False:
         _LOGGER.warning(
             "%s: Discovering=False but StartDiscovery returns InProgress "
-            "— stale internal state",
+            "— likely external raw HCI scan corruption",
             adapter,
         )
-        # Tier 1: try StopDiscovery in case our bus owns the session
         await try_stop_discovery(adapter)
 
-        # Re-probe after the attempt
         probe_ok = await _probe_start_discovery(adapter)
         if probe_ok is False:
             _LOGGER.warning(
                 "%s: Still InProgress after StopDiscovery — "
-                "needs power-cycle (deferred to caller)",
+                "external scan active, will use cache polling",
                 adapter,
             )
-            return False
+            return AdapterScanState.EXTERNAL_SCAN
 
-    return True
+    return AdapterScanState.READY

@@ -6,9 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from bleak_connection_manager.bluez import (
+    _get_adapter_powered,
+    _hciconfig_up,
     _power_cycle_adapter_with_cooldown,
+    _set_adapter_powered,
     address_to_bluez_path,
     ensure_adapter_scan_ready,
+    ensure_adapters_up,
     get_adapter_discovering,
     get_connected_devices,
     is_inactive_connection,
@@ -16,6 +20,7 @@ from bleak_connection_manager.bluez import (
     try_stop_discovery,
     verified_disconnect,
 )
+from bleak_connection_manager.const import AdapterScanState
 
 
 def test_address_to_bluez_path_default_adapter():
@@ -223,42 +228,85 @@ async def test_power_cycle_adapter_non_linux():
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.bluez.IS_LINUX", True)
-async def test_power_cycle_adapter_success():
-    from dbus_fast import MessageType
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+async def test_power_cycle_adapter_success(mock_set, mock_get):
+    """Happy path: power off succeeds, power on succeeds, verification passes."""
+    mock_set.return_value = True
+    mock_get.return_value = True
 
-    mock_reply = MagicMock()
-    mock_reply.message_type = MessageType.METHOD_RETURN
-
-    mock_bus = AsyncMock()
-    mock_bus.call.return_value = mock_reply
-
-    with (
-        patch("bleak_connection_manager.dbus_bus.get_bus", return_value=mock_bus),
-        patch("bleak_connection_manager.bluez._POWER_CYCLE_SETTLE", 0.0),
-    ):
+    with patch("bleak_connection_manager.bluez._POWER_CYCLE_SETTLE", 0.0):
         result = await power_cycle_adapter("hci0")
 
     assert result is True
-    # Called twice: Powered=False and Powered=True
-    assert mock_bus.call.call_count == 2
+    assert mock_set.call_count == 2
+    mock_set.assert_any_call("hci0", False)
+    mock_set.assert_any_call("hci0", True)
 
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.bluez.IS_LINUX", True)
-async def test_power_cycle_adapter_failure_on_power_off():
-    from dbus_fast import MessageType
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+async def test_power_cycle_adapter_failure_on_power_off(mock_set):
+    mock_set.return_value = False
 
-    mock_reply = MagicMock()
-    mock_reply.message_type = MessageType.ERROR
-    mock_reply.body = ["Failed"]
+    result = await power_cycle_adapter("hci0")
 
-    mock_bus = AsyncMock()
-    mock_bus.call.return_value = mock_reply
+    assert result is False
+    mock_set.assert_called_once_with("hci0", False)
 
-    with patch("bleak_connection_manager.dbus_bus.get_bus", return_value=mock_bus):
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._hciconfig_up")
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+async def test_power_cycle_adapter_dbus_retry_succeeds(mock_set, mock_get, mock_hci):
+    """Powered=True fails first, but D-Bus retry succeeds."""
+    mock_set.side_effect = [True, True, True]
+    mock_get.side_effect = [False, True]
+
+    with patch("bleak_connection_manager.bluez._POWER_CYCLE_SETTLE", 0.0):
+        result = await power_cycle_adapter("hci0")
+
+    assert result is True
+    mock_hci.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._hciconfig_up")
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+async def test_power_cycle_adapter_hciconfig_fallback(mock_set, mock_get, mock_hci):
+    """D-Bus Powered=True fails twice, hciconfig fallback recovers."""
+    mock_set.side_effect = [True, True, True]
+    mock_get.side_effect = [False, False, True]
+    mock_hci.return_value = True
+
+    with patch("bleak_connection_manager.bluez._POWER_CYCLE_SETTLE", 0.0):
+        result = await power_cycle_adapter("hci0")
+
+    assert result is True
+    mock_hci.assert_called_once_with("hci0")
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._hciconfig_up")
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+async def test_power_cycle_adapter_all_recovery_fails(mock_set, mock_get, mock_hci):
+    """All recovery attempts fail — adapter left DOWN."""
+    mock_set.side_effect = [True, True, True]
+    mock_get.return_value = False
+    mock_hci.return_value = False
+
+    with patch("bleak_connection_manager.bluez._POWER_CYCLE_SETTLE", 0.0):
         result = await power_cycle_adapter("hci0")
 
     assert result is False
+    mock_hci.assert_called_once_with("hci0")
 
 
 # ── power_cycle_adapter_with_cooldown tests ────────────────────────
@@ -400,7 +448,7 @@ async def test_get_connected_devices_returns_connected():
 @patch("bleak_connection_manager.bluez.IS_LINUX", False)
 async def test_ensure_adapter_scan_ready_non_linux():
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is True
+    assert result == AdapterScanState.READY
 
 
 @pytest.mark.asyncio
@@ -413,7 +461,7 @@ async def test_ensure_adapter_scan_ready_clean(mock_disc, mock_probe):
     mock_probe.return_value = True
 
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is True
+    assert result == AdapterScanState.READY
 
 
 @pytest.mark.asyncio
@@ -428,7 +476,7 @@ async def test_ensure_adapter_scan_ready_discovering_true_stop_clears(
     mock_stop.return_value = True
 
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is True
+    assert result == AdapterScanState.READY
     mock_stop.assert_called_once_with("hci0")
 
 
@@ -439,12 +487,12 @@ async def test_ensure_adapter_scan_ready_discovering_true_stop_clears(
 async def test_ensure_adapter_scan_ready_discovering_true_stop_fails(
     mock_disc, mock_stop
 ):
-    """Discovering=True — StopDiscovery doesn't help, returns False for rotation."""
+    """Discovering=True — StopDiscovery doesn't help, returns STUCK."""
     mock_disc.side_effect = [True, True]
     mock_stop.return_value = False
 
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is False
+    assert result == AdapterScanState.STUCK
     mock_stop.assert_called_once_with("hci0")
 
 
@@ -462,7 +510,7 @@ async def test_ensure_adapter_scan_ready_inprogress_stop_clears(
     mock_stop.return_value = True
 
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is True
+    assert result == AdapterScanState.READY
     mock_stop.assert_called_once_with("hci0")
 
 
@@ -474,13 +522,13 @@ async def test_ensure_adapter_scan_ready_inprogress_stop_clears(
 async def test_ensure_adapter_scan_ready_inprogress_stop_fails(
     mock_disc, mock_probe, mock_stop
 ):
-    """Hidden InProgress — StopDiscovery doesn't help, returns False."""
+    """Hidden InProgress — StopDiscovery doesn't help, returns EXTERNAL_SCAN."""
     mock_disc.return_value = False
     mock_probe.side_effect = [False, False]
     mock_stop.return_value = False
 
     result = await ensure_adapter_scan_ready("hci0")
-    assert result is False
+    assert result == AdapterScanState.EXTERNAL_SCAN
 
 
 # ── _power_cycle_adapter_with_cooldown connection awareness ────────
@@ -506,3 +554,52 @@ async def test_power_cycle_warns_about_active_connections(
     mock_cycle.assert_called_once_with("hci_test_warn")
 
     bluez_mod._last_power_cycle.pop("hci_test_warn", None)
+
+
+# ── ensure_adapters_up tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", False)
+async def test_ensure_adapters_up_non_linux():
+    """Non-Linux is a no-op."""
+    await ensure_adapters_up(["hci0", "hci1"])
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+async def test_ensure_adapters_up_all_up(mock_get):
+    """All adapters already UP — nothing to do."""
+    mock_get.return_value = True
+    await ensure_adapters_up(["hci0", "hci1"])
+    assert mock_get.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._hciconfig_up")
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+async def test_ensure_adapters_up_recovers_down_adapter(mock_get, mock_set, mock_hci):
+    """One adapter DOWN — D-Bus brings it back."""
+    mock_get.side_effect = [True, False, True]
+    mock_set.return_value = True
+
+    await ensure_adapters_up(["hci0", "hci1"])
+    mock_set.assert_called_once_with("hci1", True)
+    mock_hci.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez._hciconfig_up")
+@patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
+@patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
+async def test_ensure_adapters_up_hciconfig_fallback(mock_get, mock_set, mock_hci):
+    """D-Bus power-on fails, hciconfig fallback succeeds."""
+    mock_get.side_effect = [False, False, True]
+    mock_set.return_value = True
+
+    await ensure_adapters_up(["hci0"])
+    mock_hci.assert_called_once_with("hci0")

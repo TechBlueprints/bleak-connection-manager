@@ -32,10 +32,11 @@ from .adapters import discover_adapters, pick_adapter
 from .bluez import (
     _power_cycle_adapter_with_cooldown,
     ensure_adapter_scan_ready,
+    ensure_adapters_up,
     get_connected_devices,
     try_stop_discovery,
 )
-from .const import IS_LINUX, ScanLockConfig
+from .const import IS_LINUX, AdapterScanState, ScanLockConfig
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .scan_lock import acquire_scan_lock, release_scan_lock
 
@@ -295,6 +296,60 @@ async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
     return None
 
 
+async def _find_all_in_bluez_cache() -> list[BLEDevice]:
+    """Return all ``Device1`` entries from the BlueZ D-Bus cache.
+
+    Used as a fallback for ``discover()`` when an external raw HCI scan
+    is active — the scan continuously populates the cache via kernel
+    mgmt events, so the cache contents are reasonably fresh.
+    """
+    try:
+        from dbus_fast import Message, MessageType
+
+        from .dbus_bus import get_bus
+    except ImportError:
+        return []
+
+    bus = await get_bus()
+    reply = await bus.call(
+        Message(
+            destination="org.bluez",
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="GetManagedObjects",
+        )
+    )
+    if reply.message_type == MessageType.ERROR:
+        return []
+
+    devices: list[BLEDevice] = []
+    objects = reply.body[0]
+    for path, interfaces in objects.items():
+        dev_props = interfaces.get("org.bluez.Device1")
+        if dev_props is None:
+            continue
+        dev_addr = dev_props.get("Address")
+        if hasattr(dev_addr, "value"):
+            dev_addr = dev_addr.value
+        if not isinstance(dev_addr, str):
+            continue
+        dev_name = dev_props.get("Name")
+        if hasattr(dev_name, "value"):
+            dev_name = dev_name.value
+        dev_rssi = dev_props.get("RSSI")
+        if hasattr(dev_rssi, "value"):
+            dev_rssi = dev_rssi.value
+        devices.append(
+            BLEDevice(
+                address=dev_addr,
+                name=dev_name if isinstance(dev_name, str) else None,
+                rssi=dev_rssi if isinstance(dev_rssi, int) else 0,
+                details={"path": path},
+            )
+        )
+    return devices
+
+
 # How often to re-check the BlueZ cache while waiting for another
 # process's scan to populate it.
 _CACHE_POLL_INTERVAL = 0.5
@@ -391,6 +446,10 @@ async def find_device(
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]
 
+    # ── Self-heal: bring up any adapters left DOWN ─────────────────
+    if IS_LINUX:
+        await ensure_adapters_up(effective_adapters)
+
     # ── Step 1: Cache-first — check BlueZ D-Bus cache ─────────────
     #
     # If any process has previously scanned and found this device,
@@ -457,7 +516,7 @@ async def find_device(
 
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     last_error: Exception | None = None
-    stuck_adapters: set[str] = set()
+    stuck_adapters: dict[str, AdapterScanState] = {}
 
     for attempt in range(1, max_attempts + 1):
         adapter = pick_adapter(effective_adapters, attempt)
@@ -518,17 +577,39 @@ async def find_device(
         # ── Pre-scan adapter health check ──────────────────────────
         if IS_LINUX:
             try:
-                ready = await ensure_adapter_scan_ready(adapter)
-                if not ready:
-                    _LOGGER.warning(
-                        "%s: Adapter %s not scan-ready, rotating "
-                        "(attempt %d/%d)",
+                scan_state = await ensure_adapter_scan_ready(adapter)
+                if scan_state == AdapterScanState.EXTERNAL_SCAN:
+                    _LOGGER.info(
+                        "%s: External scan detected on %s, polling "
+                        "cache instead of scanning (attempt %d/%d)",
                         address,
                         adapter,
                         attempt,
                         max_attempts,
                     )
-                    stuck_adapters.add(adapter)
+                    release_scan_lock(fd)
+                    fd = None
+                    cached = await _poll_cache_while_locked(
+                        address, timeout,
+                    )
+                    if cached is not None:
+                        _LOGGER.info(
+                            "%s: Found in cache via external scan on %s",
+                            address,
+                            adapter,
+                        )
+                        return cached
+                    continue
+                elif scan_state == AdapterScanState.STUCK:
+                    _LOGGER.warning(
+                        "%s: Adapter %s stuck (orphaned session), "
+                        "rotating (attempt %d/%d)",
+                        address,
+                        adapter,
+                        attempt,
+                        max_attempts,
+                    )
+                    stuck_adapters[adapter] = AdapterScanState.STUCK
                     release_scan_lock(fd)
                     fd = None
                     continue
@@ -592,7 +673,7 @@ async def find_device(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, address)
-                stuck_adapters.add(adapter)
+                stuck_adapters[adapter] = AdapterScanState.STUCK
                 await _try_recover_adapter(
                     adapter, effective_adapters,
                     "InProgress during scan",
@@ -607,7 +688,7 @@ async def find_device(
                     attempt,
                     max_attempts,
                 )
-                stuck_adapters.add(adapter)
+                stuck_adapters[adapter] = AdapterScanState.STUCK
                 await _try_recover_adapter(
                     adapter, effective_adapters,
                     "hard timeout (Stuck State 16)",
@@ -630,10 +711,15 @@ async def find_device(
 
     # ── Last resort: all attempts exhausted ────────────────────────
     #
-    # If adapters are stuck, try power-cycling the one with fewest
-    # active connections as a last resort, then check the cache.
-    if IS_LINUX and stuck_adapters:
-        await _last_resort_power_cycle(stuck_adapters, effective_adapters)
+    # Only power-cycle adapters that are STUCK (not EXTERNAL_SCAN —
+    # power-cycling is futile when an external raw HCI scanner will
+    # re-corrupt the state immediately).
+    truly_stuck = {
+        a for a, state in stuck_adapters.items()
+        if state == AdapterScanState.STUCK
+    }
+    if IS_LINUX and truly_stuck:
+        await _last_resort_power_cycle(truly_stuck, effective_adapters)
 
     # Check BlueZ cache — another process's scan or the power-cycle
     # may have populated it.
@@ -707,8 +793,12 @@ async def discover(
         adapters = discover_adapters()
     effective_adapters = adapters or ["hci0"]
 
+    # Self-heal: bring up any adapters left DOWN.
+    if IS_LINUX:
+        await ensure_adapters_up(effective_adapters)
+
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
-    stuck_adapters: set[str] = set()
+    stuck_adapters: dict[str, AdapterScanState] = {}
 
     for attempt in range(1, max_attempts + 1):
         adapter = pick_adapter(effective_adapters, attempt)
@@ -734,16 +824,42 @@ async def discover(
         # Pre-scan adapter health check
         if IS_LINUX:
             try:
-                ready = await ensure_adapter_scan_ready(adapter)
-                if not ready:
-                    _LOGGER.warning(
-                        "Adapter %s not scan-ready, rotating "
-                        "(attempt %d/%d)",
+                scan_state = await ensure_adapter_scan_ready(adapter)
+                if scan_state == AdapterScanState.EXTERNAL_SCAN:
+                    _LOGGER.info(
+                        "External scan detected on %s, returning "
+                        "cached devices (attempt %d/%d)",
                         adapter,
                         attempt,
                         max_attempts,
                     )
-                    stuck_adapters.add(adapter)
+                    release_scan_lock(fd)
+                    fd = None
+                    try:
+                        devices = await _find_all_in_bluez_cache()
+                        _LOGGER.info(
+                            "Returning %d devices from BlueZ cache "
+                            "(external scan on %s)",
+                            len(devices),
+                            adapter,
+                        )
+                        return devices
+                    except Exception:
+                        _LOGGER.debug(
+                            "Cache fallback failed on %s",
+                            adapter,
+                            exc_info=True,
+                        )
+                    continue
+                elif scan_state == AdapterScanState.STUCK:
+                    _LOGGER.warning(
+                        "Adapter %s stuck (orphaned session), "
+                        "rotating (attempt %d/%d)",
+                        adapter,
+                        attempt,
+                        max_attempts,
+                    )
+                    stuck_adapters[adapter] = AdapterScanState.STUCK
                     release_scan_lock(fd)
                     fd = None
                     continue
@@ -793,7 +909,7 @@ async def discover(
                     max_attempts,
                 )
                 await _diagnose_inprogress(adapter, "discover")
-                stuck_adapters.add(adapter)
+                stuck_adapters[adapter] = AdapterScanState.STUCK
                 await _try_recover_adapter(
                     adapter, effective_adapters,
                     "InProgress during discover",
@@ -807,7 +923,7 @@ async def discover(
                     attempt,
                     max_attempts,
                 )
-                stuck_adapters.add(adapter)
+                stuck_adapters[adapter] = AdapterScanState.STUCK
                 await _try_recover_adapter(
                     adapter, effective_adapters,
                     "hard timeout (Stuck State 16)",
@@ -827,8 +943,12 @@ async def discover(
         if attempt < max_attempts:
             await asyncio.sleep(_RETRY_BACKOFF)
 
-    # Last resort: power-cycle the least-connected stuck adapter
-    if IS_LINUX and stuck_adapters:
-        await _last_resort_power_cycle(stuck_adapters, effective_adapters)
+    # Only power-cycle STUCK adapters (not EXTERNAL_SCAN).
+    truly_stuck = {
+        a for a, state in stuck_adapters.items()
+        if state == AdapterScanState.STUCK
+    }
+    if IS_LINUX and truly_stuck:
+        await _last_resort_power_cycle(truly_stuck, effective_adapters)
 
     return []

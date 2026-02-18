@@ -4,8 +4,35 @@ from __future__ import annotations
 
 import platform
 from dataclasses import dataclass
+from enum import Enum
 
 IS_LINUX = platform.system() == "Linux"
+
+
+class AdapterScanState(Enum):
+    """Result of pre-scan adapter health check.
+
+    Returned by :func:`~bleak_connection_manager.bluez.ensure_adapter_scan_ready`
+    to tell the scanner how to proceed.
+    """
+
+    READY = "ready"
+    """Adapter can scan normally via ``StartDiscovery``."""
+
+    EXTERNAL_SCAN = "external_scan"
+    """An external process (e.g. ``dbus-ble-sensors``) is running raw HCI
+    scans that corrupt BlueZ's internal discovery state.  Pattern:
+    ``Discovering=False`` but ``StartDiscovery`` returns ``InProgress``.
+
+    The scanner should fall back to BlueZ cache polling — the external
+    scan continuously populates the cache via kernel mgmt events.
+    Power-cycling is futile because the external scanner re-corrupts
+    the state immediately."""
+
+    STUCK = "stuck"
+    """BlueZ-level orphaned discovery session (``Discovering=True`` that
+    cannot be cleared via ``StopDiscovery``).  The scanner should rotate
+    to another adapter and may escalate to power-cycling as a last resort."""
 
 # Thread-level safety timer timeout (seconds).  Must be less than
 # BLEAK_SAFETY_TIMEOUT (60 s in bleak-retry-connector) so the asyncio
