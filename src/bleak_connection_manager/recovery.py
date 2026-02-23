@@ -240,6 +240,87 @@ def is_bluetoothd_alive() -> bool:
     return False
 
 
+async def restart_bluetoothd(
+    init_script: str = "/etc/init.d/bluetooth",
+    timeout: float = 5.0,
+) -> bool:
+    """Restart ``bluetoothd`` via the init script if it is not running.
+
+    On Venus OS, ``bluetoothd`` is managed by ``/etc/init.d/bluetooth``
+    (a SysV init script) with no crash supervision.  If it segfaults or
+    is killed, it stays dead until someone manually starts it.
+
+    This function:
+
+    1. Checks ``is_bluetoothd_alive()`` — if already running, returns
+       ``True`` immediately (no-op).
+    2. Runs ``<init_script> start`` via subprocess.
+    3. Waits up to *timeout* seconds for it to complete.
+    4. Verifies ``bluetoothd`` is running with a second ``/proc`` check.
+
+    Returns ``True`` if ``bluetoothd`` is running when the function
+    returns (whether it was already running or freshly started).
+    """
+    if not IS_LINUX:
+        return True
+
+    if is_bluetoothd_alive():
+        return True
+
+    if not os.path.isfile(init_script):
+        _LOGGER.error(
+            "Cannot restart bluetoothd: init script %s not found",
+            init_script,
+        )
+        return False
+
+    _LOGGER.warning(
+        "bluetoothd is not running — attempting restart via %s",
+        init_script,
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            init_script, "start",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            _LOGGER.error(
+                "bluetoothd restart timed out after %.0fs", timeout,
+            )
+            return False
+
+        if proc.returncode != 0:
+            _LOGGER.error(
+                "bluetoothd restart failed (exit %d): %s",
+                proc.returncode,
+                (stderr or stdout or b"").decode(errors="replace").strip(),
+            )
+            return False
+
+        await asyncio.sleep(0.5)
+
+        if is_bluetoothd_alive():
+            _LOGGER.info("bluetoothd restarted successfully")
+            return True
+
+        _LOGGER.error(
+            "bluetoothd init script exited 0 but process not found in /proc"
+        )
+        return False
+
+    except Exception:
+        _LOGGER.exception("Failed to restart bluetoothd")
+        return False
+
+
 async def reset_adapter(adapter: str, mac: str = "") -> bool:
     """Reset a BLE adapter using bluetooth-auto-recovery.
 
@@ -285,10 +366,15 @@ async def reset_adapter(adapter: str, mac: str = "") -> bool:
 
         # Verify bluetoothd survived the reset (Stuck State 11)
         if not is_bluetoothd_alive():
+            _LOGGER.warning(
+                "bluetoothd died after resetting %s (Stuck State 11) "
+                "— attempting auto-restart",
+                adapter,
+            )
+            if await restart_bluetoothd():
+                return True
             _LOGGER.critical(
-                "bluetoothd is not running after resetting %s "
-                "(Stuck State 11).  The init system or calling "
-                "application must restart it.",
+                "bluetoothd could not be restarted after resetting %s",
                 adapter,
             )
             return False

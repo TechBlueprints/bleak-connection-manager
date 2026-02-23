@@ -99,6 +99,62 @@ async def get_bus():
     return _bus
 
 
+async def _ping_bluez() -> bool:
+    """Single fast D-Bus check for ``org.bluez`` availability.
+
+    Returns ``True`` if BlueZ responded (any non-ServiceUnknown reply).
+    """
+    from dbus_fast import Message, MessageType
+
+    try:
+        bus = await get_bus()
+        reply = await bus.call(
+            Message(
+                destination="org.bluez",
+                path="/org/bluez",
+                interface="org.freedesktop.DBus.Properties",
+                member="GetAll",
+                signature="s",
+                body=["org.bluez.AgentManager1"],
+            )
+        )
+        if reply.message_type != MessageType.ERROR:
+            return True
+        error_name = reply.error_name or ""
+        if "ServiceUnknown" in error_name or "UnknownObject" in error_name:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _poll_bluez(timeout: float, poll_interval: float) -> bool:
+    """Poll D-Bus for ``org.bluez`` up to *timeout* seconds.
+
+    Returns ``True`` as soon as BlueZ responds, ``False`` on timeout.
+    """
+    elapsed = 0.0
+    while elapsed < timeout:
+        if await _ping_bluez():
+            if elapsed > 0:
+                _LOGGER.info("BlueZ ready on D-Bus after %.1fs", elapsed)
+            else:
+                _LOGGER.debug("BlueZ ready on D-Bus")
+            return True
+
+        _LOGGER.debug(
+            "Waiting for BlueZ on D-Bus (%.1fs / %.0fs)...",
+            elapsed, timeout,
+        )
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+        # Reconnect bus if it dropped while we were waiting
+        await get_bus()
+
+    return False
+
+
 async def wait_for_bluez(
     timeout: float = 30.0,
     poll_interval: float = 1.0,
@@ -113,8 +169,15 @@ async def wait_for_bluez(
         The name org.bluez was not provided by any .service files
 
     This function polls D-Bus until ``org.bluez`` is reachable or
-    *timeout* seconds have elapsed.  Call it once at service startup
-    (or the first time BCM needs BlueZ) to avoid the race.
+    *timeout* seconds have elapsed.
+
+    If the initial poll times out, the function attempts to restart
+    ``bluetoothd`` via ``/etc/init.d/bluetooth start`` and polls for
+    an additional 10 seconds.
+
+    The ``_bluez_ready`` cache is validated with a single D-Bus ping
+    on every call, so a crashed ``bluetoothd`` is detected even when
+    the cache says BlueZ was previously healthy.
 
     Returns ``True`` if BlueZ became available, ``False`` on timeout.
     """
@@ -123,64 +186,44 @@ async def wait_for_bluez(
     if not IS_LINUX:
         return True
 
+    # Validate the cache: if we previously marked BlueZ as ready,
+    # do a quick ping to confirm it's still alive.  This catches
+    # bluetoothd crashes that happened since the last successful check.
     if _bluez_ready:
+        if await _ping_bluez():
+            return True
+        _LOGGER.warning(
+            "BlueZ was previously available but is no longer responding "
+            "on D-Bus — bluetoothd may have crashed"
+        )
+        _bluez_ready = False
+
+    # Normal poll loop
+    if await _poll_bluez(timeout, poll_interval):
+        _bluez_ready = True
         return True
 
-    from dbus_fast import Message, MessageType
-
-    bus = await get_bus()
-    elapsed = 0.0
-
-    while elapsed < timeout:
-        try:
-            reply = await bus.call(
-                Message(
-                    destination="org.bluez",
-                    path="/org/bluez",
-                    interface="org.freedesktop.DBus.Properties",
-                    member="GetAll",
-                    signature="s",
-                    body=["org.bluez.AgentManager1"],
-                )
-            )
-            if reply.message_type != MessageType.ERROR:
-                _bluez_ready = True
-                if elapsed > 0:
-                    _LOGGER.info(
-                        "BlueZ ready on D-Bus after %.1fs", elapsed,
-                    )
-                else:
-                    _LOGGER.debug("BlueZ ready on D-Bus")
-                return True
-
-            error_name = reply.error_name or ""
-            if "ServiceUnknown" in error_name or "UnknownObject" in error_name:
-                pass  # BlueZ not yet available — keep polling
-            else:
-                # Some other D-Bus error on the interface is fine —
-                # it means org.bluez is alive and responded.
-                _bluez_ready = True
-                _LOGGER.debug("BlueZ ready on D-Bus (responded with %s)", error_name)
-                return True
-
-        except Exception:
-            pass  # Bus error — BlueZ not ready
-
-        _LOGGER.debug(
-            "Waiting for BlueZ on D-Bus (%.1fs / %.0fs)...",
-            elapsed, timeout,
-        )
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-
-        # Reconnect bus if it dropped while we were waiting
-        bus = await get_bus()
-
+    # Poll exhausted — attempt to restart bluetoothd
     _LOGGER.warning(
         "BlueZ did not appear on D-Bus after %.0fs — "
-        "proceeding anyway (BLE operations may fail)",
+        "attempting to restart bluetoothd",
         timeout,
     )
+
+    from .recovery import restart_bluetoothd
+
+    if await restart_bluetoothd():
+        if await _poll_bluez(10.0, poll_interval):
+            _bluez_ready = True
+            return True
+        _LOGGER.error(
+            "bluetoothd restarted but BlueZ still not on D-Bus after 10s"
+        )
+    else:
+        _LOGGER.error(
+            "Failed to restart bluetoothd — BLE operations will fail"
+        )
+
     return False
 
 

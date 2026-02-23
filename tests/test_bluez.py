@@ -568,20 +568,23 @@ async def test_ensure_adapters_up_non_linux():
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez.ensure_bluetoothd", new_callable=AsyncMock, return_value=True)
 @patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
-async def test_ensure_adapters_up_all_up(mock_get):
+async def test_ensure_adapters_up_all_up(mock_get, mock_btd):
     """All adapters already UP — nothing to do."""
     mock_get.return_value = True
     await ensure_adapters_up(["hci0", "hci1"])
     assert mock_get.call_count == 2
+    mock_btd.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez.ensure_bluetoothd", new_callable=AsyncMock, return_value=True)
 @patch("bleak_connection_manager.bluez._hciconfig_up")
 @patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
 @patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
-async def test_ensure_adapters_up_recovers_down_adapter(mock_get, mock_set, mock_hci):
+async def test_ensure_adapters_up_recovers_down_adapter(mock_get, mock_set, mock_hci, mock_btd):
     """One adapter DOWN — D-Bus brings it back."""
     mock_get.side_effect = [True, False, True]
     mock_set.return_value = True
@@ -593,13 +596,85 @@ async def test_ensure_adapters_up_recovers_down_adapter(mock_get, mock_set, mock
 
 @pytest.mark.asyncio
 @patch("bleak_connection_manager.bluez.IS_LINUX", True)
+@patch("bleak_connection_manager.bluez.ensure_bluetoothd", new_callable=AsyncMock, return_value=True)
 @patch("bleak_connection_manager.bluez._hciconfig_up")
 @patch("bleak_connection_manager.bluez._set_adapter_powered", new_callable=AsyncMock)
 @patch("bleak_connection_manager.bluez._get_adapter_powered", new_callable=AsyncMock)
-async def test_ensure_adapters_up_hciconfig_fallback(mock_get, mock_set, mock_hci):
+async def test_ensure_adapters_up_hciconfig_fallback(mock_get, mock_set, mock_hci, mock_btd):
     """D-Bus power-on fails, hciconfig fallback succeeds."""
     mock_get.side_effect = [False, False, True]
     mock_set.return_value = True
 
     await ensure_adapters_up(["hci0"])
     mock_hci.assert_called_once_with("hci0")
+
+
+# ── ensure_bluetoothd tests ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", False)
+async def test_ensure_bluetoothd_non_linux():
+    """Non-Linux always returns True."""
+    from bleak_connection_manager.bluez import ensure_bluetoothd
+
+    assert await ensure_bluetoothd() is True
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+async def test_ensure_bluetoothd_already_alive():
+    """If bluetoothd is already running, returns True without restart."""
+    from bleak_connection_manager.bluez import ensure_bluetoothd
+
+    with patch(
+        "bleak_connection_manager.recovery.is_bluetoothd_alive", return_value=True
+    ):
+        assert await ensure_bluetoothd() is True
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+async def test_ensure_bluetoothd_dead_restart_succeeds():
+    """Dead bluetoothd gets restarted, wait_for_bluez confirms."""
+    from bleak_connection_manager.bluez import ensure_bluetoothd
+
+    with (
+        patch(
+            "bleak_connection_manager.recovery.is_bluetoothd_alive",
+            return_value=False,
+        ),
+        patch(
+            "bleak_connection_manager.recovery.restart_bluetoothd",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_restart,
+        patch(
+            "bleak_connection_manager.dbus_bus.wait_for_bluez",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_wait,
+    ):
+        assert await ensure_bluetoothd() is True
+        mock_restart.assert_awaited_once()
+        mock_wait.assert_awaited_once_with(timeout=15.0)
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.bluez.IS_LINUX", True)
+async def test_ensure_bluetoothd_dead_restart_fails():
+    """Dead bluetoothd and restart fails — returns False."""
+    from bleak_connection_manager.bluez import ensure_bluetoothd
+
+    with (
+        patch(
+            "bleak_connection_manager.recovery.is_bluetoothd_alive",
+            return_value=False,
+        ),
+        patch(
+            "bleak_connection_manager.recovery.restart_bluetoothd",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+    ):
+        assert await ensure_bluetoothd() is False

@@ -540,15 +540,56 @@ async def power_cycle_adapter(adapter: str) -> bool:
     return False
 
 
+async def ensure_bluetoothd() -> bool:
+    """Self-heal: restart ``bluetoothd`` if it has crashed.
+
+    Lightweight check called at the start of scan operations (via
+    :func:`ensure_adapters_up`) to detect a dead ``bluetoothd`` between
+    scan cycles.  Uses a pure ``/proc`` scan — no D-Bus round-trip —
+    so cost is negligible when ``bluetoothd`` is healthy.
+
+    If ``bluetoothd`` is dead, attempts to restart it and waits up to
+    15 seconds for it to register on D-Bus.
+
+    Returns ``True`` if ``bluetoothd`` is running when the function
+    returns (whether it was already running or freshly started).
+    """
+    if not IS_LINUX:
+        return True
+
+    from .recovery import is_bluetoothd_alive, restart_bluetoothd
+
+    if is_bluetoothd_alive():
+        return True
+
+    _LOGGER.warning("bluetoothd is not running — attempting restart")
+
+    if not await restart_bluetoothd():
+        _LOGGER.error("Failed to restart bluetoothd")
+        return False
+
+    from .dbus_bus import wait_for_bluez
+
+    if await wait_for_bluez(timeout=15.0):
+        _LOGGER.info("bluetoothd restarted and BlueZ is back on D-Bus")
+        return True
+
+    _LOGGER.error("bluetoothd restarted but BlueZ did not appear on D-Bus")
+    return False
+
+
 async def ensure_adapters_up(adapters: list[str]) -> None:
     """Self-heal: bring up any adapters that are currently DOWN.
 
     Called at the start of scan operations to recover from failed
     power-cycles or other conditions that left an adapter powered off.
+    Also verifies that ``bluetoothd`` is running and restarts it if needed.
     Tries D-Bus first, then falls back to ``hciconfig`` if needed.
     """
     if not IS_LINUX:
         return
+
+    await ensure_bluetoothd()
 
     for adapter in adapters:
         powered = await _get_adapter_powered(adapter)
