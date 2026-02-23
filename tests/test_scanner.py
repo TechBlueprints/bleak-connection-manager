@@ -639,6 +639,59 @@ async def test_find_device_post_inprogress_tries_recover(
 
 
 @pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.release_scan_lock")
+@patch("bleak_connection_manager.scanner.acquire_scan_lock")
+@patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", True)
+async def test_find_device_lock_released_on_cancelled_during_health_check(
+    mock_scanner_cls, mock_cache, mock_ready, mock_acquire, mock_release,
+):
+    """Scan lock is released when CancelledError fires during health check."""
+    mock_cache.return_value = None
+    mock_acquire.return_value = 42
+    mock_ready.side_effect = asyncio.CancelledError()
+
+    cfg = ScanLockConfig(enabled=True)
+    with pytest.raises(asyncio.CancelledError):
+        await find_device(
+            "AA:BB:CC:DD:EE:FF",
+            max_attempts=1,
+            adapters=["hci0"],
+            scan_lock_config=cfg,
+            timeout=0.1,
+        )
+
+    mock_release.assert_called_with(42)
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.release_scan_lock")
+@patch("bleak_connection_manager.scanner.acquire_scan_lock")
+@patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", True)
+async def test_discover_lock_released_on_cancelled_during_health_check(
+    mock_scanner_cls, mock_ready, mock_acquire, mock_release,
+):
+    """Scan lock is released when CancelledError fires during discover health check."""
+    mock_acquire.return_value = 42
+    mock_ready.side_effect = asyncio.CancelledError()
+
+    cfg = ScanLockConfig(enabled=True)
+    with pytest.raises(asyncio.CancelledError):
+        await discover(
+            max_attempts=1,
+            adapters=["hci0"],
+            scan_lock_config=cfg,
+            timeout=0.1,
+        )
+
+    mock_release.assert_called_with(42)
+
+
+@pytest.mark.asyncio
 @patch("bleak_connection_manager.scanner._last_resort_power_cycle", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner._try_recover_adapter", new_callable=AsyncMock)
 @patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)

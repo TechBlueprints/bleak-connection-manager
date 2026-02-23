@@ -620,6 +620,9 @@ async def find_device(
                     adapter,
                     exc_info=True,
                 )
+            except BaseException:
+                release_scan_lock(fd)
+                raise
 
         try:
             _LOGGER.debug(
@@ -869,6 +872,9 @@ async def discover(
                     adapter,
                     exc_info=True,
                 )
+            except BaseException:
+                release_scan_lock(fd)
+                raise
 
         try:
             _LOGGER.debug(
