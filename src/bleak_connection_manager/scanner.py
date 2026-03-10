@@ -440,7 +440,12 @@ async def find_device(
     # our service may start before bluetoothd registers on D-Bus.
     if IS_LINUX:
         from .dbus_bus import wait_for_bluez
-        await wait_for_bluez()
+        if not await wait_for_bluez():
+            _LOGGER.warning(
+                "%s: BlueZ not available — skipping scan",
+                address,
+            )
+            return None
 
     if adapters is None and IS_LINUX:
         adapters = discover_adapters()
@@ -790,7 +795,9 @@ async def discover(
     # Ensure BlueZ is available before any BLE operations.
     if IS_LINUX:
         from .dbus_bus import wait_for_bluez
-        await wait_for_bluez()
+        if not await wait_for_bluez():
+            _LOGGER.warning("BlueZ not available — skipping discover")
+            return []
 
     if adapters is None and IS_LINUX:
         adapters = discover_adapters()

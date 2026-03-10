@@ -48,6 +48,7 @@ from .recovery import (
     EscalationAction,
     EscalationConfig,
     EscalationPolicy,
+    invalidate_dbus_state,
     is_bluetoothd_alive,
     reset_adapter,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "PROFILE_BATTERY",
     "PROFILE_ON_DEMAND",
     "PROFILE_SENSOR",
+    "invalidate_dbus_state",
     "reset_adapter",
     # Validators
     "validate_char_exists",

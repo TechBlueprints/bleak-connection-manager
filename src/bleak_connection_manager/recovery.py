@@ -321,6 +321,58 @@ async def restart_bluetoothd(
         return False
 
 
+async def invalidate_dbus_state() -> None:
+    """Tear down and invalidate all cached D-Bus state after an adapter reset.
+
+    An adapter reset (MGMT power cycle) causes ``bluetoothd`` to rebuild
+    its D-Bus object tree.  Any in-process D-Bus state cached before the
+    reset becomes stale:
+
+    * **Bleak's BlueZManager** singleton caches device paths, adapter
+      paths, and GATT service maps from ``GetManagedObjects`` and D-Bus
+      signals.  After a reset, these paths no longer exist in BlueZ.
+      The manager's ``async_init()`` skips re-initialization because
+      ``self._bus.connected`` is still ``True``, so the stale cache
+      persists indefinitely.
+
+    * **BCM's shared bus** (``dbus_bus.py``) may have pending state
+      tied to the old adapter configuration.
+
+    This function forces both to tear down so they rebuild fresh state
+    on next use.
+    """
+    # 1. Invalidate BCM's own shared bus
+    from .dbus_bus import close_bus
+    await close_bus()
+    _LOGGER.debug("Closed BCM shared D-Bus bus")
+
+    # 2. Invalidate Bleak's BlueZManager singleton
+    try:
+        from bleak.backends.bluezdbus.manager import _global_instances
+    except ImportError:
+        _LOGGER.debug("Bleak bluezdbus manager not available, skipping")
+        return
+
+    loop = asyncio.get_running_loop()
+    manager = _global_instances.get(loop)
+    if manager is None:
+        _LOGGER.debug("No BlueZManager instance for current event loop")
+        return
+
+    bus = getattr(manager, "_bus", None)
+    if bus is not None:
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+        manager._bus = None
+        _LOGGER.info(
+            "Invalidated BlueZManager D-Bus bus — will rebuild on next use"
+        )
+    else:
+        _LOGGER.debug("BlueZManager has no active bus")
+
+
 async def reset_adapter(adapter: str, mac: str = "") -> bool:
     """Reset a BLE adapter using bluetooth-auto-recovery.
 
@@ -328,10 +380,13 @@ async def reset_adapter(adapter: str, mac: str = "") -> bool:
     handles MGMT socket power cycle, USB reset, and rfkill unblock.
     This is the same approach used by Home Assistant's habluetooth.
 
-    After the reset, verifies that ``bluetoothd`` is still alive.
-    If ``bluetoothd`` crashed during the reset (Stuck State 11), logs
-    a critical warning.  The caller or init system is responsible for
-    restarting it.
+    After the reset:
+
+    1. Verifies that ``bluetoothd`` is still alive (restarts it if
+       it crashed during the reset — "Stuck State 11").
+    2. Invalidates all cached D-Bus state (BlueZManager singleton and
+       BCM's shared bus) so that the next connection attempt rebuilds
+       from ``GetManagedObjects`` instead of using stale cached paths.
 
     Parameters
     ----------
@@ -372,12 +427,18 @@ async def reset_adapter(adapter: str, mac: str = "") -> bool:
                 adapter,
             )
             if await restart_bluetoothd():
+                await invalidate_dbus_state()
                 return True
             _LOGGER.critical(
                 "bluetoothd could not be restarted after resetting %s",
                 adapter,
             )
             return False
+
+        # Invalidate cached D-Bus state — the adapter reset caused
+        # bluetoothd to rebuild its object tree, so any cached device
+        # paths, adapter properties, or GATT maps are now stale.
+        await invalidate_dbus_state()
 
         return True
 

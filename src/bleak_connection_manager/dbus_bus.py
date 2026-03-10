@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from .const import IS_LINUX
 
@@ -51,6 +52,12 @@ _LOGGER = logging.getLogger(__name__)
 _bus: object | None = None  # dbus_fast.aio.MessageBus, typed loosely to avoid import on non-Linux
 _bus_loop: object | None = None  # The event loop the bus was created on
 _bluez_ready = False  # Set True once we've confirmed org.bluez is on D-Bus
+
+# Rate-limit: after a confirmed wait_for_bluez() failure (bluetoothd dead
+# and restart unsuccessful), don't re-poll for this many seconds.  Prevents
+# rapid cycling that leaks D-Bus socket FDs in bleak/dbus_fast.
+_BLUEZ_FAILURE_COOLDOWN = 60.0
+_last_bluez_failure: float = 0.0
 
 
 async def get_bus():
@@ -92,6 +99,10 @@ async def get_bus():
             return _bus
         else:
             _LOGGER.debug("Shared D-Bus bus disconnected, reconnecting")
+            try:
+                _bus.disconnect()
+            except Exception:
+                pass
 
     _bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     _bus_loop = current_loop
@@ -181,10 +192,22 @@ async def wait_for_bluez(
 
     Returns ``True`` if BlueZ became available, ``False`` on timeout.
     """
-    global _bluez_ready
+    global _bluez_ready, _last_bluez_failure
 
     if not IS_LINUX:
         return True
+
+    # Rate-limit: if we recently confirmed BlueZ is dead and couldn't
+    # recover, don't burn CPU and FDs re-polling.  Return False
+    # immediately so the caller backs off.
+    if _last_bluez_failure > 0:
+        since_failure = time.monotonic() - _last_bluez_failure
+        if since_failure < _BLUEZ_FAILURE_COOLDOWN:
+            _LOGGER.debug(
+                "BlueZ failure cooldown: %.0fs remaining",
+                _BLUEZ_FAILURE_COOLDOWN - since_failure,
+            )
+            return False
 
     # Validate the cache: if we previously marked BlueZ as ready,
     # do a quick ping to confirm it's still alive.  This catches
@@ -198,23 +221,30 @@ async def wait_for_bluez(
         )
         _bluez_ready = False
 
-    # Normal poll loop
-    if await _poll_bluez(timeout, poll_interval):
+    # Normal poll loop (shortened to 5s — the full 30s poll is wasteful
+    # for a crashed daemon, and the restart below is the real fix)
+    if await _poll_bluez(min(timeout, 5.0), poll_interval):
         _bluez_ready = True
+        _last_bluez_failure = 0.0
         return True
 
-    # Poll exhausted — attempt to restart bluetoothd
+    # Poll exhausted — attempt recovery
     _LOGGER.warning(
-        "BlueZ did not appear on D-Bus after %.0fs — "
-        "attempting to restart bluetoothd",
-        timeout,
+        "BlueZ not on D-Bus — attempting recovery",
     )
 
     from .recovery import restart_bluetoothd
 
+    # Stop dbus-ble-sensors first if present — its raw HCI scanning
+    # is the primary cause of bluetoothd crashes on Venus OS.
+    await _stop_raw_hci_scanner()
+
     if await restart_bluetoothd():
         if await _poll_bluez(10.0, poll_interval):
             _bluez_ready = True
+            _last_bluez_failure = 0.0
+            # Re-enable dbus-ble-sensors now that bluetoothd is healthy
+            await _start_raw_hci_scanner()
             return True
         _LOGGER.error(
             "bluetoothd restarted but BlueZ still not on D-Bus after 10s"
@@ -224,7 +254,65 @@ async def wait_for_bluez(
             "Failed to restart bluetoothd — BLE operations will fail"
         )
 
+    # Re-enable dbus-ble-sensors even on failure (don't leave it stopped)
+    await _start_raw_hci_scanner()
+
+    _last_bluez_failure = time.monotonic()
     return False
+
+
+async def _stop_raw_hci_scanner() -> None:
+    """Stop ``dbus-ble-sensors`` if it exists.
+
+    On Venus OS, this Victron service uses raw HCI sockets for BLE
+    scanning, bypassing BlueZ entirely.  This corrupts BlueZ's
+    internal state and eventually crashes ``bluetoothd``.  Stopping it
+    before restarting ``bluetoothd`` prevents the new daemon from being
+    immediately killed again.
+
+    No-op if the service doesn't exist or ``svc`` is unavailable.
+    """
+    svc_dir = "/service/dbus-ble-sensors"
+    try:
+        import os
+        if not os.path.exists(svc_dir):
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "svc", "-d", svc_dir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+        _LOGGER.info(
+            "Stopped dbus-ble-sensors before bluetoothd restart"
+        )
+        await asyncio.sleep(0.5)
+    except Exception:
+        _LOGGER.debug(
+            "Could not stop dbus-ble-sensors (may not exist)",
+            exc_info=True,
+        )
+
+
+async def _start_raw_hci_scanner() -> None:
+    """Re-enable ``dbus-ble-sensors`` if it exists."""
+    svc_dir = "/service/dbus-ble-sensors"
+    try:
+        import os
+        if not os.path.exists(svc_dir):
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "svc", "-u", svc_dir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+        _LOGGER.info("Re-enabled dbus-ble-sensors after bluetoothd restart")
+    except Exception:
+        _LOGGER.debug(
+            "Could not re-enable dbus-ble-sensors",
+            exc_info=True,
+        )
 
 
 async def close_bus() -> None:
