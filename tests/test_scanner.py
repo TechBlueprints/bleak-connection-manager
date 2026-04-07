@@ -10,6 +10,7 @@ from bleak.exc import BleakError
 from bleak_connection_manager.const import AdapterScanState, ScanLockConfig
 from bleak_connection_manager.scanner import (
     _find_in_bluez_cache,
+    _is_passive_scan,
     _poll_cache_while_locked,
     discover,
     find_device,
@@ -722,3 +723,120 @@ async def test_find_device_no_power_cycle_when_other_adapter_available(
     assert result is mock_device
     mock_recover.assert_called_once()
     mock_last_resort.assert_not_called()
+
+
+# ── _is_passive_scan helper tests ─────────────────────────────────
+
+
+def test_is_passive_scan_true():
+    assert _is_passive_scan(scanning_mode="passive") is True
+
+
+def test_is_passive_scan_false_active():
+    assert _is_passive_scan(scanning_mode="active") is False
+
+
+def test_is_passive_scan_false_missing():
+    assert _is_passive_scan() is False
+
+
+def test_is_passive_scan_case_insensitive():
+    assert _is_passive_scan(scanning_mode="Passive") is True
+    assert _is_passive_scan(scanning_mode="PASSIVE") is True
+
+
+# ── Passive scan lock bypass tests ────────────────────────────────
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", False)
+@patch("bleak_connection_manager.scanner.acquire_scan_lock")
+@patch("bleak_connection_manager.scanner.release_scan_lock")
+async def test_find_device_passive_skips_lock(
+    mock_release, mock_acquire, mock_scanner_cls
+):
+    """Passive scan should not acquire the scan lock."""
+    mock_device = _make_device()
+    mock_scanner_cls.find_device_by_address = AsyncMock(return_value=mock_device)
+
+    cfg = ScanLockConfig(enabled=True)
+    result = await find_device(
+        "AA:BB:CC:DD:EE:FF",
+        max_attempts=1,
+        scan_lock_config=cfg,
+        scanning_mode="passive",
+        timeout=0.1,
+    )
+
+    assert result is mock_device
+    mock_acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner._find_in_bluez_cache", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", True)
+async def test_find_device_passive_skips_health_check(
+    mock_scanner_cls, mock_cache, mock_ready,
+):
+    """Passive scan should skip the pre-scan adapter health check."""
+    mock_cache.return_value = None
+    mock_device = _make_device()
+    mock_scanner_cls.find_device_by_address = AsyncMock(return_value=mock_device)
+
+    result = await find_device(
+        "AA:BB:CC:DD:EE:FF",
+        max_attempts=1,
+        adapters=["hci0"],
+        scanning_mode="passive",
+        timeout=0.1,
+    )
+
+    assert result is mock_device
+    mock_ready.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", False)
+@patch("bleak_connection_manager.scanner.acquire_scan_lock")
+@patch("bleak_connection_manager.scanner.release_scan_lock")
+async def test_discover_passive_skips_lock(
+    mock_release, mock_acquire, mock_scanner_cls
+):
+    """Passive discover should not acquire the scan lock."""
+    mock_scanner_cls.discover = AsyncMock(return_value=[_make_device()])
+
+    cfg = ScanLockConfig(enabled=True)
+    result = await discover(
+        max_attempts=1,
+        scan_lock_config=cfg,
+        scanning_mode="passive",
+        timeout=0.1,
+    )
+
+    assert len(result) == 1
+    mock_acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("bleak_connection_manager.scanner.ensure_adapter_scan_ready", new_callable=AsyncMock)
+@patch("bleak_connection_manager.scanner.BleakScanner")
+@patch("bleak_connection_manager.scanner.IS_LINUX", True)
+async def test_discover_passive_skips_health_check(
+    mock_scanner_cls, mock_ready,
+):
+    """Passive discover should skip the pre-scan adapter health check."""
+    mock_scanner_cls.discover = AsyncMock(return_value=[_make_device()])
+
+    result = await discover(
+        max_attempts=1,
+        adapters=["hci0"],
+        scanning_mode="passive",
+        timeout=0.1,
+    )
+
+    assert len(result) == 1
+    mock_ready.assert_not_called()
