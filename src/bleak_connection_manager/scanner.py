@@ -68,6 +68,16 @@ def _is_inprogress(exc: BaseException) -> bool:
     return "inprogress" in err_str or "in progress" in err_str
 
 
+def _is_passive_scan(**scanner_kwargs: Any) -> bool:
+    """Check if the caller requested passive scanning.
+
+    Passive scanning uses BlueZ AdvertisementMonitor1 instead of
+    StartDiscovery, so it cannot cause InProgress contention and
+    does not need the scan lock or adapter health checks.
+    """
+    return str(scanner_kwargs.get("scanning_mode", "")).lower() == "passive"
+
+
 async def _try_recover_adapter(
     adapter: str,
     effective_adapters: list[str],
@@ -518,7 +528,12 @@ async def find_device(
     # the BlueZ cache while we wait — their scan results will show
     # up in the shared cache.  Only scan ourselves if the cache
     # stays empty and we acquire the lock.
+    #
+    # Passive scanning (AdvertisementMonitor1) does not call
+    # StartDiscovery, so it cannot cause InProgress contention.
+    # Skip the scan lock and adapter health check entirely.
 
+    passive = _is_passive_scan(**scanner_kwargs)
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     last_error: Exception | None = None
     stuck_adapters: dict[str, AdapterScanState] = {}
@@ -528,7 +543,7 @@ async def find_device(
 
         # --- Try to acquire the scan lock for this adapter ---
         fd: int | None = None
-        if scan_lock_config is not None and scan_lock_config.enabled:
+        if not passive and scan_lock_config is not None and scan_lock_config.enabled:
             # Try non-blocking first (timeout=0)
             instant_cfg = ScanLockConfig(
                 enabled=True,
@@ -580,7 +595,7 @@ async def find_device(
                     continue
 
         # ── Pre-scan adapter health check ──────────────────────────
-        if IS_LINUX:
+        if IS_LINUX and not passive:
             try:
                 scan_state = await ensure_adapter_scan_ready(adapter)
                 if scan_state == AdapterScanState.EXTERNAL_SCAN:
@@ -807,6 +822,7 @@ async def discover(
     if IS_LINUX:
         await ensure_adapters_up(effective_adapters)
 
+    passive = _is_passive_scan(**scanner_kwargs)
     hard_timeout = timeout + _HARD_TIMEOUT_BUFFER
     stuck_adapters: dict[str, AdapterScanState] = {}
 
@@ -814,7 +830,7 @@ async def discover(
         adapter = pick_adapter(effective_adapters, attempt)
 
         fd: int | None = None
-        if scan_lock_config is not None and scan_lock_config.enabled:
+        if not passive and scan_lock_config is not None and scan_lock_config.enabled:
             lock_cfg_for_attempt = ScanLockConfig(
                 enabled=True,
                 lock_dir=scan_lock_config.lock_dir,
@@ -832,7 +848,7 @@ async def discover(
                 continue
 
         # Pre-scan adapter health check
-        if IS_LINUX:
+        if IS_LINUX and not passive:
             try:
                 scan_state = await ensure_adapter_scan_ready(adapter)
                 if scan_state == AdapterScanState.EXTERNAL_SCAN:
