@@ -60,6 +60,28 @@ _BLUEZ_FAILURE_COOLDOWN = 60.0
 _last_bluez_failure: float = 0.0
 
 
+def is_service_unknown_error(exc: BaseException) -> bool:
+    """Return True if *exc* is a D-Bus ServiceUnknown error (org.bluez not running)."""
+    msg = str(exc)
+    return "ServiceUnknown" in msg or "not provided by any .service files" in msg
+
+
+def mark_bluez_gone() -> None:
+    """Clear the BlueZ-ready flag so the next scan re-waits for bluetoothd.
+
+    Call this whenever a BLE operation fails with a ServiceUnknown error —
+    it means bluetoothd crashed at runtime and must come back before any
+    BlueZ operation can succeed.
+    """
+    global _bluez_ready
+    if _bluez_ready:
+        _LOGGER.warning(
+            "org.bluez is no longer on D-Bus (bluetoothd crashed?); "
+            "future scans will wait for it to restart"
+        )
+        _bluez_ready = False
+
+
 async def get_bus():
     """Get the shared system D-Bus connection, creating or reconnecting as needed.
 

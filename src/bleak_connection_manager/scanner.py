@@ -78,6 +78,12 @@ def _is_passive_scan(**scanner_kwargs: Any) -> bool:
     return str(scanner_kwargs.get("scanning_mode", "")).lower() == "passive"
 
 
+def _is_service_unknown(exc: BaseException) -> bool:
+    """Check if an exception is a D-Bus ServiceUnknown error (bluetoothd not running)."""
+    from .dbus_bus import is_service_unknown_error
+    return is_service_unknown_error(exc)
+
+
 async def _try_recover_adapter(
     adapter: str,
     effective_adapters: list[str],
@@ -716,6 +722,20 @@ async def find_device(
                     adapter, effective_adapters,
                     "hard timeout (Stuck State 16)",
                 )
+            elif IS_LINUX and _is_service_unknown(exc):
+                # bluetoothd died at runtime — clear the ready flag and
+                # wait for it to restart before the next attempt.
+                from .dbus_bus import mark_bluez_gone, wait_for_bluez
+                mark_bluez_gone()
+                _LOGGER.warning(
+                    "%s: org.bluez gone on %s (bluetoothd crashed?), "
+                    "waiting for restart (attempt %d/%d)",
+                    address,
+                    adapter,
+                    attempt,
+                    max_attempts,
+                )
+                await wait_for_bluez(timeout=30.0)
             else:
                 _LOGGER.debug(
                     "%s: Scan error on %s: %s (attempt %d/%d)",
@@ -957,6 +977,17 @@ async def discover(
                     adapter, effective_adapters,
                     "hard timeout (Stuck State 16)",
                 )
+            elif IS_LINUX and _is_service_unknown(exc):
+                from .dbus_bus import mark_bluez_gone, wait_for_bluez
+                mark_bluez_gone()
+                _LOGGER.warning(
+                    "org.bluez gone on %s (bluetoothd crashed?), "
+                    "waiting for restart (attempt %d/%d)",
+                    adapter,
+                    attempt,
+                    max_attempts,
+                )
+                await wait_for_bluez(timeout=30.0)
             else:
                 _LOGGER.debug(
                     "Scan error on %s: %s (attempt %d/%d)",

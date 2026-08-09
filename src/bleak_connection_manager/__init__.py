@@ -52,6 +52,7 @@ from .recovery import (
     is_bluetoothd_alive,
     reset_adapter,
 )
+from .dbus_bus import is_service_unknown_error, mark_bluez_gone, wait_for_bluez
 from .validators import validate_char_exists, validate_gatt_services, validate_read_char
 from .watchdog import ConnectionWatchdog
 
@@ -97,6 +98,9 @@ __all__ = [
     "cancel_le_connect",
     # Recovery / escalation
     "is_bluetoothd_alive",
+    "is_service_unknown_error",
+    "mark_bluez_gone",
+    "wait_for_bluez",
     "EscalationAction",
     "EscalationConfig",
     "EscalationPolicy",
