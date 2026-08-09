@@ -75,5 +75,57 @@ async def test_watchdog_callback_exception_handled():
     watchdog = ConnectionWatchdog(timeout=0.1, on_timeout=bad_callback)
     watchdog.start()
     await asyncio.sleep(0.5)
-    # Should not propagate
+    # Should not propagate — and a failed recovery hook must NOT kill
+    # the watchdog (the connection is still down and unmonitored)
+    assert watchdog.is_running
+    watchdog.stop()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_sync_callback_supported(caplog):
+    """A plain (non-async) callback must work, not raise on await None."""
+    fired = []
+
+    def sync_callback():
+        fired.append(True)
+
+    watchdog = ConnectionWatchdog(timeout=0.1, on_timeout=sync_callback)
+    watchdog.start()
+    await asyncio.sleep(0.4)
+    watchdog.stop()
+
+    assert fired
+    assert "on_timeout callback failed" not in caplog.text
+    assert watchdog.last_callback_error is None
+
+
+@pytest.mark.asyncio
+async def test_watchdog_retries_after_callback_failure():
+    """A failing callback re-arms the watchdog instead of dying silently."""
+    calls = []
+
+    async def bad_callback():
+        calls.append(True)
+        raise RuntimeError("recovery hook broken")
+
+    watchdog = ConnectionWatchdog(timeout=0.1, on_timeout=bad_callback)
+    watchdog.start()
+    await asyncio.sleep(0.45)
+
+    assert len(calls) >= 2, "watchdog gave up after first callback failure"
+    assert watchdog.is_running
+    assert isinstance(watchdog.last_callback_error, RuntimeError)
+    watchdog.stop()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_one_shot_on_success():
+    """After a successful callback the watchdog exits (documented one-shot)."""
+    callback = AsyncMock()
+    watchdog = ConnectionWatchdog(timeout=0.1, on_timeout=callback)
+    watchdog.start()
+    await asyncio.sleep(0.4)
+
+    callback.assert_called_once()
     assert not watchdog.is_running
+    assert watchdog.last_callback_error is None

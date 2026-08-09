@@ -33,7 +33,9 @@ starts fresh instead of adopting stale state.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
@@ -46,6 +48,20 @@ if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _adapter_from_device(device: BLEDevice | None) -> str | None:
+    """Extract the adapter name from a BLEDevice's BlueZ D-Bus path.
+
+    bleak's BlueZ backend stores the object path in ``device.details``
+    (e.g. ``/org/bluez/hci1/dev_AA_BB_...``).  Returns ``None`` when the
+    device has no path (non-BlueZ backend, fabricated device).
+    """
+    details = getattr(device, "details", None)
+    if not isinstance(details, dict):
+        return None
+    match = re.match(r"/org/bluez/(hci\d+)/", details.get("path") or "")
+    return match.group(1) if match else None
 
 
 class ConnectionWatchdog:
@@ -63,6 +79,22 @@ class ConnectionWatchdog:
     2. ``remove_device()`` via D-Bus to clear BlueZ cache.
     3. The *on_timeout* callback, where the caller can reconnect.
 
+    Firing semantics: the watchdog is **one-shot on success** — after
+    the cleanup and a callback invocation that does not raise, the
+    monitoring task exits, and a new watchdog must be created for the
+    next connection.  If the callback *raises*, the watchdog re-arms
+    and retries after another full timeout instead of dying silently;
+    the most recent failure is exposed as :attr:`last_callback_error`.
+
+    .. warning::
+        The cleanup calls ``remove_device()``, which deletes the BlueZ
+        device object.  The caller's ``BleakClient`` never receives a
+        property-change signal for that deletion, so its cached
+        ``is_connected`` may remain ``True`` indefinitely.  Do not use
+        ``client.is_connected`` as a loop condition to detect this
+        watchdog firing — drive reconnection from the *on_timeout*
+        callback (or from your own data-freshness check).
+
     Parameters
     ----------
     timeout:
@@ -70,11 +102,18 @@ class ConnectionWatchdog:
         there is no default because only the caller knows the device's
         expected notification cadence.
     on_timeout:
-        Async callback invoked when the timeout expires.
+        Callback invoked when the timeout expires.  May be a plain
+        callable or a coroutine function; a returned awaitable is
+        awaited.
     client:
         The connected ``BleakClient``.
     device:
         The ``BLEDevice`` for the connection.
+    adapter:
+        The adapter the connection lives on (e.g. ``"hci1"``).  If
+        ``None``, derived from the device's BlueZ D-Bus path, falling
+        back to ``hci0``.  Cleanup must target the right adapter or
+        the D-Bus calls silently miss the stale device object.
     """
 
     def __init__(
@@ -83,14 +122,17 @@ class ConnectionWatchdog:
         on_timeout: Callable[[], Awaitable[None]] | None = None,
         client: BleakClient | None = None,
         device: BLEDevice | None = None,
+        adapter: str | None = None,
     ) -> None:
         self._timeout = timeout
         self._on_timeout = on_timeout
         self._client = client
         self._device = device
+        self._adapter = adapter
         self._last_activity: float = 0.0
         self._task: asyncio.Task[None] | None = None
         self._started = False
+        self._last_callback_error: BaseException | None = None
 
     @property
     def is_running(self) -> bool:
@@ -101,6 +143,16 @@ class ConnectionWatchdog:
     def last_activity(self) -> float:
         """Return the monotonic timestamp of the last activity."""
         return self._last_activity
+
+    @property
+    def last_callback_error(self) -> BaseException | None:
+        """Return the exception from the most recent failed *on_timeout* call.
+
+        ``None`` if the callback has not failed (or succeeded on a
+        retry).  While this is non-``None`` the watchdog is re-arming
+        and retrying the callback after each timeout period.
+        """
+        return self._last_callback_error
 
     def notify_activity(self) -> None:
         """Record that a notification or other activity was received.
@@ -152,6 +204,7 @@ class ConnectionWatchdog:
         if self._client is None or self._device is None:
             return
         address = self._device.address
+        adapter = self._adapter or _adapter_from_device(self._device) or "hci0"
 
         # Step 1: disconnect with timeout (prevents phantom hang)
         try:
@@ -176,7 +229,7 @@ class ConnectionWatchdog:
         # if still Connected=True, escalates to remove_device internally
         try:
             await verified_disconnect(
-                address, timeout=DISCONNECT_TIMEOUT
+                address, adapter, timeout=DISCONNECT_TIMEOUT
             )
         except Exception:
             _LOGGER.debug(
@@ -187,7 +240,7 @@ class ConnectionWatchdog:
 
         # Step 3: remove device from BlueZ so next connect starts fresh
         try:
-            await remove_device(address)
+            await remove_device(address, adapter)
         except Exception:
             _LOGGER.debug(
                 "ConnectionWatchdog: remove_device failed for %s",
@@ -217,16 +270,34 @@ class ConnectionWatchdog:
                     self._timeout,
                 )
 
+                # Cleanup is repeated on each retry after a callback
+                # failure — the bluez helpers tolerate an already-
+                # removed device, and stale state may have reappeared.
                 if self._client is not None and self._device is not None:
                     await self._cleanup_connection()
 
                 if self._on_timeout is not None:
                     try:
-                        await self._on_timeout()
-                    except Exception:
+                        # Accept both plain callables and coroutine
+                        # functions — a sync callback returns None,
+                        # which must not be awaited.
+                        result = self._on_timeout()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as exc:
+                        # A failed recovery hook must not end monitoring:
+                        # the connection is still down.  Re-arm and keep
+                        # retrying (and nagging the log) until the
+                        # callback succeeds or stop() is called.
+                        self._last_callback_error = exc
+                        self._last_activity = time.monotonic()
                         _LOGGER.exception(
                             "ConnectionWatchdog: on_timeout callback failed"
+                            " — re-arming, retrying in %.1f s",
+                            self._timeout,
                         )
+                        continue
+                    self._last_callback_error = None
                 break
         except asyncio.CancelledError:
             pass
