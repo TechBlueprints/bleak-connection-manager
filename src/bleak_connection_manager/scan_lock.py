@@ -1,155 +1,117 @@
-"""Cross-process exclusive scan lock for BLE adapters.
+"""Per-adapter scan serialization (in-process).
 
-BlueZ allows only **one** ``StartDiscovery`` per adapter.  When multiple
-processes call ``BleakScanner.discover()`` on the same adapter, all but
-the first get ``org.bluez.Error.InProgress`` (Stuck State 4).
+**Premise correction (2026-08-09, verified on Venus OS v3.73 / BlueZ
+5.72):** this module originally implemented a cross-process
+``fcntl.flock`` lock on the premise that BlueZ allows only one
+``StartDiscovery`` per adapter and returns ``InProgress`` to every
+other *process*.  That premise is false on modern BlueZ (>= 5.50):
+discovery sessions are per-D-Bus-client and merged — a second
+process's ``StartDiscovery`` joins the running discovery and succeeds
+(verified live on the target Cerbo with two concurrent processes).
 
-This module provides a per-adapter exclusive file lock (``fcntl.flock``)
-so that only one process scans a given adapter at a time.  It is
-designed to be used alongside the connection slot locks in
-:mod:`bleak_connection_manager.lock`, which manage *connection* concurrency.
-Scan and connection locks are independent resources — holding a scan lock
-does not block connection attempts, and vice versa.
+The real ``InProgress`` hazard is *same-client*: two concurrent scans
+in one process share bleak's D-Bus connection, and the second
+``StartDiscovery`` from the same client fails with ``InProgress``
+(bleak 2.x does not refcount active scans).  That is an in-process
+problem, so this module now provides a per-adapter ``asyncio.Lock``.
+The old file locks also serialized scans *across* services that BlueZ
+would happily merge, adding latency for nothing.
 
-**How it works:**
-
-Each adapter gets **one** lock file (e.g. ``/run/bleak-cm-hci0-scan.lock``).
-Before calling ``BleakScanner.start()`` / ``discover()`` /
-``find_device_by_address()``, a process acquires the lock.  When
-scanning is complete, the lock is released.
-
-**Usage patterns:**
-
-1. **Low-level acquire / release** — for maximum control::
-
-    fd = await acquire_scan_lock(config, "hci0")
-    try:
-        device = await BleakScanner.find_device_by_address(addr, ...)
-    finally:
-        release_scan_lock(fd)
-
-2. **Async context manager** — for convenience::
-
-    async with ScanLock(config, "hci0"):
-        device = await BleakScanner.find_device_by_address(addr, ...)
+The public API is unchanged (``acquire_scan_lock`` /
+``release_scan_lock`` / ``ScanLock``); only the handle type changed
+from a file descriptor to the held ``asyncio.Lock``.
 
 **Graceful degradation:**
 
-If the lock cannot be acquired within the configured timeout, the caller
-proceeds without the lock.  This avoids deadlocking the entire BLE
-subsystem when a process crashes while holding the lock (although
-``flock`` is kernel-managed and crash-safe, the timeout is still useful
-for processes that hold the lock for too long due to BlueZ hangs).
-
-**Why this can't deadlock:**
-
-Same reasoning as connection slot locks:
-
-- Every ``flock`` call is non-blocking (``LOCK_NB``).  If the lock
-  isn't free, we release, sleep, retry.
-- ``flock`` is kernel-managed: if a process crashes, the kernel
-  releases the lock automatically.  No stale counters.
+If the lock cannot be acquired within the configured timeout, the
+caller proceeds without the lock so a wedged scan cannot deadlock the
+BLE subsystem; the worst case is a same-client ``InProgress`` the
+retry loop already handles.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .const import ScanLockConfig
 
-try:
-    import fcntl
-
-    _HAS_FCNTL = True
-except ImportError:
-    _HAS_FCNTL = False
-
 _LOGGER = logging.getLogger(__name__)
 
-_RETRY_INTERVAL = 0.25
+# Per-adapter locks, recreated if the event loop changes (asyncio
+# primitives are bound to the loop they were created on).
+_locks: dict[str, asyncio.Lock] = {}
+_locks_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_lock(adapter: str) -> asyncio.Lock:
+    global _locks, _locks_loop
+    loop = asyncio.get_running_loop()
+    if _locks_loop is not loop:
+        _locks = {}
+        _locks_loop = loop
+    lock = _locks.get(adapter)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[adapter] = lock
+    return lock
 
 
 async def acquire_scan_lock(
     config: ScanLockConfig,
     adapter: str | None,
-) -> int | None:
-    """Acquire an exclusive scan lock for the given adapter.
+) -> asyncio.Lock | None:
+    """Acquire the per-adapter scan lock.
 
-    Tries to ``flock(LOCK_EX | LOCK_NB)`` the adapter's scan lock file.
-    If the lock is held by another process, retries until *config.lock_timeout*
-    expires.
-
-    Parameters
-    ----------
-    config:
-        Scan lock configuration.
-    adapter:
-        Adapter name (e.g. ``"hci0"``).
+    Waits up to *config.lock_timeout* seconds.  A timeout of ``0``
+    is a non-blocking attempt.
 
     Returns
     -------
-    int | None
-        An open file descriptor holding the scan lock, or ``None`` if
-        the lock could not be acquired (timeout or unavailable).
+    asyncio.Lock | None
+        The held lock (pass to :func:`release_scan_lock`), or ``None``
+        if locking is disabled or the lock could not be acquired in
+        time.
     """
-    if not _HAS_FCNTL or not config.enabled:
+    if not config.enabled:
         return None
 
-    lock_path = config.path_for_adapter(adapter)
-    elapsed = 0.0
+    lock = _get_lock(adapter or "hci0")
 
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-        except OSError:
-            _LOGGER.debug(
-                "Failed to open scan lock file %s",
-                lock_path,
-                exc_info=True,
-            )
+    if config.lock_timeout <= 0:
+        # Non-blocking attempt.  Lock.acquire() on an uncontended lock
+        # completes without yielding, so this cannot race in-loop.
+        if lock.locked():
             return None
+        await lock.acquire()
+        return lock
 
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _LOGGER.debug(
-                "Acquired scan lock for %s (%s)",
-                adapter,
-                lock_path,
-            )
-            return fd
-        except OSError:
-            # Lock is held — close and retry after a sleep
-            os.close(fd)
-
-        elapsed += _RETRY_INTERVAL
-        if elapsed >= config.lock_timeout:
-            _LOGGER.warning(
-                "Timed out waiting for scan lock on %s after %.1f s "
-                "— scan lock not acquired",
-                adapter,
-                elapsed,
-            )
-            return None
-
-        await asyncio.sleep(_RETRY_INTERVAL)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=config.lock_timeout)
+    except asyncio.TimeoutError:
+        _LOGGER.warning(
+            "Timed out waiting for scan lock on %s after %.1f s "
+            "— scan lock not acquired",
+            adapter,
+            config.lock_timeout,
+        )
+        return None
+    return lock
 
 
-def release_scan_lock(fd: int | None) -> None:
+def release_scan_lock(lock: asyncio.Lock | None) -> None:
     """Release a previously acquired scan lock.
 
     Safe to call with ``None`` (no-op).
     """
-    if fd is None:
+    if lock is None:
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-    except OSError:
-        _LOGGER.debug("Failed to release scan lock", exc_info=True)
+        lock.release()
+    except RuntimeError:
+        _LOGGER.debug("Scan lock already released", exc_info=True)
 
 
 class ScanLock:
@@ -171,22 +133,22 @@ class ScanLock:
         Adapter name (e.g. ``"hci0"``).
     """
 
-    __slots__ = ("_config", "_adapter", "_fd")
+    __slots__ = ("_config", "_adapter", "_lock")
 
     def __init__(self, config: ScanLockConfig, adapter: str | None = "hci0") -> None:
         self._config = config
         self._adapter = adapter
-        self._fd: int | None = None
+        self._lock: asyncio.Lock | None = None
 
     async def __aenter__(self) -> "ScanLock":
-        self._fd = await acquire_scan_lock(self._config, self._adapter)
+        self._lock = await acquire_scan_lock(self._config, self._adapter)
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        release_scan_lock(self._fd)
-        self._fd = None
+        release_scan_lock(self._lock)
+        self._lock = None
 
     @property
     def acquired(self) -> bool:
         """Whether the scan lock is currently held."""
-        return self._fd is not None
+        return self._lock is not None

@@ -3,8 +3,11 @@
 This is the scan counterpart to :mod:`bleak_connection_manager.connection`.
 It wraps ``BleakScanner`` with:
 
-- **Per-adapter scan lock** — cross-process ``fcntl.flock`` so only one
-  process scans a given adapter at a time (Stuck State 4 fix).
+- **Per-adapter scan lock** — in-process ``asyncio.Lock`` so only one
+  scan per adapter runs at a time within this process (bleak shares one
+  D-Bus client, and a same-client double ``StartDiscovery`` returns
+  ``InProgress``; cross-process scans are merged by BlueZ >= 5.50 and
+  need no coordination).
 - **Adapter rotation** — if the scan lock on the current adapter can't be
   acquired quickly, or if BlueZ returns ``InProgress``, automatically
   rotate to the next adapter.
@@ -375,7 +378,7 @@ async def _poll_cache_while_locked(
     address: str,
     wait_seconds: float,
 ) -> BLEDevice | None:
-    """Poll the BlueZ D-Bus cache while another process holds the scan lock.
+    """Poll the BlueZ D-Bus cache while another scan holds the scan lock.
 
     When the scan lock is busy, we know another process is running
     ``StartDiscovery``.  Its results will appear in the shared BlueZ
@@ -530,7 +533,8 @@ async def find_device(
 
     # ── Step 3: Scan with lock coordination ────────────────────────
     #
-    # If the scan lock is busy, another process is scanning.  Poll
+    # If the scan lock is busy, another scan in this process (or an
+    # external client's merged discovery) is running.  Poll
     # the BlueZ cache while we wait — their scan results will show
     # up in the shared cache.  Only scan ourselves if the cache
     # stays empty and we acquire the lock.
@@ -548,7 +552,7 @@ async def find_device(
         adapter = pick_adapter(effective_adapters, attempt)
 
         # --- Try to acquire the scan lock for this adapter ---
-        fd: int | None = None
+        fd: asyncio.Lock | None = None
         if not passive and scan_lock_config is not None and scan_lock_config.enabled:
             # Try non-blocking first (timeout=0)
             instant_cfg = ScanLockConfig(
@@ -560,9 +564,9 @@ async def find_device(
             fd = await acquire_scan_lock(instant_cfg, adapter)
 
             if fd is None:
-                # Lock is busy — another process is scanning on this
-                # adapter.  Poll the BlueZ cache while waiting; their
-                # scan results will appear in the shared cache.
+                # Lock is busy — another scan in this process is
+                # running on this adapter.  Poll the BlueZ cache while
+                # waiting; its results appear in the shared cache.
                 _LOGGER.debug(
                     "%s: Scan lock busy on %s, polling cache (attempt %d/%d)",
                     address,
@@ -575,7 +579,7 @@ async def find_device(
                 )
                 if cached is not None:
                     _LOGGER.debug(
-                        "%s: Found in cache while another process scanned",
+                        "%s: Found in cache while another scan ran",
                         address,
                     )
                     return cached
@@ -849,7 +853,7 @@ async def discover(
     for attempt in range(1, max_attempts + 1):
         adapter = pick_adapter(effective_adapters, attempt)
 
-        fd: int | None = None
+        fd: asyncio.Lock | None = None
         if not passive and scan_lock_config is not None and scan_lock_config.enabled:
             lock_cfg_for_attempt = ScanLockConfig(
                 enabled=True,

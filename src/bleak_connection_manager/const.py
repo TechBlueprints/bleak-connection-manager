@@ -100,31 +100,29 @@ class LockConfig:
 
 @dataclass
 class ScanLockConfig:
-    """Configuration for cross-process BLE scan serialization.
+    """Configuration for per-adapter scan serialization.
 
-    BlueZ allows only **one** active scan (``StartDiscovery``) per adapter
-    at a time.  When multiple processes call ``BleakScanner.discover()`` or
-    ``BleakScanner.find_device_by_address()`` on the same adapter, all but
-    the first receive ``org.bluez.Error.InProgress`` (Stuck State 4).
+    Modern BlueZ (>= 5.50) merges discovery sessions across D-Bus
+    clients, so scans by *different processes* on the same adapter do
+    not conflict (verified on Venus OS v3.73 / BlueZ 5.72).  The real
+    ``org.bluez.Error.InProgress`` hazard is two concurrent scans in
+    the **same process**: they share bleak's D-Bus connection, and the
+    second ``StartDiscovery`` from the same client fails.
 
-    This config controls a per-adapter exclusive file lock that ensures
-    only one process scans on a given adapter at a time.  All services
-    on the same host **must** use the same *lock_dir* and *lock_template*
-    to coordinate.
-
-    Unlike :class:`LockConfig` (which supports N concurrent slots),
-    scan locking is strictly exclusive — BlueZ does not support
-    concurrent scans on a single adapter.
+    This config therefore controls an in-process per-adapter
+    ``asyncio.Lock`` (see :mod:`bleak_connection_manager.scan_lock`).
+    It was previously a cross-process file lock built on the incorrect
+    premise that BlueZ allows only one scan per adapter system-wide.
 
     Parameters
     ----------
     enabled:
-        Whether cross-process scan locking is active.
+        Whether per-adapter scan serialization is active.
     lock_dir:
-        Directory for lock files.  Defaults to ``/run`` — cleared on
-        reboot so stale locks cannot survive reboots.
+        Deprecated — retained for API compatibility, no longer used
+        (locking is in-process; no lock files are created).
     lock_template:
-        Template with ``{adapter}`` placeholder.
+        Deprecated — retained for API compatibility, no longer used.
     lock_timeout:
         Maximum seconds to wait for scan lock acquisition.  If exceeded,
         the scan proceeds without holding the lock (graceful degradation)
