@@ -48,7 +48,6 @@ from .const import (
 )
 from .diagnostics import StuckState, clear_stuck_state, diagnose_stuck_state
 from .hci import cancel_le_connect as _hci_cancel_le_connect
-from .hci import disconnect_by_address as _hci_disconnect_by_address
 from .lock import acquire_slot, release_slot
 from .recovery import (
     EscalationAction,
@@ -228,7 +227,7 @@ async def _handle_inprogress(
     # Step 1: Cancel at HCI level — this is safe even if no LE connect
     # is pending (controller returns Command Disallowed, which we ignore)
     try:
-        _hci_cancel_le_connect(adapter)
+        await asyncio.to_thread(_hci_cancel_le_connect, adapter)
     except Exception:
         _LOGGER.debug(
             "HCI LE cancel failed for %s on %s",
@@ -471,7 +470,28 @@ async def establish_connection(
                     else:
                         client = await connect_coro
 
+                except BleakNotFoundError:
+                    # Must precede the BleakError clause below
+                    # (BleakNotFoundError subclasses BleakError) so the
+                    # documented not-found contract raises instead of
+                    # retrying through the escalation chain.
+                    raise
+
                 except (BleakError, BleakAbortedError, asyncio.TimeoutError, EOFError, BrokenPipeError, asyncio.CancelledError) as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Only a cancel aimed at the inner connect task
+                        # (safety timer, or a CancelledError leaked from
+                        # bleak internals) is retryable.  A cancel of
+                        # *this* task — caller shutdown, or wait_for
+                        # enforcing overall_timeout — must propagate, or
+                        # the retry loop keeps the task alive against
+                        # the caller's will.  Task.cancelling() requires
+                        # Python 3.11; on older versions propagate every
+                        # cancel (conservative).
+                        current = asyncio.current_task()
+                        cancelling = getattr(current, "cancelling", None)
+                        if cancelling is None or cancelling() > 0:
+                            raise
                     last_error = exc
                     _LOGGER.debug(
                         "%s: Attempt %d/%d on %s failed: %s",
@@ -501,9 +521,6 @@ async def establish_connection(
                         await asyncio.sleep(0.25)
 
                     continue
-
-                except BleakNotFoundError:
-                    raise
 
                 finally:
                     if timer is not None:

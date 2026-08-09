@@ -71,7 +71,8 @@ async def _delete_bluez_cache(address: str, adapter: str = "hci0") -> bool:
         return False
 
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             [hciconfig, adapter],
             capture_output=True,
             text=True,
@@ -130,13 +131,15 @@ async def _delete_bluez_cache(address: str, adapter: str = "hci0") -> bool:
     # When it comes back up, BlueZ re-reads the storage — but the
     # phantom's directory is gone, so it won't be reloaded.
     try:
-        subprocess.run(
+        await asyncio.to_thread(
+            subprocess.run,
             [hciconfig, adapter, "down"],
             capture_output=True,
             timeout=5.0,
         )
         await asyncio.sleep(0.5)
-        subprocess.run(
+        await asyncio.to_thread(
+            subprocess.run,
             [hciconfig, adapter, "up"],
             capture_output=True,
             timeout=5.0,
@@ -216,12 +219,17 @@ async def diagnose_stuck_state(
     # must not diagnose phantom/orphan states — they would be false
     # positives that remove devices BlueZ is actively connecting to.
     search_adapters = adapters if adapters else [adapter]
-    _hci_works = any(hci_available(a) for a in search_adapters)
+    # hcitool subprocess calls block for up to 5 s each — keep them off
+    # the event loop thread or every other connection in this process
+    # stalls while we diagnose.
+    _hci_works = await asyncio.to_thread(
+        lambda: any(hci_available(a) for a in search_adapters)
+    )
 
     hci_conn = None
     if _hci_works:
-        hci_conn = find_connection_by_address(
-            address, adapters=search_adapters
+        hci_conn = await asyncio.to_thread(
+            find_connection_by_address, address, adapters=search_adapters
         )
 
     # Layer 2: Check D-Bus (BlueZ's cached view)
@@ -367,7 +375,9 @@ async def clear_stuck_state(
             address,
         )
         search_adapters = adapters if adapters else [adapter]
-        disconnect_by_address(address, adapters=search_adapters)
+        await asyncio.to_thread(
+            disconnect_by_address, address, adapters=search_adapters
+        )
         await remove_device(address, adapter)
         return True
 

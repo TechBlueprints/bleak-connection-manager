@@ -522,7 +522,7 @@ async def power_cycle_adapter(adapter: str) -> bool:
         "%s: D-Bus Powered=True failed twice, falling back to hciconfig",
         adapter,
     )
-    _hciconfig_up(adapter)
+    await asyncio.to_thread(_hciconfig_up, adapter)
     await asyncio.sleep(1.0)
     powered = await _get_adapter_powered(adapter)
     if powered is True:
@@ -604,7 +604,7 @@ async def ensure_adapters_up(adapters: list[str]) -> None:
                 _LOGGER.warning(
                     "%s: D-Bus power-on failed, trying hciconfig", adapter,
                 )
-                _hciconfig_up(adapter)
+                await asyncio.to_thread(_hciconfig_up, adapter)
                 await asyncio.sleep(1.0)
                 powered = await _get_adapter_powered(adapter)
             if powered is True:
