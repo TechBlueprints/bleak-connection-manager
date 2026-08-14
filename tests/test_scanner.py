@@ -540,7 +540,7 @@ async def test_find_device_external_scan_polls_cache(
     )
 
     assert result is mock_device
-    mock_poll.assert_called_once_with("AA:BB:CC:DD:EE:FF", 5.0)
+    mock_poll.assert_called_once_with("AA:BB:CC:DD:EE:FF", 5.0, adapters=["hci0"])
     mock_scanner_cls.find_device_by_address.assert_not_called()
 
 
