@@ -261,11 +261,23 @@ async def _diagnose_inprogress(adapter: str, address: str) -> None:
 
 
 
-async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
+async def _find_in_bluez_cache(
+    address: str,
+    adapters: list[str] | None = None,
+) -> BLEDevice | None:
     """Check if BlueZ already has a cached device entry from another scanner.
 
     Uses the shared bus from :mod:`.dbus_bus` with raw ``bus.call()`` —
     no proxy objects, no introspection, no fire-and-forget ``AddMatch``.
+
+    When *adapters* is given, only cache entries living under one of those
+    adapters are returned.  Without this filter, a caller that restricts
+    connections to specific adapters can still be handed a device object
+    on a *different* adapter (cached there by another process's scan) —
+    and connecting through that object silently violates the adapter
+    restriction.  Observed in production: a client pinned to ``hci1``
+    kept reconnecting via ``hci0`` because a continuous scanner on
+    ``hci0`` re-created the cache entry within seconds of every purge.
     """
     try:
         from dbus_fast import Message, MessageType
@@ -289,8 +301,11 @@ async def _find_in_bluez_cache(address: str) -> BLEDevice | None:
         return None
 
     objects = reply.body[0]
+    allowed_prefixes = tuple(f"/org/bluez/{a}/" for a in adapters) if adapters else None
     for path, interfaces in objects.items():
         if not path.endswith(addr_path_suffix):
+            continue
+        if allowed_prefixes and not path.startswith(allowed_prefixes):
             continue
         dev_props = interfaces.get("org.bluez.Device1", {})
         if not dev_props:
@@ -377,6 +392,7 @@ _CACHE_POLL_INTERVAL = 0.5
 async def _poll_cache_while_locked(
     address: str,
     wait_seconds: float,
+    adapters: list[str] | None = None,
 ) -> BLEDevice | None:
     """Poll the BlueZ D-Bus cache while another scan holds the scan lock.
 
@@ -394,7 +410,7 @@ async def _poll_cache_while_locked(
         await asyncio.sleep(_CACHE_POLL_INTERVAL)
         elapsed += _CACHE_POLL_INTERVAL
         try:
-            cached = await _find_in_bluez_cache(address)
+            cached = await _find_in_bluez_cache(address, adapters=adapters)
             if cached is not None:
                 return cached
         except Exception:
@@ -481,7 +497,7 @@ async def find_device(
     # directly without triggering StartDiscovery.
     if IS_LINUX:
         try:
-            cached = await _find_in_bluez_cache(address)
+            cached = await _find_in_bluez_cache(address, adapters=adapters)
             if cached is not None:
                 _LOGGER.debug(
                     "%s: Found in BlueZ cache — scan avoided",
@@ -575,7 +591,7 @@ async def find_device(
                     max_attempts,
                 )
                 cached = await _poll_cache_while_locked(
-                    address, _LOCK_ATTEMPT_TIMEOUT,
+                    address, _LOCK_ATTEMPT_TIMEOUT, adapters=adapters,
                 )
                 if cached is not None:
                     _LOGGER.debug(
@@ -620,7 +636,7 @@ async def find_device(
                     release_scan_lock(fd)
                     fd = None
                     cached = await _poll_cache_while_locked(
-                        address, timeout,
+                        address, timeout, adapters=adapters,
                     )
                     if cached is not None:
                         _LOGGER.info(
@@ -776,7 +792,7 @@ async def find_device(
             address,
         )
         try:
-            cached = await _find_in_bluez_cache(address)
+            cached = await _find_in_bluez_cache(address, adapters=adapters)
             if cached is not None:
                 _LOGGER.info(
                     "%s: Found in BlueZ cache (bypassed InProgress)",
