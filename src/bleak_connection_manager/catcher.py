@@ -218,6 +218,12 @@ def _acquire_adapter(address):
         logger.info(f"BLE [{address}]: every usable adapter is scan-claimed by another process, using them anyway")
         eligible = usable
     start = _rotation.index(address) % len(eligible)
+    if logger.isEnabledFor(logging.DEBUG):
+        occupancy = {a: (snapshot.get(a) or {}) for a in eligible}
+        logger.debug(
+            f"BLE [{address}]: adapter order {eligible[start:] + eligible[:start]} "
+            f"(walk index {_rotation.index(address)}, occupancy {occupancy})"
+        )
     exhausted = []
     for adapter in eligible[start:] + eligible[:start]:
         cap = config.link_caps.get(adapter)
@@ -277,10 +283,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_is_retry_client = kwargs.pop("_is_retry_client", False)
         self._catcher_args = (address_or_ble_device, disconnected_callback, services)
         self._catcher_kwargs = kwargs
-        self._catcher_address = getattr(address_or_ble_device, "address", address_or_ble_device)
+        # str() in case a caller hands us a subclassed str (habluetooth
+        # guards the same way)
+        self._catcher_address = str(getattr(address_or_ble_device, "address", address_or_ble_device))
         self._catcher_claims = []
         self._catcher_manager = None
         self._backend = None
+        # bleak's backend_id property reads this, but the real __init__ that
+        # would set it only runs at connect(); seed it so placeholders answer
+        self._backend_id = ""
         self._pair_before_connect = False
 
     def _release_claims(self):
@@ -367,13 +378,23 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             # not a radio failure, so the walk index stays put
             self._release_claims()
             raise
+        connected = False
         try:
             result = await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
+            connected = True
         except Exception:
-            # a failed attempt: free the claims and walk to the next adapter
-            self._release_claims()
+            # a failed attempt: the next one goes out on the next adapter
             _rotation.connect_failed(self._catcher_address)
             raise
+        finally:
+            if not connected:
+                # finally, not except: a cancelled connect (asyncio timeout
+                # machinery above us) must release the claims too, and the
+                # wrapper must not hold a partially-initialised backend.
+                # Cancellation does not advance the walk - it says nothing
+                # about the radio.
+                self._release_claims()
+                self._backend = None
         self._arm_claim_validity()
         return result
 
@@ -498,7 +519,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_claim = None
         self._catcher_manager = None
         self._backend = None
-        self._backend_id = None
+        self._backend_id = ""
 
     def _release_scan_claim(self):
         claim, self._catcher_claim = self._catcher_claim, None
@@ -547,11 +568,16 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             # the claim must not outlive a scanner that never got a backend
             self._release_scan_claim()
             raise
+        started = False
         try:
             result = await _ORIGINAL_BLEAK_SCANNER.start(self)
-        except Exception:
-            self._release_scan_claim()
-            raise
+            started = True
+        finally:
+            if not started:
+                # finally, not except: a cancelled start must release the
+                # scan claim too, and drop the partially-initialised backend
+                self._release_scan_claim()
+                self._backend = None
         self._arm_claim_validity()
         return result
 

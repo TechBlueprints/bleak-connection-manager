@@ -45,7 +45,7 @@ class _RichBackend:
 
     async def connect(self, pair, **kwargs):
         result = CONNECT_RESULTS.pop(0) if CONNECT_RESULTS else True
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):  # CancelledError is not an Exception
             raise result
         self.is_connected = True
 
@@ -91,7 +91,7 @@ class _RichScannerBackend:
 
     async def start(self):
         result = SCANNER_START_RESULTS.pop(0) if SCANNER_START_RESULTS else True
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):  # CancelledError is not an Exception
             raise result
         self.scanning = True
 
@@ -756,6 +756,37 @@ def test_the_scan_claim_is_released_when_the_real_scanner_init_fails(env):
         scanner = sys.modules["bleak"].BleakScanner()
         with pytest.raises(TypeError):
             await scanner.start()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+
+
+def test_a_cancelled_connect_releases_claims_without_advancing_the_walk(env):
+    """bleak-retry-connector's timeout machinery cancels in-flight connects;
+    CancelledError is a BaseException, so an except-Exception release path
+    would strand the claims. Cancellation says nothing about the radio, so
+    the walk index must not move either."""
+    env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(client.connect())
+
+    assert os.listdir(env.dir) == []
+    assert catcher._rotation.index(ADDRESS) == 0
+    assert client._backend is None  # no partially-initialised backend held
+
+
+def test_a_cancelled_scan_start_releases_the_claim(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    SCANNER_START_RESULTS.append(asyncio.CancelledError())
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(asyncio.CancelledError):
+            await scanner.start()
+        assert scanner._backend is None
 
     asyncio.run(scenario())
     assert os.listdir(env.dir) == []

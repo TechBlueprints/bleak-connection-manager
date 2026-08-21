@@ -60,7 +60,8 @@ explicitly (`bluez={"adapter": ...}`) is never overridden.
 
 `link_caps` bounds **established-link capacity** per adapter (dongle limits
 like the CSR8510's are undocumented, so caps are deployment config, not
-discovery). A capped adapter's connections each hold a numbered exclusive
+discovery — bleak-retry-connector's field experience suggests ~5 for CSR
+adapters and ~7 for Broadcom as starting points). A capped adapter's connections each hold a numbered exclusive
 `hciN.link.<k>` claim file; when all slots are held live, selection moves to
 the next eligible adapter **without** advancing the failure index. When every
 eligible adapter is full, `connect()` raises `OutOfConnectionSlotsError`
