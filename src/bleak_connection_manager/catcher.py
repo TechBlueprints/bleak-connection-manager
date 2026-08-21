@@ -23,17 +23,30 @@ install, so everything constructed internally uses the original classes and
 can never recurse into the wrapper.
 """
 
+import asyncio
+import inspect
 import logging
 import os
 import re
 import subprocess
+import time
 import weakref
 
 from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
 from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
+from . import recovery
 from .claims import CLAIM_DIR, ClaimManager
+
+# habluetooth's scanner watchdog thresholds (const.py:96-108), derived
+# backwards from BlueZ's 180s device expiry: restart after 90s of silence,
+# checking every 30s; past 120s (or having never seen anything) escalate to
+# a hardware reset. monotonic is indirected for tests.
+SCANNER_WATCHDOG_TIMEOUT = 90.0
+SCANNER_WATCHDOG_INTERVAL = 30.0
+SCANNER_WATCHDOG_MULTIPLE = SCANNER_WATCHDOG_TIMEOUT + SCANNER_WATCHDOG_INTERVAL
+_monotonic = time.monotonic
 
 try:
     import bleak_retry_connector as _brc_module
@@ -597,6 +610,12 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_kwargs = kwargs
         self._catcher_claim = None
         self._catcher_manager = None
+        self._catcher_adapter = None
+        self._catcher_last_detection = 0.0
+        self._catcher_start_time = 0.0
+        self._catcher_watchdog = None
+        self._catcher_restarting = False
+        self._catcher_tasks = set()
         self._backend = None
         self._backend_id = ""
 
@@ -619,6 +638,86 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         ref = weakref.ref(self)
         claim.validity = lambda: ref() is not None
 
+    def _make_detection_callback(self, raw_callback):
+        # every advertisement stamps the liveness clock the watchdog reads -
+        # except empty ones: a wedged adapter can keep emitting empty
+        # advertisements, so they must not count as signs of life
+        # (habluetooth's rule). Async caller callbacks are scheduled, not
+        # called, mirroring how habluetooth's scanner wrapper adapts them.
+        is_async = raw_callback is not None and inspect.iscoroutinefunction(raw_callback)
+
+        def _detection(device, advertisement_data):
+            if (
+                getattr(advertisement_data, "local_name", None)
+                or getattr(advertisement_data, "manufacturer_data", None)
+                or getattr(advertisement_data, "service_data", None)
+                or getattr(advertisement_data, "service_uuids", None)
+            ):
+                self._catcher_last_detection = _monotonic()
+            if raw_callback is None:
+                return
+            if is_async:
+                task = asyncio.get_running_loop().create_task(raw_callback(device, advertisement_data))
+                self._catcher_tasks.add(task)
+                task.add_done_callback(self._catcher_tasks.discard)
+            else:
+                raw_callback(device, advertisement_data)
+
+        return _detection
+
+    def _cancel_watchdog(self):
+        watchdog, self._catcher_watchdog = self._catcher_watchdog, None
+        if watchdog is not None:
+            watchdog.cancel()
+
+    def _schedule_watchdog(self):
+        self._cancel_watchdog()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._catcher_watchdog = loop.call_later(SCANNER_WATCHDOG_INTERVAL, self._watchdog_tick)
+
+    def _quiet_seconds(self):
+        return _monotonic() - self._catcher_last_detection
+
+    def _watchdog_tick(self):
+        self._catcher_watchdog = None
+        if self._backend is None:
+            return
+        if self._quiet_seconds() > SCANNER_WATCHDOG_TIMEOUT and not self._catcher_restarting:
+            task = asyncio.get_running_loop().create_task(self._watchdog_restart())
+            self._catcher_tasks.add(task)
+            task.add_done_callback(self._catcher_tasks.discard)
+        self._schedule_watchdog()
+
+    async def _watchdog_restart(self):
+        """habluetooth's two-tier remedy for a scanner gone quiet: restart
+        it, and if it never saw anything or stays quiet past the escalation
+        threshold, hardware-reset the adapter first - gated on no other
+        live process holding claims on the card. The restart re-runs
+        selection, so a genuinely dead card can also be walked away from."""
+        if self._catcher_restarting:
+            return
+        self._catcher_restarting = True
+        try:
+            quiet = self._quiet_seconds()
+            never_saw = self._catcher_last_detection == self._catcher_start_time
+            adapter = self._catcher_adapter
+            logger.warning(
+                f"BLE scanner on {adapter or 'the default adapter'} has been quiet for {quiet:.0f}s, restarting"
+            )
+            await self.stop()
+            if adapter and (never_saw or quiet > SCANNER_WATCHDOG_MULTIPLE):
+                config = _config
+                manager = config.claims if config is not None else None
+                await recovery.reset_adapter(adapter, claims_manager=manager, gone_silent=True)
+            await self.start()
+        except Exception:
+            logger.exception("BLE scanner watchdog restart failed")
+        finally:
+            self._catcher_restarting = False
+
     async def start(self):
         detection_callback, service_uuids, scanning_mode = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
@@ -638,7 +737,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 init_kwargs.setdefault("adapter", adapter)
             _ORIGINAL_BLEAK_SCANNER.__init__(
                 self,
-                detection_callback,
+                self._make_detection_callback(detection_callback),
                 service_uuids,
                 scanning_mode,
                 **init_kwargs,
@@ -657,10 +756,16 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 # scan claim too, and drop the partially-initialised backend
                 self._release_scan_claim()
                 self._backend = None
+        self._catcher_adapter = explicit or adapter
+        now = _monotonic()
+        self._catcher_start_time = now
+        self._catcher_last_detection = now
+        self._schedule_watchdog()
         self._arm_claim_validity()
         return result
 
     async def stop(self):
+        self._cancel_watchdog()
         if self._backend is None:
             return
         try:

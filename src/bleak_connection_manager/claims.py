@@ -226,6 +226,32 @@ class ClaimManager:
                     entry["links"] += 1
         return state
 
+    def foreign_use(self, adapter):
+        """Count of live claims other processes hold on the adapter.
+
+        The gate for disruptive actions: an adapter reset kills every link
+        on the card, so a process must not reset one that another live
+        process is scanning or connected on. An unusable directory returns
+        0 - the caller is already uncoordinated.
+        """
+        count = 0
+        try:
+            names = os.listdir(self.claim_dir)
+        except OSError:
+            return 0
+        own = os.getpid()
+        prefix = f"{adapter}."
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            path = os.path.join(self.claim_dir, name)
+            if not self._is_live(path):
+                continue
+            pid = _read_pid(path)
+            if pid is not None and pid != own:
+                count += 1
+        return count
+
     # -- claiming ----------------------------------------------------------
 
     def _soft_path(self, adapter, qualifier=None):

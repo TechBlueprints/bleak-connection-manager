@@ -107,7 +107,13 @@ class RichBleakScanner:
         if SCANNER_INIT_RESULTS:
             raise SCANNER_INIT_RESULTS.pop(0)
         adapter = kwargs.get("adapter", (bluez or {}).get("adapter"))
-        RECORDED_SCANNER_INITS.append({"adapter": adapter, "extra": sorted(k for k in kwargs if k != "adapter")})
+        RECORDED_SCANNER_INITS.append(
+            {
+                "adapter": adapter,
+                "extra": sorted(k for k in kwargs if k != "adapter"),
+                "detection_callback": detection_callback,
+            }
+        )
         self._backend = _RichScannerBackend(adapter)
         self._backend_id = "stub"
 
@@ -799,6 +805,87 @@ def test_an_unconfigured_scanner_scores_over_every_present_adapter(env, monkeypa
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci4"
 
 
+# -- the scanner watchdog and claims-gated recovery ------------------------
+
+
+def _adv(**kwargs):
+    base = {"local_name": None, "manufacturer_data": {}, "service_data": {}, "service_uuids": []}
+    base.update(kwargs)
+    return types.SimpleNamespace(**base)
+
+
+def test_the_watchdog_clock_only_counts_nonempty_advertisements(env):
+    """A wedged adapter can keep emitting empty advertisements; they must
+    not read as signs of life (habluetooth's rule)."""
+    seen = []
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner(seen.append and (lambda d, a: seen.append(a)))
+        await scanner.start()
+        stamp = RECORDED_SCANNER_INITS[-1]["detection_callback"]
+        scanner._catcher_last_detection -= 50
+
+        before = scanner._catcher_last_detection
+        stamp("device", _adv())  # empty
+        assert scanner._catcher_last_detection == before
+        stamp("device", _adv(local_name="BMS"))
+        assert scanner._catcher_last_detection > before
+        assert len(seen) == 2  # the caller's callback saw both
+        await scanner.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_quiet_scanner_restarts_without_a_hardware_reset(env, monkeypatch):
+    resets = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False):
+        resets.append(adapter)
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        now = catcher._monotonic()
+        scanner._catcher_start_time = now - 300  # it did see things once
+        scanner._catcher_last_detection = now - 100  # quiet 100s: restart tier
+        await scanner._watchdog_restart()
+        assert scanner._backend.scanning is True
+        assert "hci5.scan" in os.listdir(env.dir)  # re-claimed after restart
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert len(RECORDED_SCANNER_INITS) == 2  # scanner was rebuilt
+    assert resets == []  # 100s < the 120s escalation threshold
+
+
+def test_a_scanner_quiet_past_escalation_hardware_resets_the_adapter(env, monkeypatch):
+    resets = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False):
+        resets.append((adapter, gone_silent, claims_manager is not None))
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        now = catcher._monotonic()
+        scanner._catcher_start_time = now - 300
+        scanner._catcher_last_detection = now - 200  # past the 120s threshold
+        await scanner._watchdog_restart()
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert resets == [("hci5", True, True)]  # gone_silent, claims-gated
+
+
 # -- claim-leak backstops: init failures and silent drops ------------------
 
 
@@ -889,6 +976,9 @@ def test_an_abandoned_running_scanners_claim_frees_on_the_heartbeat(env):
         del scanner
 
     asyncio.run(scenario())
+    # the stub's recorded detection callback closes over the wrapper; drop
+    # the test harness's own reference so only production references remain
+    RECORDED_SCANNER_INITS.clear()
     gc.collect()
     catcher._config.claims._beat_once()
     assert "hci5.scan" not in os.listdir(env.dir)

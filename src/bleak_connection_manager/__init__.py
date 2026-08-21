@@ -22,7 +22,7 @@ _CATCHER_EXPORTS = (
     "OutOfConnectionSlotsError",
 )
 
-__all__ = list(_CATCHER_EXPORTS) + ["claims"]
+__all__ = list(_CATCHER_EXPORTS) + ["claims", "reset_adapter"]
 
 
 def __getattr__(name):
@@ -30,4 +30,10 @@ def __getattr__(name):
         from bleak_connection_manager import catcher
 
         return getattr(catcher, name)
+    if name == "reset_adapter":
+        # claims-gated adapter recovery; stdlib unless the reset actually
+        # runs, so importing it never drags bleak in
+        from bleak_connection_manager import recovery
+
+        return recovery.reset_adapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

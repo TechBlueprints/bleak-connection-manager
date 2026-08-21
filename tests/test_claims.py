@@ -302,6 +302,20 @@ def test_the_beat_touches_claims_that_are_still_valid(tmp_path):
     m.release(claim)
 
 
+def test_foreign_use_counts_only_live_claims_from_other_processes(tmp_path):
+    m = _manager(tmp_path, "svc")
+    own = m.claim_soft("hci1")
+    _foreign_file(tmp_path, "hci1.link.0", pid=1)  # live foreign
+    _foreign_file(tmp_path, "hci1.scan", pid=99999999, aged=3600)  # stale foreign
+    _foreign_file(tmp_path, "hci2.use.other", pid=1)  # different adapter
+    try:
+        assert m.foreign_use("hci1") == 1
+        assert m.foreign_use("hci2") == 1
+        assert m.foreign_use("hci3") == 0
+    finally:
+        m.release(own)
+
+
 def test_release_all_releases_everything(tmp_path):
     m = _manager(tmp_path, "svc")
     m.claim_hard("hci1")

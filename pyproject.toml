@@ -14,6 +14,9 @@ dependencies = [
 retry = [
     "bleak-retry-connector>=4.0.0",
 ]
+recovery = [
+    "bluetooth-auto-recovery>=1.2.0",
+]
 dev = [
     "pytest>=7.0",
 ]
