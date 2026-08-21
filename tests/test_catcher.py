@@ -1,0 +1,527 @@
+# -*- coding: utf-8 -*-
+"""Tests for the bleak catcher: process-wide client routing, habluetooth style.
+
+A rich bleak stub mimics the bleak 3.x contract the wrapper relies on:
+__init__ builds the platform backend eagerly (which is why the wrapper must
+defer it), connect()/disconnect()/is_connected all delegate to
+self._backend. A bleak_retry_connector stub carries the two rebound names.
+The stubs are swapped into sys.modules while the catcher module is first
+imported and while each test runs, so the catcher's captured originals are
+the stub classes regardless of what the environment has installed.
+
+Foreign processes are simulated with pid-1 claim files (kill(1, 0) raises
+PermissionError, which counts as alive); stale ones with a dead pid and an
+aged mtime.
+"""
+
+import asyncio
+import contextlib
+import os
+import sys
+import time
+import types
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+ADDRESS = "C8:47:8C:00:00:00"
+
+# scripts the rich stub consumes, reset per test
+CONNECT_RESULTS = []
+RECORDED_INITS = []
+
+
+class _RichBackend:
+    def __init__(self, adapter, address):
+        self.adapter = adapter
+        self.address = address
+        self.is_connected = False
+
+    async def connect(self, pair, **kwargs):
+        result = CONNECT_RESULTS.pop(0) if CONNECT_RESULTS else True
+        if isinstance(result, Exception):
+            raise result
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.is_connected = False
+
+
+class RichBleakClient:
+    """Just like bleak 3.x: the backend is wired up inside __init__."""
+
+    def __init__(self, address_or_ble_device, disconnected_callback=None, services=None, *, timeout=30, pair=False, bluez=None, backend=None, **kwargs):
+        adapter = (bluez or {}).get("adapter")
+        address = getattr(address_or_ble_device, "address", address_or_ble_device)
+        RECORDED_INITS.append(
+            {
+                "address": address,
+                "adapter": adapter,
+                "services": services,
+                "extra": sorted(kwargs),
+                "disconnected_callback": disconnected_callback,
+            }
+        )
+        self._backend = _RichBackend(adapter, address)
+        self._pair_before_connect = pair
+
+    async def connect(self, **kwargs):
+        await self._backend.connect(self._pair_before_connect, **kwargs)
+
+    async def disconnect(self):
+        await self._backend.disconnect()
+
+    @property
+    def is_connected(self):
+        return self._backend.is_connected
+
+
+def _make_stub_modules():
+    exc = types.ModuleType("bleak.exc")
+    exc.BleakError = type("BleakError", (Exception,), {})
+    exc.BleakDeviceNotFoundError = type("BleakDeviceNotFoundError", (Exception,), {})
+    bleak = types.ModuleType("bleak")
+    bleak.BleakClient = RichBleakClient
+    bleak.BleakScanner = object
+    bleak.exc = exc
+
+    brc = types.ModuleType("bleak_retry_connector")
+    brc.BleakClient = RichBleakClient
+
+    class StubServiceCacheClient(RichBleakClient):
+        def set_cached_services(self, services):
+            return None
+
+    brc.BleakClientWithServiceCache = StubServiceCacheClient
+    return bleak, exc, brc
+
+
+STUB_BLEAK, STUB_BLEAK_EXC, STUB_BRC = _make_stub_modules()
+
+
+@contextlib.contextmanager
+def _stubs_installed():
+    names = ("bleak", "bleak.exc", "bleak_retry_connector")
+    saved = {name: sys.modules.get(name) for name in names}
+    sys.modules["bleak"] = STUB_BLEAK
+    sys.modules["bleak.exc"] = STUB_BLEAK_EXC
+    sys.modules["bleak_retry_connector"] = STUB_BRC
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _load_catcher():
+    """Import the catcher bound to the stubs, whatever the env has installed."""
+    with _stubs_installed():
+        import bleak_connection_manager.catcher as module
+    return module
+
+
+catcher = _load_catcher()
+
+
+def _foreign_file(claim_dir, name, pid=1, aged=None):
+    path = os.path.join(claim_dir, name)
+    os.makedirs(claim_dir, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"{pid} foreign-svc {int(time.time())}\n")
+    if aged:
+        old = time.time() - aged
+        os.utime(path, (old, old))
+    return path
+
+
+OWNER = "test-svc"
+
+
+def _soft_name(adapter, mac=ADDRESS):
+    return f"{adapter}.use.{OWNER}-{os.getpid()}.{mac.replace(':', '')}"
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    """Stubs in sys.modules, fresh rotation and warning state, a tmp claim
+    directory, no adapters "present" unless a test says otherwise."""
+    CONNECT_RESULTS.clear()
+    RECORDED_INITS.clear()
+    catcher._warned_bare_connect_addresses.clear()
+    monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
+    monkeypatch.setattr(catcher, "present_adapters", lambda: set())
+
+    def install(adapters=(), link_caps=None):
+        catcher.install_bleak_catcher(OWNER, adapters=adapters, link_caps=link_caps, claim_dir=str(tmp_path))
+
+    with _stubs_installed():
+        yield types.SimpleNamespace(install=install, dir=str(tmp_path))
+        catcher.uninstall_bleak_catcher()
+
+
+# -- install/uninstall and wrapper basics (ported from the prototype) ------
+
+
+def test_install_rebinds_bleak_and_brc_and_uninstall_restores(env):
+    brc = sys.modules["bleak_retry_connector"]
+    assert sys.modules["bleak"].BleakClient is RichBleakClient
+    env.install()
+    assert sys.modules["bleak"].BleakClient is catcher.BLEConnection
+    assert brc.BleakClient is catcher.BLEConnection
+    assert brc.BleakClientWithServiceCache is catcher.BLEConnectionWithServiceCache
+    env.install()  # idempotent
+    assert sys.modules["bleak"].BleakClient is catcher.BLEConnection
+    catcher.uninstall_bleak_catcher()
+    assert sys.modules["bleak"].BleakClient is RichBleakClient
+    assert brc.BleakClient is RichBleakClient
+    assert brc.BleakClientWithServiceCache is STUB_BRC.BleakClientWithServiceCache
+
+
+def test_a_late_importer_gets_the_wrapper_and_placeholders_are_inert(env):
+    """
+    aiobmsble's BaseBMS does `from bleak import BleakClient` when it is first
+    imported and builds a placeholder client immediately. After install, that
+    binding must be the wrapper, and the placeholder must be inert: nothing
+    constructed, not connected, but still answering is_connected and address.
+    """
+    env.install()
+    BleakClient = sys.modules["bleak"].BleakClient  # what a late import binds
+    device = types.SimpleNamespace(address=ADDRESS)
+    placeholder = BleakClient(device, disconnected_callback=None, services=["fff0", "180a"])
+
+    assert isinstance(placeholder, catcher.BLEConnection)
+    assert RECORDED_INITS == []  # nothing built before connect
+    assert placeholder.is_connected is False
+    assert placeholder.address == ADDRESS
+    asyncio.run(placeholder.disconnect())  # noop, must not raise
+
+
+def test_the_captured_originals_cannot_recurse(env):
+    env.install()
+    assert catcher._ORIGINAL_BLEAK_CLIENT is RichBleakClient
+    assert catcher._ORIGINAL_BRC_CLIENT is RichBleakClient
+
+
+def test_connect_routes_the_selected_adapter_into_bluez_args(env):
+    env.install(adapters=("hci7",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci7"]
+    assert client.is_connected is True
+
+
+def test_a_failed_connect_walks_to_the_next_adapter_on_the_same_instance(env):
+    """
+    bleak-retry-connector retries connect() on one client instance; each
+    attempt must re-run the selection so the walk continues mid-retry.
+    """
+    env.install(adapters=("hci5", "hci6"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())
+    asyncio.run(client.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci5", "hci6"]
+    assert client.is_connected is True
+
+
+def test_a_dropped_link_reconnects_on_the_same_adapter(env):
+    """A disconnect is not a failed attempt and must not advance the walk."""
+    env.install(adapters=("hci5", "hci6"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+    asyncio.run(client.disconnect())
+    asyncio.run(client.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci5", "hci5"]
+
+
+def test_an_adapter_chosen_by_the_caller_is_never_overridden(env):
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True, bluez={"adapter": "hci9"})
+
+    asyncio.run(client.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci9"]
+    assert os.listdir(env.dir) == []  # uncapped explicit adapter: no claims at all
+
+
+def test_without_configured_adapters_the_wrapper_is_a_passthrough(env):
+    env.install(adapters=())
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True, services=["fff0"])
+
+    asyncio.run(client.connect())
+
+    assert len(RECORDED_INITS) == 1
+    recorded = RECORDED_INITS[0]
+    assert recorded["address"] == ADDRESS
+    assert recorded["adapter"] is None
+    assert recorded["services"] == ["fff0"]
+    assert recorded["extra"] == []
+    assert client.is_connected is True
+    assert os.listdir(env.dir) == []
+
+
+UNRETRIED_WARNING = "called without bleak-retry-connector"
+
+
+def test_a_client_built_by_establish_connection_connects_without_the_warning(env, caplog):
+    """
+    bleak-retry-connector marks the clients it constructs with
+    _is_retry_client=True; the marker must silence the warning and must not
+    leak into the real client's kwargs.
+    """
+    env.install()
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert UNRETRIED_WARNING not in caplog.text
+    assert RECORDED_INITS[0]["extra"] == []  # marker was popped, not passed down
+
+
+def test_a_bare_connect_warns_that_it_has_no_retry(env, caplog):
+    env.install()
+    client = sys.modules["bleak"].BleakClient(ADDRESS)
+
+    asyncio.run(client.connect())
+
+    assert UNRETRIED_WARNING in caplog.text
+    assert ADDRESS in caplog.text
+
+
+def test_the_bare_connect_warning_fires_once_per_address(env, caplog):
+    """A reconnect loop must not repeat this into the log every pass."""
+    env.install()
+    client = sys.modules["bleak"].BleakClient(ADDRESS)
+
+    asyncio.run(client.connect())
+    asyncio.run(client.disconnect())
+    asyncio.run(client.connect())
+    other = sys.modules["bleak"].BleakClient(ADDRESS)
+    asyncio.run(other.connect())
+
+    assert caplog.text.count(UNRETRIED_WARNING) == 1
+
+
+def test_rotation_state_is_shared_across_client_instances(env):
+    """
+    A caller that builds a fresh client per attempt must still continue the
+    walk instead of restarting it.
+    """
+    env.install(adapters=("hci5", "hci6"))
+
+    first = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(first.connect())
+
+    second = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(second.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci5", "hci6"]
+
+
+# -- claims integration: slots, soft claims, releases, avoidance -----------
+
+
+def test_a_connect_holds_a_link_slot_and_a_soft_claim(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert set(os.listdir(env.dir)) == {"hci5.link.0", _soft_name("hci5")}
+
+
+def test_an_uncapped_adapter_takes_no_slot_but_writes_a_soft_claim(env):
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert os.listdir(env.dir) == [_soft_name("hci5")]
+
+
+def test_a_full_adapter_is_skipped_without_advancing_the_walk(env):
+    """Slot exhaustion says nothing about the radio: the next eligible
+    adapter is tried, and the failure index must not move - advancing would
+    let a busy adapter push a device off its preferred radio."""
+    env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 1})
+    blocker = _foreign_file(env.dir, "hci5.link.0")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"
+    assert catcher._rotation.index(ADDRESS) == 0
+
+    asyncio.run(client.disconnect())
+    os.unlink(blocker)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"  # index never moved
+
+
+def test_every_adapter_full_raises_the_typed_error_with_occupancy(env):
+    env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 1, "hci6": 1})
+    _foreign_file(env.dir, "hci5.link.0")
+    _foreign_file(env.dir, "hci6.link.0")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+        asyncio.run(client.connect())
+
+    message = str(excinfo.value)
+    assert "connection slot" in message  # brc's OUT_OF_SLOTS_ERRORS match
+    assert "hci5 (1/1 links held)" in message
+    assert "hci6 (1/1 links held)" in message
+    assert isinstance(excinfo.value, sys.modules["bleak"].exc.BleakError)
+    assert RECORDED_INITS == []  # raised before any backend was constructed
+    assert catcher._rotation.index(ADDRESS) == 0  # exhaustion is not failure
+
+
+def test_claims_are_released_on_disconnect(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+    assert len(os.listdir(env.dir)) == 2
+    asyncio.run(client.disconnect())
+    assert os.listdir(env.dir) == []
+
+
+def test_claims_are_released_when_the_link_drops_unexpectedly(env):
+    """An unexpected drop must free the slot, via the wrapped raw
+    disconnected_callback, before the caller's own callback runs."""
+    seen = []
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, seen.append, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+    assert len(os.listdir(env.dir)) == 2
+
+    raw_callback = RECORDED_INITS[-1]["disconnected_callback"]
+    raw_callback(client)  # bleak fires this (via functools.partial) on a drop
+
+    assert os.listdir(env.dir) == []
+    assert seen == [client]
+
+
+def test_claims_are_released_when_the_connect_attempt_fails(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())
+
+    assert os.listdir(env.dir) == []
+    assert catcher._rotation.index(ADDRESS) == 1  # a real failure DOES advance
+
+
+def test_a_foreign_scan_claim_steers_selection_away(env):
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.scan")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"
+    assert catcher._rotation.index(ADDRESS) == 0  # avoidance never moves the walk
+
+
+def test_our_own_scan_claim_does_not_steer_selection_away(env):
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.scan", pid=os.getpid())
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"
+
+
+def test_all_adapters_scan_claimed_never_gates(env):
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.scan")
+    _foreign_file(env.dir, "hci6.scan")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"
+    assert client.is_connected is True
+
+
+def test_a_pinned_device_never_falls_back_to_the_pool(env, monkeypatch):
+    """The pin's adapter is gone from the kernel: the empty presence filter
+    falls back to the pinned list itself, never to the shared pool."""
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    env.install(adapters=(f"{ADDRESS}@hci9", "hci5"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci9"
+
+
+def test_selection_filters_against_present_adapters(env, monkeypatch):
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci6"})
+    env.install(adapters=("hci5", "hci6"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"
+
+
+def test_an_empty_presence_filter_falls_back_to_the_configured_order(env, monkeypatch):
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci7"})
+    env.install(adapters=("hci5", "hci6"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"
+
+
+def test_an_explicit_adapter_is_still_slot_gated_when_capped(env):
+    """A link cap is physics, not coordination: an explicitly chosen full
+    adapter raises the typed error - the connect is doomed and the error
+    buys correct pacing. With the slot free, the connect holds it."""
+    env.install(adapters=(), link_caps={"hci9": 1})
+    blocker = _foreign_file(env.dir, "hci9.link.0")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True, bluez={"adapter": "hci9"})
+
+    with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+        asyncio.run(client.connect())
+    assert "hci9 (1/1 links held)" in str(excinfo.value)
+
+    os.unlink(blocker)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci9"
+    assert "hci9.link.0" in os.listdir(env.dir)
+
+
+# -- the service-cache surface ---------------------------------------------
+
+
+def test_the_service_cache_surface_matches_bleak_retry_connector(env, caplog):
+    """set_cached_services is a no-op; clear_cache delegates under a hasattr
+    guard and warns + returns False when the underlying bleak (3.x) has no
+    clear_cache - the one path establish_connection calls it on."""
+    env.install()
+    ClientClass = sys.modules["bleak_retry_connector"].BleakClientWithServiceCache
+    assert ClientClass is catcher.BLEConnectionWithServiceCache
+    client = ClientClass(ADDRESS, _is_retry_client=True)
+
+    assert client.set_cached_services(["fff0"]) is None
+    assert asyncio.run(client.clear_cache()) is False
+    assert "clear_cache not implemented" in caplog.text

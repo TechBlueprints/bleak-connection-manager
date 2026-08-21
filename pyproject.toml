@@ -1,0 +1,33 @@
+[project]
+name = "bleak-connection-manager"
+version = "2.0.0.dev0"
+description = "Embeddable bleak catcher: claim-aware adapter routing installed underneath every bleak client"
+authors = [{ name = "TechBlueprints" }]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "bleak>=0.21.0",
+]
+
+[project.optional-dependencies]
+retry = [
+    "bleak-retry-connector>=4.0.0",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+"Repository" = "https://github.com/TechBlueprints/bleak-connection-manager"
+"Bug Tracker" = "https://github.com/TechBlueprints/bleak-connection-manager/issues"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
