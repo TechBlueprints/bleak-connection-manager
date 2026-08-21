@@ -209,6 +209,7 @@ def env(tmp_path, monkeypatch):
     RECORDED_SCANNER_INITS.clear()
     catcher._warned_bare_connect_addresses.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
+    monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
     def install(adapters=(), link_caps=None, wrap_scanner=False):
@@ -408,22 +409,23 @@ def test_an_uncapped_adapter_takes_no_slot_but_writes_a_soft_claim(env):
     assert os.listdir(env.dir) == [_soft_name("hci5")]
 
 
-def test_a_full_adapter_is_skipped_without_advancing_the_walk(env):
+def test_a_full_adapter_is_skipped_without_a_failure_penalty(env):
     """Slot exhaustion says nothing about the radio: the next eligible
-    adapter is tried, and the failure index must not move - advancing would
-    let a busy adapter push a device off its preferred radio."""
+    adapter is tried and no failure is recorded - a busy card must not be
+    scored down like a broken one. (The freed cap-1 card then legitimately
+    keeps habluetooth's last-slot penalty, so the uncapped card wins ties.)"""
     env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 1})
     blocker = _foreign_file(env.dir, "hci5.link.0")
     client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
 
     asyncio.run(client.connect())
     assert RECORDED_INITS[-1]["adapter"] == "hci6"
-    assert catcher._rotation.index(ADDRESS) == 0
+    assert catcher._connect_failures == {}  # exhaustion is not failure
 
     asyncio.run(client.disconnect())
     os.unlink(blocker)
     asyncio.run(client.connect())
-    assert RECORDED_INITS[-1]["adapter"] == "hci5"  # index never moved
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"  # uncapped beats last-slot
 
 
 def test_every_adapter_full_raises_the_typed_error_with_occupancy(env):
@@ -729,6 +731,72 @@ def test_an_unconfigured_scanner_is_a_passthrough(env):
     assert RECORDED_SCANNER_INITS[-1]["adapter"] is None
     assert RECORDED_SCANNER_INITS[-1]["extra"] == []
     assert os.listdir(env.dir) == []
+
+
+# -- scored placement (habluetooth parity, cross-process) ------------------
+
+
+def test_an_unconfigured_install_scores_over_every_present_adapter(env, monkeypatch):
+    """Default is everything: with no pool configured, placement scores all
+    adapters the kernel exposes; the pool config acts as an allowlist."""
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5", "hci6"})
+    env.install(adapters=())
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"  # tie -> lowest hci number
+    assert _soft_name("hci5") in os.listdir(env.dir)
+
+
+def test_scoring_spreads_unpinned_devices_away_from_occupied_adapters(env):
+    """The cross-process generalization of habluetooth's in-progress
+    penalty: live soft claims from any process push new placements to the
+    least-occupied card."""
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.use.other-svc.AABBCC")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"
+
+
+def test_a_recovered_adapter_competes_again_after_a_success_elsewhere(env):
+    """Failure penalties are per (adapter, address) and a success clears
+    only that adapter's count - so the preferred card's single old failure
+    keeps it demoted only until the counts even out."""
+    env.install(adapters=("hci5", "hci6"))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())      # hci5 fails, penalized
+    asyncio.run(client.connect())          # lands on hci6
+    asyncio.run(client.disconnect())
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())      # hci6 fails too, now tied
+    asyncio.run(client.connect())
+
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci5", "hci6", "hci6", "hci5"]
+
+
+def test_hci_names_sort_numerically():
+    assert sorted(["hci10", "hci2", "hci1"], key=catcher._hci_sort_key) == ["hci1", "hci2", "hci10"]
+
+
+def test_an_unconfigured_scanner_scores_over_every_present_adapter(env, monkeypatch):
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci4"})
+    env.install(adapters=(), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert "hci4.scan" in os.listdir(env.dir)
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci4"
 
 
 # -- claim-leak backstops: init failures and silent drops ------------------

@@ -156,6 +156,26 @@ class BleAdapterRotation:
 
 _rotation = BleAdapterRotation()
 
+# (adapter, address) -> consecutive failed connect attempts, feeding the
+# placement score; a success there clears it (habluetooth's model)
+_connect_failures = {}
+
+
+def _connect_finished(adapter, address, connected):
+    if not adapter:
+        return
+    key = (adapter, _address_key(address))
+    if connected:
+        _connect_failures.pop(key, None)
+    else:
+        _connect_failures[key] = _connect_failures.get(key, 0) + 1
+
+
+def _hci_sort_key(name):
+    match = re.match(r"hci(\d+)$", name)
+    return (0, int(match.group(1))) if match else (1, name)
+
+
 # addresses already warned about bare connect() calls, once per process -
 # a reconnect loop hitting this every few seconds would flood the log
 _warned_bare_connect_addresses = set()
@@ -181,31 +201,76 @@ def _out_of_slots_error(address, exhausted, config):
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
+def _score_order(eligible, address_key, snapshot, caps):
+    """Candidates best-first, by habluetooth-parity connect scoring.
+
+    habluetooth scores connection paths as RSSI minus penalties
+    (base_scanner.py:213-246). We have no RSSI - connect-dominated processes
+    do not scan - so the base is 0 and the penalty unit is 1 (their
+    effective_rssi_diff floor for equal-RSSI paths), with their in-progress
+    term generalized cross-process: live soft claims count every in-flight
+    attempt and established link on the card, from every process, which is
+    what their per-process counter approximates. Failure counts stay local.
+    A capped-full adapter sinks to the end rather than dropping out: the
+    claim loop still visits it in case a slot freed since the snapshot, and
+    real exhaustion is decided by the O_EXCL claim, not the score. Ties
+    break by configuration order.
+    """
+    scored = []
+    for index, adapter in enumerate(eligible):
+        entry = snapshot.get(adapter) or {}
+        cap = caps.get(adapter)
+        free = (cap - entry.get("links", 0)) if cap else None
+        score = 0.0
+        score -= entry.get("soft", 0) * 1.01
+        score -= _connect_failures.get((adapter, address_key), 0) * 0.51
+        if free is not None:
+            if free <= 0:
+                score -= 1000.0
+            elif free == 1:
+                score -= 0.76
+        scored.append((-score, index, adapter))
+    scored.sort()
+    return [adapter for _, _, adapter in scored]
+
+
 def _acquire_adapter(address):
     """Select an adapter for the next attempt and take its claims.
 
-    Returns (adapter-or-None, claims-held). Selection: the device's pins or
-    the shared pool, filtered by kernel presence, then by foreign live scan
-    claims - each filter falling back to the unfiltered list rather than
-    refusing to attempt - walked from the failure-driven index. An adapter
-    whose configured link capacity is fully claimed is skipped WITHOUT
-    advancing the index: exhaustion says nothing about the radio, and
-    advancing would let a busy adapter push a device off its pin. Raises
+    Returns (adapter-or-None, claims-held). Pinned devices keep the
+    deterministic failure-driven walk over their pin list - a pin is an
+    explicit operator preference order, and only a failed connect moves a
+    device off it. Unpinned devices are placed by scoring (_score_order)
+    over the shared pool, or - with no pool configured - over every adapter
+    the kernel currently exposes, so an unconfigured install spreads load by
+    default and the pool config acts as an allowlist. Both paths filter by
+    kernel presence and foreign live scan claims, each filter falling back
+    to the unfiltered list rather than refusing to attempt. An adapter whose
+    configured link capacity is fully claimed is passed over WITHOUT a
+    failure being recorded: exhaustion says nothing about the radio. Raises
     OutOfConnectionSlotsError only when every eligible adapter is capped and
     full.
     """
     config = _config
     if config is None:
         return None, []
-    adapters = config.pins.get(_address_key(address)) or config.pool
-    if not adapters:
-        return None, []
-    adapters = list(adapters)
+    address_key = _address_key(address)
+    pins = config.pins.get(address_key)
     present = present_adapters()
-    usable = [a for a in adapters if a in present] if present else adapters
+    if pins:
+        candidates = list(pins)
+    elif config.pool:
+        candidates = list(config.pool)
+    elif present:
+        candidates = sorted(present, key=_hci_sort_key)
+    else:
+        candidates = []
+    if not candidates:
+        return None, []
+    usable = [a for a in candidates if a in present] if present else candidates
     if not usable:
         # refusing to attempt is worse than trying an adapter that may be gone
-        usable = adapters
+        usable = candidates
     snapshot = config.claims.claims()
     own_pid = os.getpid()
 
@@ -217,15 +282,19 @@ def _acquire_adapter(address):
     if not eligible:
         logger.info(f"BLE [{address}]: every usable adapter is scan-claimed by another process, using them anyway")
         eligible = usable
-    start = _rotation.index(address) % len(eligible)
+    if pins:
+        start = _rotation.index(address) % len(eligible)
+        ordered = eligible[start:] + eligible[:start]
+    else:
+        ordered = _score_order(eligible, address_key, snapshot, config.link_caps)
     if logger.isEnabledFor(logging.DEBUG):
-        occupancy = {a: (snapshot.get(a) or {}) for a in eligible}
+        occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
         logger.debug(
-            f"BLE [{address}]: adapter order {eligible[start:] + eligible[:start]} "
-            f"(walk index {_rotation.index(address)}, occupancy {occupancy})"
+            f"BLE [{address}]: adapter order {ordered} "
+            f"({'pinned walk' if pins else 'scored'}, occupancy {occupancy})"
         )
     exhausted = []
-    for adapter in eligible[start:] + eligible[:start]:
+    for adapter in ordered:
         cap = config.link_caps.get(adapter)
         if cap:
             slot = config.claims.claim_slot(adapter, cap)
@@ -378,12 +447,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             # not a radio failure, so the walk index stays put
             self._release_claims()
             raise
+        adapter_used = explicit or adapter
         connected = False
         try:
             result = await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
             connected = True
         except Exception:
-            # a failed attempt: the next one goes out on the next adapter
+            # a failed attempt: penalize this adapter in the score and, for
+            # pinned devices, walk to the next pin
+            _connect_finished(adapter_used, self._catcher_address, False)
             _rotation.connect_failed(self._catcher_address)
             raise
         finally:
@@ -391,10 +463,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 # finally, not except: a cancelled connect (asyncio timeout
                 # machinery above us) must release the claims too, and the
                 # wrapper must not hold a partially-initialised backend.
-                # Cancellation does not advance the walk - it says nothing
-                # about the radio.
+                # Cancellation is not a failure - it says nothing about the
+                # radio.
                 self._release_claims()
                 self._backend = None
+        _connect_finished(adapter_used, self._catcher_address, True)
         self._arm_claim_validity()
         return result
 
@@ -443,10 +516,12 @@ class BLEConnectionWithServiceCache(BLEConnection):
         return False
 
 
-def _scan_candidates(config):
-    """Adapters a scan may use: the shared pool, or with no pool the union
-    of pinned adapters in configuration order (a scan serves discovery for
-    every device, so pins only narrow it when they are all there is)."""
+def _scan_candidates(config, present):
+    """Adapters a scan may use: the shared pool, else the union of pinned
+    adapters in configuration order (a scan serves discovery for every
+    device, so pins only narrow it when they are all there is), else every
+    adapter the kernel exposes - like connection placement, an unconfigured
+    install uses everything and the config acts as an allowlist."""
     if config.pool:
         return list(config.pool)
     seen = []
@@ -454,7 +529,11 @@ def _scan_candidates(config):
         for adapter in adapters:
             if adapter not in seen:
                 seen.append(adapter)
-    return seen
+    if seen:
+        return seen
+    if present:
+        return sorted(present, key=_hci_sort_key)
+    return []
 
 
 def _acquire_scan_adapter():
@@ -471,10 +550,10 @@ def _acquire_scan_adapter():
     config = _config
     if config is None:
         return None, None
-    candidates = _scan_candidates(config)
+    present = present_adapters()
+    candidates = _scan_candidates(config, present)
     if not candidates:
         return None, None
-    present = present_adapters()
     usable = [a for a in candidates if a in present] if present else candidates
     if not usable:
         # refusing to scan is worse than scanning an adapter that may be gone
