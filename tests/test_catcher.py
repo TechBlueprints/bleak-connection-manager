@@ -805,6 +805,51 @@ def test_an_unconfigured_scanner_scores_over_every_present_adapter(env, monkeypa
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci4"
 
 
+# -- connection-parameter tuning around connect ----------------------------
+
+
+def test_conn_params_load_fast_before_connect_and_medium_after(env, monkeypatch):
+    loads = []
+    monkeypatch.setattr(catcher.mgmt, "load_fast", lambda adapter, address: loads.append(("fast", adapter)))
+    monkeypatch.setattr(catcher.mgmt, "load_medium", lambda adapter, address: loads.append(("medium", adapter)))
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert loads == [("fast", "hci5"), ("medium", "hci5")]
+
+
+def test_a_failed_connect_never_loads_the_medium_params(env, monkeypatch):
+    loads = []
+    monkeypatch.setattr(catcher.mgmt, "load_fast", lambda adapter, address: loads.append("fast"))
+    monkeypatch.setattr(catcher.mgmt, "load_medium", lambda adapter, address: loads.append("medium"))
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())
+
+    assert loads == ["fast"]
+
+
+def test_conn_param_tuning_can_be_disabled_and_skips_passthrough(env, monkeypatch):
+    loads = []
+    monkeypatch.setattr(catcher.mgmt, "load_fast", lambda adapter, address: loads.append("fast"))
+    monkeypatch.setattr(catcher.mgmt, "load_medium", lambda adapter, address: loads.append("medium"))
+
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert loads == []  # disabled
+
+    env.install(adapters=())  # unconfigured: no adapter known, nothing to tune
+    other = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(other.connect())
+    assert loads == []
+
+
 # -- the scanner watchdog and claims-gated recovery ------------------------
 
 

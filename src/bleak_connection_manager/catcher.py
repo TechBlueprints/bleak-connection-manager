@@ -36,7 +36,7 @@ from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
 from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
-from . import recovery
+from . import mgmt, recovery
 from .claims import CLAIM_DIR, ClaimManager
 
 # habluetooth's scanner watchdog thresholds (const.py:96-108), derived
@@ -195,12 +195,13 @@ _warned_bare_connect_addresses = set()
 
 
 class _CatcherConfig:
-    def __init__(self, owner, pins, pool, link_caps, claims):
+    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params):
         self.owner = owner
         self.pins = pins
         self.pool = pool
         self.link_caps = link_caps
         self.claims = claims
+        self.tune_conn_params = tune_conn_params
 
 
 _config = None
@@ -461,6 +462,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             self._release_claims()
             raise
         adapter_used = explicit or adapter
+        tune = bool(adapter_used and config is not None and config.tune_conn_params)
+        if tune:
+            # habluetooth's fast-then-medium: pre-seed the kernel so the
+            # fast parameters apply to the connection being established
+            mgmt.load_fast(adapter_used, self._catcher_address)
         connected = False
         try:
             result = await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
@@ -481,6 +487,8 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 self._release_claims()
                 self._backend = None
         _connect_finished(adapter_used, self._catcher_address, True)
+        if tune:
+            mgmt.load_medium(adapter_used, self._catcher_address)
         self._arm_claim_validity()
         return result
 
@@ -784,7 +792,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -800,7 +808,10 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     adapter is never slot-gated. wrap_scanner additionally rebinds
     bleak.BleakScanner to the adapter-bound, hard-claiming BLEScanner -
     opt-in because it changes which adapter unrelated code scans on.
-    Idempotent.
+    tune_conn_params loads habluetooth's fast-then-medium connection
+    parameters over the mgmt socket around each connect; it degrades to a
+    no-op wherever the mgmt channel is unavailable (non-Linux, no
+    NET_ADMIN). Idempotent.
     """
     global _config
     import bleak
@@ -824,6 +835,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         pool=pool,
         link_caps=caps,
         claims=ClaimManager(owner=f"{owner}-{os.getpid()}", claim_dir=claim_dir),
+        tune_conn_params=tune_conn_params,
     )
     bleak.BleakClient = BLEConnection
     bleak.BleakScanner = BLEScanner if wrap_scanner else _ORIGINAL_BLEAK_SCANNER
