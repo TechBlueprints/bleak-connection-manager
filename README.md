@@ -59,6 +59,15 @@ penalty; capped-full adapters rank last. Ties break by configuration order,
 and all scoring state is process-wide, so fresh-client-per-attempt callers
 continue where they left off.
 
+**The configuring driver picks its placement mode.** By default
+(`scan_to_score=False`) nothing scans, so the score has no RSSI base —
+routing is least-used. With `scan_to_score=True` the catcher runs periodic
+short active sweeps per candidate adapter (habluetooth's active-window
+cadence: 10s every 300s, each sweep holding that adapter's `hciN.scan`
+claim and skipping cards another live process is scanning on), and the
+score gains its RSSI base with penalties charged in units of the spread
+between the two best paths, exactly as habluetooth scores connection paths.
+
 Configured adapters are filtered against what the kernel currently exposes
 (`/sys/class/bluetooth`, `hciconfig` fallback) and against adapters another
 live process is actively scanning on (a foreign `hciN.scan` claim). Every
@@ -141,7 +150,7 @@ plain claims coordination without adopting any of this package — see
 
 | Name | Purpose |
 | --- | --- |
-| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
+| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True, scan_to_score=False)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
 | `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False)` | Claims-gated hardware reset (needs the `recovery` extra); refuses while other live processes hold claims on the card. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |

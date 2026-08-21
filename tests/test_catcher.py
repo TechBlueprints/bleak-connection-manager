@@ -218,8 +218,15 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None, wrap_scanner=False):
-        catcher.install_bleak_catcher(OWNER, adapters=adapters, link_caps=link_caps, claim_dir=str(tmp_path), wrap_scanner=wrap_scanner)
+    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False):
+        catcher.install_bleak_catcher(
+            OWNER,
+            adapters=adapters,
+            link_caps=link_caps,
+            claim_dir=str(tmp_path),
+            wrap_scanner=wrap_scanner,
+            scan_to_score=scan_to_score,
+        )
 
     with _stubs_installed():
         yield types.SimpleNamespace(install=install, dir=str(tmp_path))
@@ -803,6 +810,95 @@ def test_an_unconfigured_scanner_scores_over_every_present_adapter(env, monkeypa
 
     asyncio.run(scenario())
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci4"
+
+
+# -- scan_to_score: swept RSSI feeding the placement score -----------------
+
+
+def test_swept_rssi_becomes_the_score_base():
+    order = catcher._score_order(["hci5", "hci6"], "K", {}, {}, rssi={"hci5": -80, "hci6": -60})
+    assert order == ["hci6", "hci5"]  # stronger signal wins
+
+
+def test_rssi_penalties_are_charged_in_units_of_the_path_spread():
+    """habluetooth's two-pass trick: penalties are multiples of how much
+    better the best path is. One occupant (1.01 units) always overturns
+    the RSSI advantage - that is the herd-spreading - while a failure
+    (0.51 units) takes two to do it."""
+    occupied = {"hci6": {"soft": 1, "links": 0}}
+    assert catcher._score_order(["hci5", "hci6"], "K", occupied, {}, rssi={"hci5": -90, "hci6": -60}) == ["hci5", "hci6"]
+
+    catcher._connect_failures[("hci6", "K")] = 1
+    try:
+        one_failure = catcher._score_order(["hci5", "hci6"], "K", {}, {}, rssi={"hci5": -61, "hci6": -60})
+        assert one_failure == ["hci6", "hci5"]  # half a unit does not flip
+        catcher._connect_failures[("hci6", "K")] = 2
+        two_failures = catcher._score_order(["hci5", "hci6"], "K", {}, {}, rssi={"hci5": -61, "hci6": -60})
+        assert two_failures == ["hci5", "hci6"]  # a full unit does
+    finally:
+        catcher._connect_failures.pop(("hci6", "K"), None)
+
+
+def test_an_unseen_adapter_scores_no_rssi_value():
+    order = catcher._score_order(["hci5", "hci6"], "K", {}, {}, rssi={"hci6": -90})
+    assert order == ["hci6", "hci5"]  # -90 still beats never-seen (-127)
+
+
+def test_sweeper_samples_go_stale(env, monkeypatch):
+    env.install(adapters=("hci5",), scan_to_score=True)
+    sweeper = catcher._config.sweeper
+    sweeper.record("hci5", ADDRESS, -60)
+    assert sweeper.rssi_for(["hci5"], catcher._address_key(ADDRESS)) == {"hci5": -60}
+    monkeypatch.setattr(catcher, "_monotonic", lambda: time.monotonic() + catcher.RSSI_STALE_SECONDS + 1)
+    assert sweeper.rssi_for(["hci5"], catcher._address_key(ADDRESS)) == {}
+
+
+def test_a_sweep_takes_the_scan_claim_and_releases_it(env, monkeypatch):
+    monkeypatch.setattr(catcher, "RSSI_SWEEP_DURATION", 0)
+    env.install(adapters=("hci5",), scan_to_score=True)
+    sweeper = catcher._config.sweeper
+
+    async def scenario():
+        await sweeper._sweep_adapter("hci5")
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci5"  # original scanner, bound
+    assert "hci5.scan" not in os.listdir(env.dir)  # claim released after the window
+
+
+def test_a_sweep_never_interrupts_a_foreign_scanner(env, monkeypatch):
+    monkeypatch.setattr(catcher, "RSSI_SWEEP_DURATION", 0)
+    env.install(adapters=("hci5",), scan_to_score=True)
+    _foreign_file(env.dir, "hci5.scan")
+    sweeper = catcher._config.sweeper
+
+    async def scenario():
+        await sweeper._sweep_adapter("hci5")
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS == []  # no scanner was built
+
+
+def test_least_used_mode_runs_no_sweeper(env):
+    env.install(adapters=("hci5",))
+    assert catcher._config.sweeper is None
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert RECORDED_SCANNER_INITS == []  # nothing ever scans in this mode
+
+
+def test_scan_to_score_starts_the_sweeper_on_first_connect(env):
+    env.install(adapters=("hci5",), scan_to_score=True)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        sweeper = catcher._config.sweeper
+        assert sweeper._task is not None and not sweeper._task.done()
+        sweeper.stop()
+
+    asyncio.run(scenario())
 
 
 # -- connection-parameter tuning around connect ----------------------------

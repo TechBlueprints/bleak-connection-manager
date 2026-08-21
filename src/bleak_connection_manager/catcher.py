@@ -48,6 +48,14 @@ SCANNER_WATCHDOG_INTERVAL = 30.0
 SCANNER_WATCHDOG_MULTIPLE = SCANNER_WATCHDOG_TIMEOUT + SCANNER_WATCHDOG_INTERVAL
 _monotonic = time.monotonic
 
+# RSSI sweeps for scan_to_score placement: habluetooth's active-window
+# cadence (const.py:113-158 defaults: 300s interval, 10s duration). A sample
+# older than a missed sweep plus the window is stale.
+NO_RSSI_VALUE = -127
+RSSI_SWEEP_INTERVAL = 300.0
+RSSI_SWEEP_DURATION = 10.0
+RSSI_STALE_SECONDS = RSSI_SWEEP_INTERVAL * 2 + RSSI_SWEEP_DURATION
+
 try:
     import bleak_retry_connector as _brc_module
 
@@ -202,6 +210,92 @@ class _CatcherConfig:
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
+        self.sweeper = None
+
+
+class RssiSweeper:
+    """Periodic short active scans that feed the placement score with RSSI.
+
+    The configuring driver chooses its placement mode: without a sweeper,
+    routing is least-used (occupancy and failures only - no RSSI exists
+    because nothing scans); with one, each candidate adapter gets a short
+    active window every RSSI_SWEEP_INTERVAL and the score gains its RSSI
+    base, habluetooth style. Sweeps take the adapter's hard scan claim for
+    the window - so other processes' placement and scans steer around them -
+    and skip adapters another live process is already scanning on; the next
+    cycle retries. Everything degrades: a sweep that cannot scan just
+    leaves the score RSSI-less.
+    """
+
+    def __init__(self, config):
+        self._config = config
+        self._rssi = {}
+        self._task = None
+
+    def ensure_running(self):
+        if self._task is not None and not self._task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._run())
+
+    def stop(self):
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+
+    def record(self, adapter, address, rssi):
+        self._rssi[(adapter, _address_key(address))] = (rssi, _monotonic())
+
+    def rssi_for(self, adapters, address_key):
+        """{adapter: rssi} for the fresh samples we hold on this address."""
+        now = _monotonic()
+        fresh = {}
+        for adapter in adapters:
+            entry = self._rssi.get((adapter, address_key))
+            if entry is not None and now - entry[1] <= RSSI_STALE_SECONDS:
+                fresh[adapter] = entry[0]
+        return fresh
+
+    async def _run(self):
+        try:
+            while True:
+                for adapter in _scan_candidates(self._config, present_adapters()):
+                    await self._sweep_adapter(adapter)
+                await asyncio.sleep(RSSI_SWEEP_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("RSSI sweep loop failed")
+
+    async def _sweep_adapter(self, adapter):
+        claim = self._config.claims.claim_hard(adapter)
+        if claim is None:
+            # another live process is scanning there; its window is not ours
+            # to interrupt, and next cycle retries
+            return
+        scanner = None
+        try:
+
+            def _seen(device, advertisement_data):
+                rssi = getattr(advertisement_data, "rssi", None)
+                if rssi is not None:
+                    self.record(adapter, getattr(device, "address", device), rssi)
+
+            scanner = _ORIGINAL_BLEAK_SCANNER(_seen, adapter=adapter)
+            await scanner.start()
+            await asyncio.sleep(RSSI_SWEEP_DURATION)
+        except Exception as e:
+            logger.debug(f"RSSI sweep on {adapter} failed: {repr(e)}")
+        finally:
+            if scanner is not None:
+                try:
+                    await scanner.stop()
+                except Exception:
+                    pass
+            self._config.claims.release(claim)
 
 
 _config = None
@@ -215,34 +309,42 @@ def _out_of_slots_error(address, exhausted, config):
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
-def _score_order(eligible, address_key, snapshot, caps):
+def _score_order(eligible, address_key, snapshot, caps, rssi=None):
     """Candidates best-first, by habluetooth-parity connect scoring.
 
     habluetooth scores connection paths as RSSI minus penalties
-    (base_scanner.py:213-246). We have no RSSI - connect-dominated processes
-    do not scan - so the base is 0 and the penalty unit is 1 (their
-    effective_rssi_diff floor for equal-RSSI paths), with their in-progress
-    term generalized cross-process: live soft claims count every in-flight
-    attempt and established link on the card, from every process, which is
-    what their per-process counter approximates. Failure counts stay local.
-    A capped-full adapter sinks to the end rather than dropping out: the
-    claim loop still visits it in case a slot freed since the snapshot, and
-    real exhaustion is decided by the O_EXCL claim, not the score. Ties
-    break by configuration order.
+    (base_scanner.py:213-246), the penalties scaled by the spread between
+    the two best paths (wrappers.py:586-640). In least-used mode there is
+    no RSSI - nothing scans - so the base is 0 and the unit is 1 (their
+    effective_rssi_diff floor for equal-RSSI paths); with an RssiSweeper
+    feeding rssi, the base is the swept RSSI (NO_RSSI_VALUE when this
+    address was never seen on that adapter) and the unit is the real
+    spread. The in-progress term is generalized cross-process: live soft
+    claims count every in-flight attempt and established link on the card,
+    from every process. Failure counts stay local. A capped-full adapter
+    sinks to the end rather than dropping out: the claim loop still visits
+    it in case a slot freed since the snapshot, and real exhaustion is
+    decided by the O_EXCL claim, not the score. Ties break by
+    configuration order.
     """
+    unit = 1.0
+    if rssi:
+        known = sorted(rssi.values(), reverse=True)
+        if len(known) > 1:
+            unit = max(known[0] - known[1], 1.0)
     scored = []
     for index, adapter in enumerate(eligible):
         entry = snapshot.get(adapter) or {}
         cap = caps.get(adapter)
         free = (cap - entry.get("links", 0)) if cap else None
-        score = 0.0
-        score -= entry.get("soft", 0) * 1.01
-        score -= _connect_failures.get((adapter, address_key), 0) * 0.51
+        score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
+        score -= entry.get("soft", 0) * 1.01 * unit
+        score -= _connect_failures.get((adapter, address_key), 0) * 0.51 * unit
         if free is not None:
             if free <= 0:
-                score -= 1000.0
+                score -= 100000.0
             elif free == 1:
-                score -= 0.76
+                score -= 0.76 * unit
         scored.append((-score, index, adapter))
     scored.sort()
     return [adapter for _, _, adapter in scored]
@@ -300,7 +402,8 @@ def _acquire_adapter(address):
         start = _rotation.index(address) % len(eligible)
         ordered = eligible[start:] + eligible[:start]
     else:
-        ordered = _score_order(eligible, address_key, snapshot, config.link_caps)
+        rssi = config.sweeper.rssi_for(eligible, address_key) if config.sweeper is not None else None
+        ordered = _score_order(eligible, address_key, snapshot, config.link_caps, rssi)
     if logger.isEnabledFor(logging.DEBUG):
         occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
         logger.debug(
@@ -435,6 +538,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._release_claims()
         config = _config
         self._catcher_manager = config.claims if config is not None else None
+        if config is not None and config.sweeper is not None:
+            # lazily started here because this is the first moment a
+            # running event loop is guaranteed
+            config.sweeper.ensure_running()
         adapter = None
         explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
         if explicit:
@@ -792,7 +899,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -811,7 +918,11 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     tune_conn_params loads habluetooth's fast-then-medium connection
     parameters over the mgmt socket around each connect; it degrades to a
     no-op wherever the mgmt channel is unavailable (non-Linux, no
-    NET_ADMIN). Idempotent.
+    NET_ADMIN). scan_to_score is the driver's placement-mode choice: False
+    routes unpinned devices least-used (occupancy and failures only), True
+    additionally runs periodic short RSSI sweeps per adapter (RssiSweeper)
+    so the score gains its habluetooth RSSI base - a driver that scans can
+    place by signal, one that will not scan still spreads load. Idempotent.
     """
     global _config
     import bleak
@@ -828,6 +939,8 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         else:
             logger.warning(f"Ignoring link cap for '{adapter}': not a positive integer")
     if _config is not None:
+        if _config.sweeper is not None:
+            _config.sweeper.stop()
         _config.claims.release_all()
     _config = _CatcherConfig(
         owner=owner,
@@ -837,6 +950,8 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         claims=ClaimManager(owner=f"{owner}-{os.getpid()}", claim_dir=claim_dir),
         tune_conn_params=tune_conn_params,
     )
+    if scan_to_score:
+        _config.sweeper = RssiSweeper(_config)
     bleak.BleakClient = BLEConnection
     bleak.BleakScanner = BLEScanner if wrap_scanner else _ORIGINAL_BLEAK_SCANNER
     if _brc_module is not None:
@@ -856,5 +971,7 @@ def uninstall_bleak_catcher():
         _brc_module.BleakClient = _ORIGINAL_BRC_CLIENT
         _brc_module.BleakClientWithServiceCache = _ORIGINAL_BRC_CACHE_CLIENT
     if _config is not None:
+        if _config.sweeper is not None:
+            _config.sweeper.stop()
         _config.claims.release_all()
         _config = None
