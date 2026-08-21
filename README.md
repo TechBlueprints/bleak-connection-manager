@@ -89,6 +89,11 @@ claim = manager.claim_hard("hci0")     # exclusive scan claim, or None
 adapter, soft = manager.choose(["hci0", "hci1"])  # ranked placement
 ```
 
+The upstream bt-claims reference library (convention 0.1) is also vendored
+verbatim in [`ext/bt_claims.py`](ext/bt_claims.py) for anyone who wants the
+plain claims coordination without adopting any of this package — see
+[`ext/README.md`](ext/README.md) for provenance.
+
 ## Public API
 
 | Name | Purpose |
