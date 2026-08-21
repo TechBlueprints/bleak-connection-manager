@@ -27,9 +27,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 ADDRESS = "C8:47:8C:00:00:00"
 
-# scripts the rich stub consumes, reset per test
+# scripts the rich stubs consume, reset per test
 CONNECT_RESULTS = []
 RECORDED_INITS = []
+SCANNER_START_RESULTS = []
+RECORDED_SCANNER_INITS = []
 
 
 class _RichBackend:
@@ -77,13 +79,56 @@ class RichBleakClient:
         return self._backend.is_connected
 
 
+class _RichScannerBackend:
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.scanning = False
+
+    async def start(self):
+        result = SCANNER_START_RESULTS.pop(0) if SCANNER_START_RESULTS else True
+        if isinstance(result, Exception):
+            raise result
+        self.scanning = True
+
+    async def stop(self):
+        self.scanning = False
+
+
+class RichBleakScanner:
+    """Just like bleak 3.x: the backend is wired up inside __init__, and the
+    BlueZ backend receives the adapter via the backwards-compat kwarg."""
+
+    def __init__(self, detection_callback=None, service_uuids=None, scanning_mode="active", *, bluez=None, backend=None, **kwargs):
+        adapter = kwargs.get("adapter", (bluez or {}).get("adapter"))
+        RECORDED_SCANNER_INITS.append({"adapter": adapter, "extra": sorted(k for k in kwargs if k != "adapter")})
+        self._backend = _RichScannerBackend(adapter)
+        self._backend_id = "stub"
+
+    async def start(self):
+        await self._backend.start()
+
+    async def stop(self):
+        await self._backend.stop()
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop()
+
+    @property
+    def discovered_devices(self):
+        return ["stub-device"]
+
+
 def _make_stub_modules():
     exc = types.ModuleType("bleak.exc")
     exc.BleakError = type("BleakError", (Exception,), {})
     exc.BleakDeviceNotFoundError = type("BleakDeviceNotFoundError", (Exception,), {})
     bleak = types.ModuleType("bleak")
     bleak.BleakClient = RichBleakClient
-    bleak.BleakScanner = object
+    bleak.BleakScanner = RichBleakScanner
     bleak.exc = exc
 
     brc = types.ModuleType("bleak_retry_connector")
@@ -151,12 +196,14 @@ def env(tmp_path, monkeypatch):
     directory, no adapters "present" unless a test says otherwise."""
     CONNECT_RESULTS.clear()
     RECORDED_INITS.clear()
+    SCANNER_START_RESULTS.clear()
+    RECORDED_SCANNER_INITS.clear()
     catcher._warned_bare_connect_addresses.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None):
-        catcher.install_bleak_catcher(OWNER, adapters=adapters, link_caps=link_caps, claim_dir=str(tmp_path))
+    def install(adapters=(), link_caps=None, wrap_scanner=False):
+        catcher.install_bleak_catcher(OWNER, adapters=adapters, link_caps=link_caps, claim_dir=str(tmp_path), wrap_scanner=wrap_scanner)
 
     with _stubs_installed():
         yield types.SimpleNamespace(install=install, dir=str(tmp_path))
@@ -525,3 +572,151 @@ def test_the_service_cache_surface_matches_bleak_retry_connector(env, caplog):
     assert client.set_cached_services(["fff0"]) is None
     assert asyncio.run(client.clear_cache()) is False
     assert "clear_cache not implemented" in caplog.text
+
+
+# -- phase 2: the adapter-bound, hard-claiming scanner ---------------------
+
+
+def test_scanner_wrapping_is_opt_in(env):
+    env.install()
+    assert sys.modules["bleak"].BleakScanner is RichBleakScanner
+    env.install(wrap_scanner=True)
+    assert sys.modules["bleak"].BleakScanner is catcher.BLEScanner
+    env.install()  # re-install without the flag reverts the scanner rebind
+    assert sys.modules["bleak"].BleakScanner is RichBleakScanner
+    env.install(wrap_scanner=True)
+    catcher.uninstall_bleak_catcher()
+    assert sys.modules["bleak"].BleakScanner is RichBleakScanner
+
+
+def test_scanner_placeholders_are_inert(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    scanner = sys.modules["bleak"].BleakScanner()
+    assert isinstance(scanner, catcher.BLEScanner)
+    assert RECORDED_SCANNER_INITS == []  # nothing built before start
+    assert scanner.discovered_devices == []
+
+
+def test_a_scan_binds_an_adapter_and_holds_the_hard_claim_while_scanning(env):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert "hci5.scan" in os.listdir(env.dir)
+        assert scanner.discovered_devices == ["stub-device"]
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci5"
+    assert "hci5.scan" not in os.listdir(env.dir)  # held per scan activity
+
+
+def test_the_scanner_context_manager_claims_and_releases(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        async with sys.modules["bleak"].BleakScanner() as scanner:
+            assert "hci5.scan" in os.listdir(env.dir)
+            assert scanner._backend.scanning is True
+
+    asyncio.run(scenario())
+    assert "hci5.scan" not in os.listdir(env.dir)
+
+
+def test_scan_placement_prefers_the_less_occupied_adapter(env):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.use.other-svc")
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci6"
+
+
+def test_a_scan_avoids_a_foreign_scan_claim(env):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert "hci6.scan" in os.listdir(env.dir)
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci6"
+
+
+def test_every_card_scan_claimed_scans_anyway_unclaimed(env):
+    """Coordination never gates: with every card claimed by live foreign
+    scanners, the scan proceeds on the best-ranked card without a claim."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+    _foreign_file(env.dir, "hci6.scan")
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert scanner._backend.scanning is True
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci5"
+    assert set(os.listdir(env.dir)) == {"hci5.scan", "hci6.scan"}  # both still foreign
+
+
+def test_a_failed_scan_start_releases_the_claim(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    SCANNER_START_RESULTS.append(RuntimeError("org.bluez.Error.InProgress"))
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(RuntimeError):
+            await scanner.start()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+
+
+def test_a_scanner_adapter_chosen_by_the_caller_is_never_overridden(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner(adapter="hci9")
+        await scanner.start()
+        assert "hci9.scan" in os.listdir(env.dir)  # claim still taken, best effort
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci9"
+    assert "hci9.scan" not in os.listdir(env.dir)
+
+
+def test_a_scan_with_no_pool_uses_the_union_of_pinned_adapters(env):
+    env.install(adapters=(f"{ADDRESS}@hci9",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci9"
+
+
+def test_an_unconfigured_scanner_is_a_passthrough(env):
+    env.install(adapters=(), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] is None
+    assert RECORDED_SCANNER_INITS[-1]["extra"] == []
+    assert os.listdir(env.dir) == []

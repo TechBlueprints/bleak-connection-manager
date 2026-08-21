@@ -22,6 +22,7 @@ install_bleak_catcher(
     "dbus-blebattery.0",
     adapters=["C8:47:8C:11:22:33@hci0", "C8:47:8C:11:22:33@hci1", "hci2"],
     link_caps={"hci0": 5},          # opt-in; uncapped adapters are never gated
+    wrap_scanner=True,              # opt-in; also route BleakScanner (see below)
 )
 
 import my_bms_library  # its BleakClient is now the routed wrapper
@@ -69,6 +70,18 @@ backoff on any version), with per-adapter occupancy in the message, e.g.
 `hci0 (5/5 links held)`. Slots release on `disconnect()`, on an unexpected
 drop (via the disconnected callback), and on a failed connect.
 
+## Scanning (opt-in)
+
+With `wrap_scanner=True`, `bleak.BleakScanner` is also rebound, to an
+adapter-bound, hard-claiming scanner. At `start()` it ranks the shared pool
+(or, with no pool, the union of pinned adapters) by live occupancy — fewest
+soft claims plus held link slots first — skips cards another live process is
+scanning on, and takes the winner's exclusive `hciN.scan` claim, held per
+scan activity: released at `stop()` or on a failed start. When every card is
+claimed it scans on the best-ranked one anyway, unclaimed. A caller-chosen
+adapter is never overridden (its claim is still taken, best effort). Opt-in
+because it changes which adapter unrelated code scans on.
+
 ## The claims layer
 
 Coordination uses the bt-claims file convention under `/run/bt-claims`
@@ -98,14 +111,12 @@ plain claims coordination without adopting any of this package — see
 
 | Name | Purpose |
 | --- | --- |
-| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims")` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`. Idempotent. The pid is appended to `owner` in claim files. |
+| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |
 | `BLEConnectionWithServiceCache` | Adds bleak-retry-connector's service-cache surface (`set_cached_services` no-op, guarded `clear_cache`). |
+| `BLEScanner` | The adapter-bound, hard-claiming scanner (deferred init, routes and claims at `start()`). |
 | `OutOfConnectionSlotsError` | `BleakError` subclass raised when every eligible adapter's cap is fully claimed. |
-
-`BleakScanner` wrapping (an adapter-bound, hard-claiming scanner) is
-deliberately deferred to a later phase.
 
 ## Tests
 

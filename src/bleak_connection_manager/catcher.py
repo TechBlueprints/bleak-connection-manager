@@ -29,6 +29,7 @@ import re
 import subprocess
 
 from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
+from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
 from .claims import CLAIM_DIR, ClaimManager
@@ -395,7 +396,142 @@ class BLEConnectionWithServiceCache(BLEConnection):
         return False
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR):
+def _scan_candidates(config):
+    """Adapters a scan may use: the shared pool, or with no pool the union
+    of pinned adapters in configuration order (a scan serves discovery for
+    every device, so pins only narrow it when they are all there is)."""
+    if config.pool:
+        return list(config.pool)
+    seen = []
+    for adapters in config.pins.values():
+        for adapter in adapters:
+            if adapter not in seen:
+                seen.append(adapter)
+    return seen
+
+
+def _acquire_scan_adapter():
+    """Choose an adapter for a scan and take its hard claim.
+
+    Returns (adapter-or-None, Claim-or-None). Candidates are filtered by
+    kernel presence (falling back to the unfiltered list), ranked by live
+    occupancy - fewest soft claims plus held link slots first, configuration
+    order breaking ties - and the best claimable card wins; claim_hard
+    itself skips cards another live process is scanning on. When every card
+    is claimed, the best-ranked one is scanned anyway, unclaimed:
+    coordination is an optimization, never a gate.
+    """
+    config = _config
+    if config is None:
+        return None, None
+    candidates = _scan_candidates(config)
+    if not candidates:
+        return None, None
+    present = present_adapters()
+    usable = [a for a in candidates if a in present] if present else candidates
+    if not usable:
+        # refusing to scan is worse than scanning an adapter that may be gone
+        usable = candidates
+    snapshot = config.claims.claims()
+
+    def occupancy(adapter):
+        entry = snapshot.get(adapter) or {}
+        return entry.get("soft", 0) + entry.get("links", 0)
+
+    ranked = sorted(usable, key=lambda a: (occupancy(a), usable.index(a)))
+    for adapter in ranked:
+        claim = config.claims.claim_hard(adapter)
+        if claim is not None:
+            return adapter, claim
+    logger.info(f"bt-claims: every adapter is scan-claimed, scanning on {ranked[0]} unclaimed")
+    return ranked[0], None
+
+
+class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
+    """Drop-in BleakScanner that picks its adapter and takes the hard scan
+    claim at start().
+
+    Deferred init, like BLEConnection: bleak wires the adapter into its
+    platform scanner backend inside __init__, so construction stores the
+    arguments and builds nothing, and start() runs the real __init__ with
+    the routed adapter merged in (via the backwards-compat adapter kwarg,
+    which is how this bleak's BlueZ scanner backend receives it). The hard
+    claim (hciN.scan) is held per scan activity: taken at start(), released
+    at stop() or on a failed start - so other processes' placement steers
+    connections and scans away from a card while it is actually scanning,
+    and no longer. An adapter the caller chose explicitly is never
+    overridden, though its claim is still taken, best effort.
+
+    Rebinding over bleak.BleakScanner is opt-in
+    (install_bleak_catcher(..., wrap_scanner=True)).
+    """
+
+    def __init__(self, detection_callback=None, service_uuids=None, scanning_mode="active", **kwargs):
+        self._catcher_args = (detection_callback, service_uuids, scanning_mode)
+        self._catcher_kwargs = kwargs
+        self._catcher_claim = None
+        self._catcher_manager = None
+        self._backend = None
+        self._backend_id = None
+
+    def _release_scan_claim(self):
+        claim, self._catcher_claim = self._catcher_claim, None
+        if claim is None:
+            return
+        if self._catcher_manager is not None:
+            self._catcher_manager.release(claim)
+        else:
+            claim.release()
+
+    async def start(self):
+        detection_callback, service_uuids, scanning_mode = self._catcher_args
+        init_kwargs = dict(self._catcher_kwargs)
+        # a restart on this instance must not leak the previous claim
+        self._release_scan_claim()
+        config = _config
+        self._catcher_manager = config.claims if config is not None else None
+        explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
+        if explicit:
+            if config is not None:
+                self._catcher_claim = config.claims.claim_hard(explicit)
+        else:
+            adapter, claim = _acquire_scan_adapter()
+            self._catcher_claim = claim
+            if adapter:
+                init_kwargs.setdefault("adapter", adapter)
+        _ORIGINAL_BLEAK_SCANNER.__init__(
+            self,
+            detection_callback,
+            service_uuids,
+            scanning_mode,
+            **init_kwargs,
+        )
+        try:
+            return await _ORIGINAL_BLEAK_SCANNER.start(self)
+        except Exception:
+            self._release_scan_claim()
+            raise
+
+    async def stop(self):
+        if self._backend is None:
+            return
+        try:
+            return await _ORIGINAL_BLEAK_SCANNER.stop(self)
+        finally:
+            self._release_scan_claim()
+
+    @property
+    def discovered_devices(self):
+        # queried on never-started placeholders; delegate once real
+        if self._backend is None:
+            return []
+        prop = getattr(_ORIGINAL_BLEAK_SCANNER, "discovered_devices", None)
+        if isinstance(prop, property):
+            return prop.fget(self)
+        return self._backend.discovered_devices
+
+
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -408,7 +544,10 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     starts). adapters are raw config strings, verbatim ("MAC@hciX" pins,
     plain "hciX" pools - see parse_adapter_entries). link_caps maps adapter
     name to its established-link capacity; caps are opt-in, an uncapped
-    adapter is never slot-gated. Idempotent.
+    adapter is never slot-gated. wrap_scanner additionally rebinds
+    bleak.BleakScanner to the adapter-bound, hard-claiming BLEScanner -
+    opt-in because it changes which adapter unrelated code scans on.
+    Idempotent.
     """
     global _config
     import bleak
@@ -434,6 +573,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         claims=ClaimManager(owner=f"{owner}-{os.getpid()}", claim_dir=claim_dir),
     )
     bleak.BleakClient = BLEConnection
+    bleak.BleakScanner = BLEScanner if wrap_scanner else _ORIGINAL_BLEAK_SCANNER
     if _brc_module is not None:
         _brc_module.BleakClient = BLEConnection
         _brc_module.BleakClientWithServiceCache = BLEConnectionWithServiceCache
@@ -446,6 +586,7 @@ def uninstall_bleak_catcher():
     import bleak
 
     bleak.BleakClient = _ORIGINAL_BLEAK_CLIENT
+    bleak.BleakScanner = _ORIGINAL_BLEAK_SCANNER
     if _brc_module is not None:
         _brc_module.BleakClient = _ORIGINAL_BRC_CLIENT
         _brc_module.BleakClientWithServiceCache = _ORIGINAL_BRC_CACHE_CLIENT

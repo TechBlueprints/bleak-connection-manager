@@ -18,6 +18,7 @@ _CATCHER_EXPORTS = (
     "uninstall_bleak_catcher",
     "BLEConnection",
     "BLEConnectionWithServiceCache",
+    "BLEScanner",
     "OutOfConnectionSlotsError",
 )
 
