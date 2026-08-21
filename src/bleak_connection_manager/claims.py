@@ -103,13 +103,22 @@ def _sanitize(part):
 
 
 class Claim:
-    """A claim this process holds. Release it, or let the reaper find it."""
+    """A claim this process holds. Release it, or let the reaper find it.
+
+    validity, when set, is a zero-argument callable checked on every
+    heartbeat: the moment it returns falsy the manager releases the claim
+    instead of touching it. It is the backstop against claims outliving the
+    thing they account for (a connection that dropped without its callback
+    ever firing, an abandoned scanner) - without it the heartbeat would keep
+    such a claim live until process exit.
+    """
 
     def __init__(self, adapter, path, exclusive):
         self.adapter = adapter
         self.path = path
         self.exclusive = exclusive
         self.released = False
+        self.validity = None
 
     def touch(self):
         if self.released:
@@ -373,10 +382,26 @@ class ClaimManager:
                 self._beat = threading.Thread(target=self._heartbeat_loop, name="bt-claims-heartbeat", daemon=True)
                 self._beat.start()
 
+    def _beat_once(self):
+        with self._lock:
+            held = list(self._held)
+        for claim in held:
+            valid = True
+            if claim.validity is not None:
+                try:
+                    valid = bool(claim.validity())
+                except Exception:
+                    # never drop a claim on a broken check: a claim wrongly
+                    # held is bounded by process life, a claim wrongly
+                    # released overcommits the card
+                    valid = True
+            if valid:
+                claim.touch()
+            else:
+                logger.debug(f"bt-claims: releasing {os.path.basename(claim.path)}: what it accounted for is gone")
+                self.release(claim)
+
     def _heartbeat_loop(self):
         while True:
             time.sleep(HEARTBEAT_INTERVAL)
-            with self._lock:
-                held = list(self._held)
-            for claim in held:
-                claim.touch()
+            self._beat_once()

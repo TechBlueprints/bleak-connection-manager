@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import subprocess
+import weakref
 
 from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
 from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
@@ -314,6 +315,23 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
 
         return _disconnected
 
+    def _arm_claim_validity(self):
+        # Backstop for the release paths: once the connection is up, its
+        # claims are validity-checked on every heartbeat, so if the link
+        # dies without the disconnected callback ever firing (a torn-down
+        # D-Bus watch, an abandoned client object) the slot and soft claim
+        # free themselves within a beat instead of living until process
+        # exit. Armed only after a successful connect - a slow in-flight
+        # attempt reads as not-connected and must not be swept.
+        ref = weakref.ref(self)
+
+        def _still_connected():
+            client = ref()
+            return client is not None and client.is_connected
+
+        for claim in self._catcher_claims:
+            claim.validity = _still_connected
+
     async def connect(self, **kwargs):
         if not self._catcher_is_retry_client:
             self._warn_bare_connect()
@@ -322,34 +340,42 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # a reconnect on this instance must not leak the previous claims
         self._release_claims()
         config = _config
+        self._catcher_manager = config.claims if config is not None else None
+        adapter = None
         explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
         if explicit:
-            held = _claim_explicit(explicit, self._catcher_address)
+            self._catcher_claims = _claim_explicit(explicit, self._catcher_address)
         else:
-            adapter, held = _acquire_adapter(self._catcher_address)
+            adapter, self._catcher_claims = _acquire_adapter(self._catcher_address)
+        try:
             if adapter:
                 bluez = dict(init_kwargs.get("bluez") or {})
                 bluez.setdefault("adapter", adapter)
                 init_kwargs["bluez"] = bluez
-        self._catcher_claims = held
-        self._catcher_manager = config.claims if config is not None else None
-        callback = raw_callback
-        if held or raw_callback is not None:
-            callback = self._make_disconnected_callback(raw_callback)
-        _ORIGINAL_BLEAK_CLIENT.__init__(
-            self,
-            address_or_ble_device,
-            disconnected_callback=callback,
-            services=services,
-            **init_kwargs,
-        )
+            callback = raw_callback
+            if self._catcher_claims or raw_callback is not None:
+                callback = self._make_disconnected_callback(raw_callback)
+            _ORIGINAL_BLEAK_CLIENT.__init__(
+                self,
+                address_or_ble_device,
+                disconnected_callback=callback,
+                services=services,
+                **init_kwargs,
+            )
+        except BaseException:
+            # claims must not outlive a client that never got a backend;
+            # not a radio failure, so the walk index stays put
+            self._release_claims()
+            raise
         try:
-            return await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
+            result = await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
         except Exception:
             # a failed attempt: free the claims and walk to the next adapter
             self._release_claims()
             _rotation.connect_failed(self._catcher_address)
             raise
+        self._arm_claim_validity()
+        return result
 
     @property
     def is_connected(self):
@@ -483,6 +509,16 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         else:
             claim.release()
 
+    def _arm_claim_validity(self):
+        # an abandoned running scanner can never be stopped by its owner:
+        # when the wrapper is collected, the scan claim frees itself on the
+        # next heartbeat rather than marking the card scanning forever
+        claim = self._catcher_claim
+        if claim is None:
+            return
+        ref = weakref.ref(self)
+        claim.validity = lambda: ref() is not None
+
     async def start(self):
         detection_callback, service_uuids, scanning_mode = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
@@ -490,27 +526,34 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._release_scan_claim()
         config = _config
         self._catcher_manager = config.claims if config is not None else None
+        adapter = None
         explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
         if explicit:
             if config is not None:
                 self._catcher_claim = config.claims.claim_hard(explicit)
         else:
-            adapter, claim = _acquire_scan_adapter()
-            self._catcher_claim = claim
+            adapter, self._catcher_claim = _acquire_scan_adapter()
+        try:
             if adapter:
                 init_kwargs.setdefault("adapter", adapter)
-        _ORIGINAL_BLEAK_SCANNER.__init__(
-            self,
-            detection_callback,
-            service_uuids,
-            scanning_mode,
-            **init_kwargs,
-        )
+            _ORIGINAL_BLEAK_SCANNER.__init__(
+                self,
+                detection_callback,
+                service_uuids,
+                scanning_mode,
+                **init_kwargs,
+            )
+        except BaseException:
+            # the claim must not outlive a scanner that never got a backend
+            self._release_scan_claim()
+            raise
         try:
-            return await _ORIGINAL_BLEAK_SCANNER.start(self)
+            result = await _ORIGINAL_BLEAK_SCANNER.start(self)
         except Exception:
             self._release_scan_claim()
             raise
+        self._arm_claim_validity()
+        return result
 
     async def stop(self):
         if self._backend is None:

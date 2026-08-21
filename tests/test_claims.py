@@ -269,6 +269,39 @@ def test_placement_ranking_counts_held_links_like_soft_claims(tmp_path):
         other.release(slot)
 
 
+def test_a_claim_whose_validity_check_fails_is_released_on_the_beat(tmp_path):
+    m = _manager(tmp_path)
+    claim = m.claim_soft("hci1")
+    claim.validity = lambda: False
+    m._beat_once()
+    assert os.listdir(str(tmp_path)) == []
+
+
+def test_a_broken_validity_check_never_drops_the_claim(tmp_path):
+    """A claim wrongly held is bounded by process life; a claim wrongly
+    released overcommits the card. Errors keep the claim."""
+    m = _manager(tmp_path)
+    claim = m.claim_soft("hci1")
+
+    def boom():
+        raise RuntimeError("check failed")
+
+    claim.validity = boom
+    m._beat_once()
+    assert os.path.exists(claim.path)
+    m.release(claim)
+
+
+def test_the_beat_touches_claims_that_are_still_valid(tmp_path):
+    m = _manager(tmp_path)
+    claim = m.claim_soft("hci1")
+    _age(claim.path, 20)
+    claim.validity = lambda: True
+    m._beat_once()
+    assert time.time() - os.stat(claim.path).st_mtime < 5
+    m.release(claim)
+
+
 def test_release_all_releases_everything(tmp_path):
     m = _manager(tmp_path, "svc")
     m.claim_hard("hci1")

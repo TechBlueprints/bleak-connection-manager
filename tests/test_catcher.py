@@ -16,6 +16,7 @@ aged mtime.
 
 import asyncio
 import contextlib
+import gc
 import os
 import sys
 import time
@@ -29,8 +30,10 @@ ADDRESS = "C8:47:8C:00:00:00"
 
 # scripts the rich stubs consume, reset per test
 CONNECT_RESULTS = []
+INIT_RESULTS = []
 RECORDED_INITS = []
 SCANNER_START_RESULTS = []
+SCANNER_INIT_RESULTS = []
 RECORDED_SCANNER_INITS = []
 
 
@@ -54,6 +57,8 @@ class RichBleakClient:
     """Just like bleak 3.x: the backend is wired up inside __init__."""
 
     def __init__(self, address_or_ble_device, disconnected_callback=None, services=None, *, timeout=30, pair=False, bluez=None, backend=None, **kwargs):
+        if INIT_RESULTS:
+            raise INIT_RESULTS.pop(0)
         adapter = (bluez or {}).get("adapter")
         address = getattr(address_or_ble_device, "address", address_or_ble_device)
         RECORDED_INITS.append(
@@ -99,6 +104,8 @@ class RichBleakScanner:
     BlueZ backend receives the adapter via the backwards-compat kwarg."""
 
     def __init__(self, detection_callback=None, service_uuids=None, scanning_mode="active", *, bluez=None, backend=None, **kwargs):
+        if SCANNER_INIT_RESULTS:
+            raise SCANNER_INIT_RESULTS.pop(0)
         adapter = kwargs.get("adapter", (bluez or {}).get("adapter"))
         RECORDED_SCANNER_INITS.append({"adapter": adapter, "extra": sorted(k for k in kwargs if k != "adapter")})
         self._backend = _RichScannerBackend(adapter)
@@ -195,8 +202,10 @@ def env(tmp_path, monkeypatch):
     """Stubs in sys.modules, fresh rotation and warning state, a tmp claim
     directory, no adapters "present" unless a test says otherwise."""
     CONNECT_RESULTS.clear()
+    INIT_RESULTS.clear()
     RECORDED_INITS.clear()
     SCANNER_START_RESULTS.clear()
+    SCANNER_INIT_RESULTS.clear()
     RECORDED_SCANNER_INITS.clear()
     catcher._warned_bare_connect_addresses.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
@@ -720,3 +729,67 @@ def test_an_unconfigured_scanner_is_a_passthrough(env):
     assert RECORDED_SCANNER_INITS[-1]["adapter"] is None
     assert RECORDED_SCANNER_INITS[-1]["extra"] == []
     assert os.listdir(env.dir) == []
+
+
+# -- claim-leak backstops: init failures and silent drops ------------------
+
+
+def test_claims_are_released_when_the_real_client_init_fails(env):
+    """An exception between claim acquisition and backend construction must
+    not strand heartbeat-live claims."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    INIT_RESULTS.append(TypeError("unexpected keyword argument"))
+
+    with pytest.raises(TypeError):
+        asyncio.run(client.connect())
+
+    assert os.listdir(env.dir) == []
+    assert catcher._rotation.index(ADDRESS) == 0  # not a radio failure
+
+
+def test_the_scan_claim_is_released_when_the_real_scanner_init_fails(env):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    SCANNER_INIT_RESULTS.append(TypeError("unexpected keyword argument"))
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(TypeError):
+            await scanner.start()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+
+
+def test_a_silent_drop_frees_claims_on_the_next_heartbeat(env):
+    """A link that dies without the disconnected callback ever firing must
+    not hold its slot and soft claim until process exit: the heartbeat's
+    validity check releases them within one beat."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert len(os.listdir(env.dir)) == 2
+
+    catcher._config.claims._beat_once()
+    assert len(os.listdir(env.dir)) == 2  # still connected: the beat keeps them
+
+    client._backend.is_connected = False  # dropped; no callback delivered
+    catcher._config.claims._beat_once()
+    assert os.listdir(env.dir) == []
+
+
+def test_an_abandoned_running_scanners_claim_frees_on_the_heartbeat(env):
+    """A started scanner that is garbage collected without stop() must not
+    mark the card as scanning forever."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert "hci5.scan" in os.listdir(env.dir)
+        del scanner
+
+    asyncio.run(scenario())
+    gc.collect()
+    catcher._config.claims._beat_once()
+    assert "hci5.scan" not in os.listdir(env.dir)
