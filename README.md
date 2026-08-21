@@ -69,11 +69,23 @@ score gains its RSSI base with penalties charged in units of the spread
 between the two best paths, exactly as habluetooth scores connection paths.
 
 Configured adapters are filtered against what the kernel currently exposes
-(`/sys/class/bluetooth`, `hciconfig` fallback) and against adapters another
-live process is actively scanning on (a foreign `hciN.scan` claim). Every
-filter falls back to the unfiltered list rather than refusing to attempt —
-coordination is an optimization, never a gate. An adapter the caller chose
-explicitly (`bluez={"adapter": ...}`) is never overridden.
+(`/sys/class/bluetooth`, `hciconfig` fallback), against adapters whose sysfs
+MAC is all-zeros (a dead or unserved controller stays listed in sysfs
+forever), and against adapters another live process is actively scanning on
+(a foreign `hciN.scan` claim). Every filter falls back to the unfiltered
+list rather than refusing to attempt — coordination is an optimization,
+never a gate. An adapter the caller chose explicitly (`bluez={"adapter":
+...}`) is never overridden.
+
+**Resolved BLEDevices route themselves.** bleak's BlueZ backend connects
+via `device.details["path"]` whenever the device carries one — the adapter
+argument is only honored when it has to scan. So adapter *selection* applies
+to plain-address connects; a cache-resolved `BLEDevice` (bleak-retry-
+connector's `get_device`, scanner-discovered devices) already names its
+adapter in its D-Bus path, and the catcher treats that as caller-explicit:
+claims, cap gating, and connection-parameter tuning land on the adapter the
+link will actually use. Explicit connects (both kinds) always write the soft
+claim, so they still count in every process's occupancy score.
 
 ## Link slots
 

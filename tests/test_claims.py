@@ -145,13 +145,14 @@ def test_an_unusable_claim_directory_degrades_to_uncoordinated(tmp_path):
     assert claim is None
 
 
-def test_claim_files_carry_pid_service_and_since(tmp_path):
+def test_claim_files_carry_pid_owner_and_since(tmp_path):
     m = _manager(tmp_path, "svc")
     claim = m.claim_soft("hci1")
     try:
         with open(claim.path) as f:
             pid, service, since = f.read().split()
         assert int(pid) == os.getpid()
+        assert service == "svc"  # the owner, so `ls`-level debugging names the holder
         assert int(since) > 0
     finally:
         m.release(claim)

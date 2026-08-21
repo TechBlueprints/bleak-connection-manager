@@ -216,6 +216,7 @@ def env(tmp_path, monkeypatch):
     catcher._warned_bare_connect_addresses.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
+    monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
     def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False):
@@ -322,7 +323,9 @@ def test_an_adapter_chosen_by_the_caller_is_never_overridden(env):
     asyncio.run(client.connect())
 
     assert [r["adapter"] for r in RECORDED_INITS] == ["hci9"]
-    assert os.listdir(env.dir) == []  # uncapped explicit adapter: no claims at all
+    # visibility even for explicit choices: the connection soft-claims the
+    # card it actually uses, so other processes' occupancy scores see it
+    assert os.listdir(env.dir) == [_soft_name("hci9")]
 
 
 def test_without_configured_adapters_the_wrapper_is_a_passthrough(env):
@@ -810,6 +813,88 @@ def test_an_unconfigured_scanner_scores_over_every_present_adapter(env, monkeypa
 
     asyncio.run(scenario())
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci4"
+
+
+# -- resolved BLEDevices: the device's own adapter is the truth ------------
+
+
+def test_a_resolved_ble_devices_path_adapter_is_treated_as_explicit(env):
+    """bleak's BlueZ backend connects via device.details["path"] and ignores
+    the adapter argument for such devices - so claims, cap gating and tuning
+    must land on the device's own adapter, and selection must not run."""
+    env.install(adapters=("hci5",), link_caps={"hci9": 2})
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] is None  # nothing injected to be ignored
+    assert set(os.listdir(env.dir)) == {"hci9.link.0", _soft_name("hci9")}
+
+    asyncio.run(client.disconnect())
+    assert os.listdir(env.dir) == []
+
+
+def test_a_resolved_ble_device_on_a_full_adapter_raises_the_typed_error(env):
+    env.install(adapters=(), link_caps={"hci9": 1})
+    _foreign_file(env.dir, "hci9.link.0")
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+
+    with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+        asyncio.run(client.connect())
+    assert "hci9 (1/1 links held)" in str(excinfo.value)
+
+
+# -- dead adapters: zero-MAC filtering and scan-failure memory -------------
+
+
+def test_zero_mac_adapters_are_dropped_from_selection(env, monkeypatch):
+    """A dead onboard controller stays listed in /sys/class/bluetooth with
+    an all-zeros address forever; it must not win every tie."""
+    monkeypatch.setattr(catcher.recovery, "adapter_mac", lambda a: catcher.recovery.UNKNOWN_MAC if a == "hci0" else "AA:BB:CC:DD:EE:FF")
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci0", "hci1"})
+    env.install(adapters=(), wrap_scanner=True)
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci1"
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci1"
+
+
+def test_every_adapter_zero_mac_never_gates(env, monkeypatch):
+    monkeypatch.setattr(catcher.recovery, "adapter_mac", lambda a: catcher.recovery.UNKNOWN_MAC)
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"
+
+
+def test_a_failed_scanner_start_steers_the_next_scan_elsewhere(env):
+    """Scan selection has no failure-driven walk, so a dead-but-listed
+    adapter needs start-failure memory or it wins every tie forever."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+
+    async def scenario():
+        SCANNER_START_RESULTS.append(RuntimeError("adapter 'hci5' not found"))
+        first = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(RuntimeError):
+            await first.start()
+        second = sys.modules["bleak"].BleakScanner()
+        await second.start()
+        await second.stop()
+
+    asyncio.run(scenario())
+    assert [r["adapter"] for r in RECORDED_SCANNER_INITS] == ["hci5", "hci6"]
 
 
 # -- scan_to_score: swept RSSI feeding the placement score -----------------
