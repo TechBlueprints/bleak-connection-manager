@@ -110,6 +110,7 @@ class RichBleakScanner:
         RECORDED_SCANNER_INITS.append(
             {
                 "adapter": adapter,
+                "bluez_adapter": (bluez or {}).get("adapter"),
                 "extra": sorted(k for k in kwargs if k != "adapter"),
                 "detection_callback": detection_callback,
             }
@@ -635,7 +636,11 @@ def test_a_scan_binds_an_adapter_and_holds_the_hard_claim_while_scanning(env):
         await scanner.stop()
 
     asyncio.run(scenario())
+    # both spellings with a fresh bluez dict: older bleak backends read the
+    # adapter kwarg, current bleak reads bluez["adapter"] - and passing the
+    # kwarg alone trips current bleak's shared-mutable-default poison
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci5"
+    assert RECORDED_SCANNER_INITS[-1]["bluez_adapter"] == "hci5"
     assert "hci5.scan" not in os.listdir(env.dir)  # held per scan activity
 
 

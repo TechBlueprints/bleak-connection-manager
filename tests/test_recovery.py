@@ -75,3 +75,44 @@ def test_reset_degrades_without_bluetooth_auto_recovery(tmp_path):
     if recovery.HAS_AUTO_RECOVERY:  # environment-dependent guard
         return
     assert asyncio.run(recovery.reset_adapter("hci1")) is False
+
+
+class _FakeCompleted:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+def test_adapter_mac_falls_back_to_hciconfig(monkeypatch):
+    """Some kernels (Venus OS Cerbos) expose no sysfs address attribute at
+    all; hciconfig still reports BD Address - including the all-zeros one
+    that marks a dead card."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        name = argv[1]
+        out = "hci1:\tType: Primary  Bus: USB\n\tBD Address: 00:11:22:33:44:55  ACL MTU: 310:10\n"
+        if name == "hci0":
+            out = "hci0:\tType: Primary  Bus: UART\n\tBD Address: 00:00:00:00:00:00  ACL MTU: 0:0\n"
+        return _FakeCompleted(out)
+
+    monkeypatch.setattr(recovery, "_mac_cache", {})
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
+    assert recovery.adapter_mac("hci0") == recovery.UNKNOWN_MAC  # dead card detected
+
+
+def test_adapter_mac_is_cached_between_selections(monkeypatch):
+    """Selection asks per candidate per connect; without the cache a kernel
+    with no sysfs address would spawn hciconfig in a tight loop."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _FakeCompleted("hci1:\n\tBD Address: 00:11:22:33:44:55\n")
+
+    monkeypatch.setattr(recovery, "_mac_cache", {})
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
+    assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
+    assert len(calls) == 1
