@@ -42,12 +42,22 @@ Entries are raw strings, passed verbatim:
   ordered preference list. A pinned device **never** falls back to the pool.
 - Plain `hciX` entries form the shared pool for unpinned devices.
 
-Selection re-runs on every `connect()` call. The walk is failure-driven: the
-per-address index advances only after a **failed connect attempt** — a
-disconnect is not a failure (a dropped link reconnects on the adapter it was
-using), and the index never resets on success; the modulo wrap brings a
-recovered preferred radio back naturally. Rotation state is per-address and
-process-wide, so fresh-client-per-attempt callers continue the walk.
+With **no adapters configured at all**, every adapter the kernel exposes is
+a candidate (numeric hci order) — the pool config acts as an allowlist, and
+an unconfigured install still spreads load by default.
+
+Selection re-runs on every `connect()` call. **Pinned devices** walk their
+pin list failure-driven: the per-address index advances only after a failed
+connect attempt — a disconnect is not a failure (a dropped link reconnects
+on the adapter it was using), and the index never resets on success; the
+modulo wrap brings a recovered preferred radio back naturally. **Unpinned
+devices** are placed by habluetooth-parity connect scoring: penalties for
+live occupancy (soft claims from *any* process — the cross-process
+generalization of habluetooth's in-progress term), per-adapter failure
+counts for this address (cleared by a success there), and a last-slot
+penalty; capped-full adapters rank last. Ties break by configuration order,
+and all scoring state is process-wide, so fresh-client-per-attempt callers
+continue where they left off.
 
 Configured adapters are filtered against what the kernel currently exposes
 (`/sys/class/bluetooth`, `hciconfig` fallback) and against adapters another
@@ -83,6 +93,25 @@ claimed it scans on the best-ranked one anyway, unclaimed. A caller-chosen
 adapter is never overridden (its claim is still taken, best effort). Opt-in
 because it changes which adapter unrelated code scans on.
 
+A wrapped scanner also carries habluetooth's watchdog: checked every 30s,
+quiet past 90s → restart (which re-runs selection, so a dead card is walked
+away from), quiet past 120s or never-saw-anything → hardware reset via
+`bluetooth-auto-recovery` (the optional `recovery` extra). Empty
+advertisements don't count as signs of life. The cross-process twist: a
+reset is refused while **any other live process holds claims on the card**
+— their links would die — unless forced. `reset_adapter(adapter,
+claims_manager=None, force=False, gone_silent=False)` is exported for
+consumers' own recovery paths.
+
+## Connection parameters
+
+By default (`tune_conn_params=True`) each routed connect pre-seeds the
+kernel with habluetooth's FAST parameters (7.5ms interval, 10s supervision
+timeout) over the BlueZ management socket so they apply to the connection
+being established, then relaxes to MEDIUM (8.75–11.25ms, 8s) once it's up.
+Degrades silently to a no-op wherever the mgmt channel is unavailable
+(non-Linux, Python without `AF_BLUETOOTH`, no NET_ADMIN).
+
 ## The claims layer
 
 Coordination uses the bt-claims file convention under `/run/bt-claims`
@@ -112,7 +141,8 @@ plain claims coordination without adopting any of this package — see
 
 | Name | Purpose |
 | --- | --- |
-| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
+| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
+| `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False)` | Claims-gated hardware reset (needs the `recovery` extra); refuses while other live processes hold claims on the card. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |
 | `BLEConnectionWithServiceCache` | Adds bleak-retry-connector's service-cache surface (`set_cached_services` no-op, guarded `clear_cache`). |
