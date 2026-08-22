@@ -247,6 +247,15 @@ def _responsive_adapters(candidates):
     return live or candidates
 
 
+def _undrained_adapters(candidates, snapshot):
+    """Drop adapters with a live drain claim - some process is emptying the
+    card to reset it, and new work placed there would land in the blast
+    radius (or hold the reset off forever). Never gates: when everything is
+    draining, the unfiltered list is used - a drain steers, never refuses."""
+    clear = [a for a in candidates if not (snapshot.get(a) or {}).get("drain")]
+    return clear or candidates
+
+
 # adapter -> consecutive failed scanner starts, feeding scan placement;
 # a successful start there clears it
 _scan_failures = {}
@@ -259,6 +268,89 @@ def _scan_finished(adapter, started):
         _scan_failures.pop(adapter, None)
     else:
         _scan_failures[adapter] = _scan_failures.get(adapter, 0) + 1
+
+
+# every connected client and started scanner, for the drain watcher; weak
+# so the watcher can never keep a wrapper alive
+_live_clients = weakref.WeakSet()
+_live_scanners = weakref.WeakSet()
+_migration_tasks = set()
+
+
+def _spawn_migration(coro_fn, label):
+    # runs inside the wrapper's own event loop (scheduled with
+    # call_soon_threadsafe from the heartbeat thread)
+    try:
+        task = asyncio.get_running_loop().create_task(coro_fn())
+    except RuntimeError:
+        return
+    _migration_tasks.add(task)
+    task.add_done_callback(_migration_tasks.discard)
+
+
+def _drain_watch():
+    """Honor foreign drain claims: migrate our work off a draining card.
+
+    Runs on the claim heartbeat thread (ClaimManager.on_beat). A connected
+    client on a draining adapter is disconnected - the driver's retry loop
+    above (bleak-retry-connector) reconnects it, selection steers the new
+    attempt elsewhere, and the released claims let the resetter proceed. A
+    running scanner is restarted the same way. "If possible" is literal:
+    a client on its only usable card, an operator-pinned device with every
+    pin draining, or a caller-chosen explicit adapter stays put - its live
+    claims keep vetoing the reset, which is the safe outcome. Each wrapper
+    is kicked at most once per adapter per connect, so a migration that
+    lands back on the draining card (nothing else worked) is not bounced
+    forever.
+    """
+    config = _config
+    if config is None:
+        return
+    snapshot = config.claims.claims()
+    draining = {a for a, entry in snapshot.items() if entry.get("drain")}
+    if not draining:
+        return
+    present = present_adapters()
+    for client in list(_live_clients):
+        adapter = client._catcher_adapter_used
+        if adapter not in draining or client._catcher_settled:
+            continue
+        if client._catcher_drain_kicked == adapter or client._catcher_explicit:
+            continue
+        pins = config.pins.get(_address_key(client._catcher_address))
+        if pins:
+            alternatives = [a for a in pins if a not in draining]
+        else:
+            pool = list(config.pool) or sorted(present, key=_hci_sort_key)
+            alternatives = [a for a in pool if a not in draining]
+        if present:
+            alternatives = [a for a in alternatives if a in present] or alternatives
+        if not alternatives:
+            continue
+        loop = client._catcher_loop
+        if loop is None or loop.is_closed():
+            continue
+        client._catcher_drain_kicked = adapter
+        logger.warning(
+            f"BLE [{client._catcher_address}]: {adapter} is draining, migrating "
+            f"(will reconnect on one of {alternatives})"
+        )
+        loop.call_soon_threadsafe(_spawn_migration, client.disconnect, "migrate")
+    for scanner in list(_live_scanners):
+        adapter = scanner._catcher_adapter
+        if adapter not in draining or scanner._catcher_restarting:
+            continue
+        if scanner._catcher_drain_kicked == adapter or scanner._catcher_explicit:
+            continue
+        others = [a for a in sorted(present, key=_hci_sort_key) if a not in draining]
+        if not others:
+            continue
+        loop = scanner._catcher_loop
+        if loop is None or loop.is_closed():
+            continue
+        scanner._catcher_drain_kicked = adapter
+        logger.warning(f"BLE scan: {adapter} is draining, moving the scanner")
+        loop.call_soon_threadsafe(_spawn_migration, scanner._drain_restart, "rescan")
 
 
 # addresses already warned about bare connect() calls, once per process -
@@ -466,6 +558,7 @@ def _acquire_adapter(address):
     if not eligible:
         logger.info(f"BLE [{address}]: every usable adapter is scan-claimed by another process, using them anyway")
         eligible = usable
+    eligible = _undrained_adapters(eligible, snapshot)
     if pins:
         start = _rotation.index(address) % len(eligible)
         ordered = eligible[start:] + eligible[:start]
@@ -561,6 +654,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_settled = True
         self._catcher_last_evidence = None
         self._catcher_last_rearm = None
+        self._catcher_loop = None
+        self._catcher_explicit = False
+        # the adapter this client was already kicked off during a drain -
+        # at most one forced migration per adapter per connect
+        self._catcher_drain_kicked = None
         self._backend = None
         # bleak's backend_id property reads this, but the real __init__ that
         # would set it only runs at connect(); seed it so placeholders answer
@@ -602,6 +700,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # link really is gone, the validity heartbeat sweeps within a beat.
         def _disconnected(client):
             if generation == self._catcher_generation and not self.is_connected:
+                if any(not c.released for c in self._catcher_claims):
+                    # the release reason, on the record: if the next line is
+                    # followed by traffic-based re-arm, the property lied
+                    stamp = self._catcher_last_evidence
+                    age = "never" if stamp is None else f"{_monotonic() - stamp:.0f}s ago"
+                    logger.info(
+                        f"BLE [{self._catcher_address}]: disconnect event, is_connected False, "
+                        f"releasing claims (last link traffic: {age})"
+                    )
                 self._release_claims()
             if raw_callback is not None:
                 raw_callback(client)
@@ -828,6 +935,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             mgmt.load_medium(adapter_used, self._catcher_address)
         self._catcher_adapter_used = adapter_used
         self._catcher_settled = False
+        self._catcher_explicit = bool(explicit)
+        self._catcher_drain_kicked = None
+        self._catcher_loop = asyncio.get_running_loop()
+        _live_clients.add(self)
         self._arm_claim_validity()
         return result
 
@@ -956,6 +1067,7 @@ def _acquire_scan_adapter():
         usable = candidates
     usable = _responsive_adapters(usable)
     snapshot = config.claims.claims()
+    usable = _undrained_adapters(usable, snapshot)
 
     def rank(adapter):
         # occupancy first, like connect scoring - but scans also carry
@@ -1006,6 +1118,9 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_watchdog = None
         self._catcher_restarting = False
         self._catcher_tasks = set()
+        self._catcher_loop = None
+        self._catcher_explicit = False
+        self._catcher_drain_kicked = None
         self._backend = None
         self._backend_id = ""
 
@@ -1165,12 +1280,30 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 self._backend = None
         _scan_finished(explicit or adapter, True)
         self._catcher_adapter = explicit or adapter
+        self._catcher_explicit = bool(explicit)
+        self._catcher_drain_kicked = None
+        self._catcher_loop = asyncio.get_running_loop()
+        _live_scanners.add(self)
         now = _monotonic()
         self._catcher_start_time = now
         self._catcher_last_detection = now
         self._schedule_watchdog()
         self._arm_claim_validity()
         return result
+
+    async def _drain_restart(self):
+        # the drain watcher's migration: stop and start, nothing more - the
+        # restart re-runs selection, which steers off the draining card
+        if self._catcher_restarting:
+            return
+        self._catcher_restarting = True
+        try:
+            await self.stop()
+            await self.start()
+        except Exception:
+            logger.exception("BLE scan: drain migration failed")
+        finally:
+            self._catcher_restarting = False
 
     async def stop(self):
         self._cancel_watchdog()
@@ -1251,6 +1384,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         tune_conn_params=tune_conn_params,
         validate_connection=validate_connection,
     )
+    _config.claims.on_beat = _drain_watch
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
     bleak.BleakClient = BLEConnection

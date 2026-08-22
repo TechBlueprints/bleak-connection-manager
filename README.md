@@ -116,13 +116,33 @@ because it changes which adapter unrelated code scans on.
 
 A wrapped scanner also carries habluetooth's watchdog: checked every 30s,
 quiet past 90s → restart (which re-runs selection, so a dead card is walked
-away from), quiet past 120s or never-saw-anything → hardware reset via
-`bluetooth-auto-recovery` (the optional `recovery` extra). Empty
-advertisements don't count as signs of life. The cross-process twist: a
-reset is refused while **any other live process holds claims on the card**
-— their links would die — unless forced. `reset_adapter(adapter,
-claims_manager=None, force=False, gone_silent=False)` is exported for
-consumers' own recovery paths.
+away from), quiet past 120s or never-saw-anything → a **drain-coordinated
+hardware reset**. Empty advertisements don't count as signs of life.
+
+A reset kills every link on the card, so it is never sprung on the card's
+other users. The resetter takes the adapter's exclusive `hciN.drain` claim
+(convention 0.3): placement in every participating process steers new work
+elsewhere, and each process's drain watcher — run on its claim heartbeat —
+disconnects its own clients on the card *when they have somewhere else to
+go*, letting their retry loops reconnect on another adapter. A holder that
+cannot move (its only working card, an operator pin, a caller-chosen
+explicit adapter) stays put, and its live claims veto the reset: the
+resetter waits up to `drain_timeout` (default 60s) for the card to empty
+and gives up rather than pulling it out from under a holder. `force` skips
+every gate, for an operator who knows the card is dead.
+
+The reset primitive itself is native and stdlib-only — rfkill unblock,
+`HCIDEVDOWN`/`HCIDEVUP` bounce over a raw `AF_BLUETOOTH` socket, and
+`USBDEVFS_RESET` for a USB card that has gone silent — so no extra install
+is needed. When `bluetooth-auto-recovery` (the optional `recovery` extra)
+is importable it is preferred for its mgmt-socket handling; it is not
+vendored because its rfkill path hard-imports GPLv3 PyRIC. After a
+successful reset, `bluetoothd` is restarted if the reset killed it and
+bleak's cached D-Bus manager state is invalidated so the next connect
+rebuilds from `GetManagedObjects`. `reset_adapter(adapter,
+claims_manager=None, force=False, gone_silent=False,
+drain_timeout=DRAIN_TIMEOUT)` is exported for consumers' own recovery
+paths; `drain_timeout=0` is the old immediate foreign-claims gate.
 
 ## Connection parameters
 
@@ -198,7 +218,9 @@ Coordination uses the bt-claims file convention under `/run/bt-claims`
 (tmpfs): heartbeated `<pid> <service> <since>` files, live = pid alive AND
 mtime fresh, anyone may reap a file failing both. Kinds: `hciN.scan` (hard,
 exclusive), `hciN.use.<owner>[.<qualifier>]` (soft, ranks placement),
-`hciN.link.<k>` (numbered exclusive slots).
+`hciN.link.<k>` (numbered exclusive slots), `hciN.drain` (exclusive,
+convention 0.3: "this card is about to be reset — place elsewhere, and
+move your links off it if you can").
 
 A connection's claims are tied to the truth of its link, not to the
 wrapper object: once connected they are re-checked on every heartbeat and
@@ -232,7 +254,7 @@ plain claims coordination without adopting any of this package — see
 | Name | Purpose |
 | --- | --- |
 | `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
-| `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False)` | Claims-gated hardware reset (needs the `recovery` extra); refuses while other live processes hold claims on the card. |
+| `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT)` | Drain-coordinated hardware reset, stdlib-native (the `recovery` extra is optional and preferred when installed). Takes the `hciN.drain` claim, waits for holders to migrate, refuses if foreign claims remain at the deadline; `drain_timeout=0` is an immediate foreign-claims gate. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |
 | `BLEConnectionWithServiceCache` | Adds bleak-retry-connector's service-cache surface (`set_cached_services` no-op, guarded `clear_cache`). |

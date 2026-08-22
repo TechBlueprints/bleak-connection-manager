@@ -1690,3 +1690,154 @@ def test_an_unvalidated_install_connects_exactly_as_before(env):
     asyncio.run(client.connect())
 
     assert client.is_connected is True
+
+
+# -- drain (convention 0.3) ------------------------------------------------
+
+
+def test_a_live_drain_steers_connects_away(env):
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.drain")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci6"
+
+
+def test_every_adapter_draining_never_gates_a_connect(env):
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.drain")
+    _foreign_file(env.dir, "hci6.drain")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"  # steers, never refuses
+
+
+def test_a_live_drain_steers_scans_away(env):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.drain")
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        adapter = scanner._catcher_adapter
+        await scanner.stop()
+        return adapter
+
+    assert asyncio.run(scenario()) == "hci6"
+
+
+def test_the_drain_watcher_migrates_a_movable_client(env):
+    """The cooperative half of a coordinated reset: a foreign drain appears
+    on the card this client is connected on, another card exists, so the
+    watcher disconnects it - releasing its claims for the resetter - and
+    the driver's retry loop above is what reconnects it elsewhere."""
+    env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 2, "hci6": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        adapter = client._catcher_adapter_used
+        _foreign_file(env.dir, f"{adapter}.drain")
+        catcher._drain_watch()  # what the heartbeat thread runs
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return client, adapter
+
+    client, adapter = asyncio.run(scenario())
+    assert client.is_connected is False
+    assert client._catcher_drain_kicked == adapter
+    remaining = [n for n in os.listdir(env.dir) if not n.endswith(".drain")]
+    assert remaining == []  # claims released for the resetter
+
+
+def test_the_drain_watcher_leaves_a_client_with_nowhere_to_go(env):
+    """"If possible" is literal: on a one-card deployment the client stays,
+    and its live claims keep vetoing the reset."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        _foreign_file(env.dir, "hci5.drain")
+        catcher._drain_watch()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True
+    assert client._catcher_drain_kicked is None
+    assert any(n.startswith("hci5.link") for n in os.listdir(env.dir))
+
+
+def test_the_drain_watcher_respects_an_explicit_adapter(env):
+    env.install(adapters=("hci5", "hci6"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True, adapter="hci5")
+        await client.connect()
+        _foreign_file(env.dir, "hci5.drain")
+        catcher._drain_watch()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True  # the caller chose; we do not move it
+
+
+def test_the_drain_watcher_kicks_once_per_adapter_per_connect(env):
+    """A migration that lands back on the draining card (nothing else
+    worked) must not be bounced forever."""
+    env.install(adapters=("hci5", "hci6"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        adapter = client._catcher_adapter_used
+        _foreign_file(env.dir, f"{adapter}.drain")
+        catcher._drain_watch()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        # simulate the retry loop reconnecting onto the SAME (only working)
+        # card: is_connected again, kicked marker preserved by connect? No -
+        # connect resets it, which is correct: a fresh connect is fresh
+        # consent. Here we re-mark manually to test the guard itself.
+        client._backend.is_connected = True
+        client._catcher_settled = False
+        client._catcher_drain_kicked = adapter
+        catcher._drain_watch()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True  # second watch did not kick again
+
+
+def test_the_drain_watcher_moves_a_running_scanner(env):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        first = scanner._catcher_adapter
+        _foreign_file(env.dir, f"{first}.drain")
+        catcher.present_adapters = lambda: {"hci5", "hci6"}
+        try:
+            catcher._drain_watch()
+            for _ in range(6):
+                await asyncio.sleep(0)
+        finally:
+            catcher.present_adapters = lambda: set()
+        moved = scanner._catcher_adapter
+        await scanner.stop()
+        return first, moved
+
+    first, moved = asyncio.run(scenario())
+    assert first == "hci5"
+    assert moved == "hci6"  # restarted off the draining card
