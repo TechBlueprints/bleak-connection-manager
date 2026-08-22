@@ -42,6 +42,7 @@ class _RichBackend:
         self.adapter = adapter
         self.address = address
         self.is_connected = False
+        self.notify_callbacks = {}
 
     async def connect(self, pair, **kwargs):
         result = CONNECT_RESULTS.pop(0) if CONNECT_RESULTS else True
@@ -51,6 +52,9 @@ class _RichBackend:
 
     async def disconnect(self):
         self.is_connected = False
+
+    async def start_notify(self, char_specifier, callback, **kwargs):
+        self.notify_callbacks[char_specifier] = callback
 
 
 class RichBleakClient:
@@ -82,6 +86,9 @@ class RichBleakClient:
     @property
     def is_connected(self):
         return self._backend.is_connected
+
+    async def start_notify(self, char_specifier, callback, **kwargs):
+        await self._backend.start_notify(char_specifier, callback, **kwargs)
 
 
 class _RichScannerBackend:
@@ -483,8 +490,11 @@ def test_claims_are_released_when_the_link_drops_unexpectedly(env):
     asyncio.run(client.connect())
     assert len(os.listdir(env.dir)) == 2
 
+    # bleak's backend records the drop, then fires the callback (via
+    # functools.partial) - the release path keys on that ordering
+    client._backend.is_connected = False
     raw_callback = RECORDED_INITS[-1]["disconnected_callback"]
-    raw_callback(client)  # bleak fires this (via functools.partial) on a drop
+    raw_callback(client)
 
     assert os.listdir(env.dir) == []
     assert seen == [client]
@@ -1193,6 +1203,176 @@ def test_a_silent_drop_frees_claims_on_the_next_heartbeat(env):
     client._backend.is_connected = False  # dropped; no callback delivered
     catcher._config.claims._beat_once()
     assert os.listdir(env.dir) == []
+
+
+# -- reconnect-path claim survival (field 2026-08-21: /run/bt-claims went
+# -- empty while the LE link stayed up with data flowing) -------------------
+
+
+def test_a_spurious_disconnected_callback_with_the_link_alive_keeps_the_claims(env):
+    """A disconnect event that arrives while the wrapper's own view still
+    says connected is not a drop: releasing on it zeroes the accounting for
+    a link that is still up, and no new connect() ever re-claims. The caller
+    still hears the event - its semantics are bleak's business - but the
+    claims survive, and the heartbeat keeps them alive."""
+    seen = []
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, seen.append, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    callback = RECORDED_INITS[-1]["disconnected_callback"]
+    callback(client)  # backend still reports connected: spurious
+
+    assert len(os.listdir(env.dir)) == 2
+    assert seen == [client]
+    catcher._config.claims._beat_once()
+    assert len(os.listdir(env.dir)) == 2
+
+
+def test_a_stale_callback_from_a_torn_down_backend_cannot_strip_a_reconnect(env):
+    """The field mechanism: bleak-retry-connector retries connect() on one
+    instance, and every generation's disconnected callback closes over the
+    same wrapper. A late disconnect event from the torn-down previous
+    backend must not release the claims a newer connect() acquired - not
+    after it succeeded, and not while its attempt is still in flight."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    stale = RECORDED_INITS[0]["disconnected_callback"]
+
+    client._backend.is_connected = False
+    stale(client)  # the real drop: its own generation, link down - releases
+    assert os.listdir(env.dir) == []
+
+    asyncio.run(client.connect())  # the reconnect re-claims
+    assert len(os.listdir(env.dir)) == 2
+    stale(client)  # late duplicate event; the link is up
+    assert len(os.listdir(env.dir)) == 2
+
+    client._backend.is_connected = False  # a third attempt mid-flight
+    stale(client)  # stale generation: these claims were never its to free
+    assert len(os.listdir(env.dir)) == 2
+
+
+def test_claims_survive_the_wrapper_being_collected_while_the_link_lives(env):
+    """Validity must track the link, not the wrapper object: when the
+    wrapper is dropped while the backend keeps the BlueZ link, the claims
+    stay - and release only once the backend itself says disconnected."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        return client._backend
+
+    backend = asyncio.run(scenario())  # the wrapper goes out of scope
+    # the stub's recorded disconnected callback closes over the wrapper;
+    # drop the harness's own reference so only production references remain
+    RECORDED_INITS.clear()
+    gc.collect()
+
+    catcher._config.claims._beat_once()
+    assert len(os.listdir(env.dir)) == 2  # link truth: still connected
+
+    backend.is_connected = False
+    catcher._config.claims._beat_once()
+    assert os.listdir(env.dir) == []
+
+
+def test_notification_traffic_re_arms_claims_lost_while_the_link_lives(env):
+    """The reconnect-path field bug end to end: a disconnect event fires
+    with the wrapper's view already broken (is_connected False) while the
+    BlueZ link survives - claims are released and nothing re-claims. Data
+    still flowing through the notification path is proof of a live link,
+    so the tap re-acquires the slot and soft claim, and the evidence keeps
+    the heartbeat from sweeping them again."""
+    received = []
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda sender, data: received.append(data))
+        return client
+
+    client = asyncio.run(scenario())
+    tap = client._backend.notify_callbacks["fff4"]
+
+    client._backend.is_connected = False  # bleak's view breaks; link is up
+    RECORDED_INITS[-1]["disconnected_callback"](client)
+    assert os.listdir(env.dir) == []  # the field state: empty claim dir
+
+    tap("fff4", b"\x01")  # a notification arrives: the link is alive
+    assert set(os.listdir(env.dir)) == {"hci5.link.0", _soft_name("hci5")}
+    assert received == [b"\x01"]  # the caller's callback still ran
+
+    catcher._config.claims._beat_once()  # evidence outvotes is_connected
+    assert len(os.listdir(env.dir)) == 2
+
+
+def test_stale_link_evidence_stops_protecting_a_disconnected_client(env, monkeypatch):
+    """Evidence is a grace, not immortality: once the data stops and the
+    wrapper still reads disconnected, the heartbeat releases as before."""
+    received = []
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda sender, data: received.append(data))
+        return client
+
+    client = asyncio.run(scenario())
+    client._backend.notify_callbacks["fff4"]("fff4", b"\x01")
+    client._backend.is_connected = False
+
+    catcher._config.claims._beat_once()
+    assert len(os.listdir(env.dir)) == 2  # fresh evidence holds the claims
+
+    monkeypatch.setattr(catcher, "_monotonic", lambda: time.monotonic() + catcher.LINK_EVIDENCE_SECONDS + 1)
+    catcher._config.claims._beat_once()
+    assert os.listdir(env.dir) == []  # silence + disconnected: swept
+
+
+def test_a_stray_notification_after_disconnect_does_not_re_arm(env):
+    """An intentional disconnect is the end of the accounting: a straggler
+    notification racing the teardown must not resurrect the claims."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda sender, data: None)
+        await client.disconnect()
+        return client
+
+    client = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+
+    client._backend.notify_callbacks["fff4"]("fff4", b"\x01")
+    assert os.listdir(env.dir) == []
+
+
+def test_the_notification_tap_preserves_async_callbacks(env):
+    """bleak decides sync-vs-async handling by inspecting the callback it
+    receives; the tap must mirror the caller's coroutine-ness or async
+    consumer callbacks would silently never run."""
+    received = []
+    env.install(adapters=("hci5",))
+
+    async def consumer(sender, data):
+        received.append(data)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", consumer)
+        tap = client._backend.notify_callbacks["fff4"]
+        assert asyncio.iscoroutinefunction(tap)
+        await tap("fff4", b"\x02")
+
+    asyncio.run(scenario())
+    assert received == [b"\x02"]
 
 
 def test_an_abandoned_running_scanners_claim_frees_on_the_heartbeat(env):
