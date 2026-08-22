@@ -36,6 +36,8 @@ import struct
 import subprocess
 import time
 
+from . import mgmt
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -177,20 +179,19 @@ def _bounce_interface_hciconfig(dev_id):
 
 def _bounce_interface(dev_id):
     """hciconfig down/up: HCIDEVDOWN then HCIDEVUP over a raw AF_BLUETOOTH
-    socket, falling back to the hciconfig subprocess where the platform
-    Python cannot open one. Blocking (caller runs it in an executor).
-    Returns whether the up succeeded - down failing is fine (the interface
-    may already be down, which is why it is being reset)."""
-    af = getattr(socket, "AF_BLUETOOTH", None)
-    if af is None:
+    socket - opened via mgmt.open_bt_socket, whose ctypes path covers the
+    Venus Python built without Bluetooth support - falling back to the
+    hciconfig subprocess when no socket can be had at all. Blocking
+    (caller runs it in an executor). Returns whether the up succeeded -
+    down failing is fine (the interface may already be down, which is why
+    it is being reset)."""
+    try:
+        sock = mgmt.open_bt_socket()
+    except OSError as e:
+        logger.debug(f"bt-recovery: cannot open a bluetooth socket ({repr(e)}), using hciconfig")
         return _bounce_interface_hciconfig(dev_id)
     from fcntl import ioctl
 
-    try:
-        sock = socket.socket(af, socket.SOCK_RAW, BTPROTO_HCI)
-    except OSError as e:
-        logger.debug(f"bt-recovery: cannot open AF_BLUETOOTH socket ({repr(e)}), using hciconfig")
-        return _bounce_interface_hciconfig(dev_id)
     try:
         try:
             ioctl(sock.fileno(), HCIDEVDOWN, dev_id)

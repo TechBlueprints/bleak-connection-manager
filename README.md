@@ -158,20 +158,18 @@ kernel with habluetooth's FAST parameters (7.5ms interval, 10s supervision
 timeout) over the BlueZ management socket so they apply to the connection
 being established, then relaxes to MEDIUM (8.75–11.25ms, 8s) once it's up.
 
-**Venus OS caveat** (field, 2026-08-22, both Cerbos): the platform Python
-is built without bluetooth socket support — no `socket.AF_BLUETOOTH` — so
-the mgmt channel is unavailable and conn-param tuning silently no-ops
-there. That is the package's degradation rule working as intended: where
-a fallback exists it is used (`adapter_mac` falls back to hciconfig, the
-reset's interface bounce falls back to `hciconfig down/up`); where none
-is wired up, the feature just doesn't happen. A fill-in for the tuning
-path is known — btsocket's approach of opening the socket via ctypes
-(`libc.socket(31, SOCK_RAW, BTPROTO_HCI)`, then wrapping the fd with
-`fileno=`) sidesteps the CPython build gate entirely — but it is
-deliberately not implemented yet: landing it would activate conn-param
-tuning on Venus for the first time ever, and that first activation
-deserves its own deploy window, not a ride-along. Until then, tuning is
-inert on Venus and that is expected.
+**Venus OS note** (field, 2026-08-22, both Cerbos): the platform Python
+is built without bluetooth socket support — no `socket.AF_BLUETOOTH`.
+The kernel supports the family fine, so `mgmt.open_bt_socket()` falls
+back to making the socket(2) syscall through libc and wrapping the fd
+(btsocket's technique, MIT — the reason bluetooth-auto-recovery would
+have worked there). The mgmt channel and the reset's ioctl bounce both
+ride this opener; `hciconfig down/up` remains the bounce's last resort,
+`adapter_mac` keeps its hciconfig fallback, and where no fallback is
+wired up a feature just doesn't happen — documented, never silently
+assumed working. Deployment note: the first release carrying this opener
+is also the first on which conn-param tuning actually functions on Venus
+— sequence its rollout deliberately.
 Degrades silently to a no-op wherever the mgmt channel is unavailable
 (non-Linux, Python without `AF_BLUETOOTH`, no NET_ADMIN).
 

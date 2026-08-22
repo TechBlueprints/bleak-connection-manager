@@ -304,12 +304,18 @@ def test_is_bluetoothd_alive_scans_proc_comm(tmp_path, monkeypatch):
     assert recovery.is_bluetoothd_alive() is False
 
 
-def test_bounce_falls_back_to_hciconfig_without_af_bluetooth(monkeypatch):
-    """Venus OS ships a Python built without bluetooth socket support, so
-    the ioctl bounce must degrade to the runbook's hciconfig down/up."""
-    import subprocess as sp
+def _no_bt_socket(monkeypatch):
+    def raise_os():
+        raise OSError(97, "socket(AF_BLUETOOTH) failed")
 
-    monkeypatch.setattr(recovery.socket, "AF_BLUETOOTH", None, raising=False)
+    monkeypatch.setattr(recovery.mgmt, "open_bt_socket", raise_os)
+
+
+def test_bounce_falls_back_to_hciconfig_without_a_bt_socket(monkeypatch):
+    """When neither the socket module nor the ctypes syscall can produce a
+    bluetooth socket, the ioctl bounce degrades to the runbook's hciconfig
+    down/up."""
+    _no_bt_socket(monkeypatch)
     runs = []
 
     def fake_run(argv, **kwargs):
@@ -330,7 +336,7 @@ def test_bounce_falls_back_to_hciconfig_without_af_bluetooth(monkeypatch):
 
 
 def test_hciconfig_bounce_reports_a_failed_up(monkeypatch):
-    monkeypatch.setattr(recovery.socket, "AF_BLUETOOTH", None, raising=False)
+    _no_bt_socket(monkeypatch)
 
     def fake_run(argv, **kwargs):
         class R:

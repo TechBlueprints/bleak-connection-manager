@@ -5,6 +5,8 @@ import os
 import struct
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from bleak_connection_manager import mgmt  # noqa: E402
@@ -60,3 +62,42 @@ def test_the_probe_never_raises_on_this_platform(monkeypatch):
     monkeypatch.setattr(mgmt, "_available", None)
     monkeypatch.setattr(mgmt, "_sock", None)
     assert mgmt.available() in (True, False)  # macOS/CI: typically False
+
+
+def test_open_bt_socket_uses_the_libc_syscall_without_af_bluetooth(monkeypatch):
+    """Venus OS ships a CPython built without Bluetooth support; the kernel
+    supports the family fine, so the opener makes the socket(2) syscall
+    through libc and wraps the fd (btsocket's technique, MIT)."""
+    import socket as socket_module
+
+    monkeypatch.delattr(socket_module, "AF_BLUETOOTH", raising=False)
+    a, b = socket_module.socketpair()
+    b.close()
+    fd = a.detach()
+
+    class FakeLibc:
+        def socket(self, domain, type_, proto):
+            assert (domain, proto) == (mgmt.AF_BLUETOOTH, mgmt.BTPROTO_HCI)
+            return fd
+
+    monkeypatch.setattr(mgmt.ctypes, "CDLL", lambda *a, **k: FakeLibc())
+    sock = mgmt.open_bt_socket()
+    try:
+        assert sock.fileno() == fd
+    finally:
+        sock.close()
+
+
+def test_open_bt_socket_raises_when_the_syscall_fails(monkeypatch):
+    import socket as socket_module
+
+    monkeypatch.delattr(socket_module, "AF_BLUETOOTH", raising=False)
+
+    class FakeLibc:
+        def socket(self, domain, type_, proto):
+            return -1
+
+    monkeypatch.setattr(mgmt.ctypes, "CDLL", lambda *a, **k: FakeLibc())
+    monkeypatch.setattr(mgmt.ctypes, "get_errno", lambda: 97)
+    with pytest.raises(OSError):
+        mgmt.open_bt_socket()
