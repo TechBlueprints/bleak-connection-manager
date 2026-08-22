@@ -2014,3 +2014,82 @@ def test_a_successful_reset_forgets_the_cards_failure_record(env, monkeypatch):
 
     assert catcher._scan_failures == {}
     assert catcher._connect_failures == {}
+
+
+def _ble_device(address, path):
+    """A cache-resolved BLEDevice: its BlueZ path names its adapter, which
+    is what sends a connect down the explicit path."""
+    return types.SimpleNamespace(address=address, details={"path": path})
+
+
+# -- identity boundary: claims() keys by MAC, the catcher works in hciN ----
+#
+# Every lookup below crosses that boundary. A raw .get returns nothing on
+# any host where MACs actually resolve - which is every real deployment and
+# was none of the tests, which is how the whole class of bug survived a
+# green suite (field 2026-08-22, both Cerbos, reported by a consumer).
+
+
+def test_the_explicit_path_honors_mac_keyed_caps(env, monkeypatch):
+    """_claim_explicit is the DOMINANT path - most real connects arrive as
+    cache-resolved BLEDevices carrying a device path - and its cap lookup
+    missed entirely when caps were keyed by MAC, so link gating silently
+    stopped existing and OutOfConnectionSlotsError could never fire."""
+    env.install(adapters=("hci4",), link_caps={"00:1A:7D:DA:71:06": 1})
+    _kernel_adapters(monkeypatch, {"hci4": "00:1A:7D:DA:71:06"})
+    device = _ble_device(ADDRESS, "/org/bluez/hci4/dev_C8_47_8C_00_00_00")
+
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    assert any(n.startswith("001A7DDA7106.link.") for n in os.listdir(env.dir))
+
+
+def test_the_explicit_path_raises_out_of_slots_with_mac_keyed_caps(env, monkeypatch):
+    """The other half: with the cap invisible, the typed error that buys
+    bleak-retry-connector its out-of-slots pacing could never be raised."""
+    env.install(adapters=("hci4",), link_caps={"00:1A:7D:DA:71:06": 1})
+    _kernel_adapters(monkeypatch, {"hci4": "00:1A:7D:DA:71:06"})
+    _foreign_file(env.dir, "001A7DDA7106.link.0")  # the card's only slot, taken
+    device = _ble_device(ADDRESS, "/org/bluez/hci4/dev_C8_47_8C_00_00_00")
+
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+    with pytest.raises(catcher.OutOfConnectionSlotsError):
+        asyncio.run(client.connect())
+
+
+def test_occupancy_scoring_sees_mac_keyed_claims(env, monkeypatch):
+    """Placement spreads load by counting other processes' claims. Against
+    a MAC-keyed snapshot an hciN lookup sees zero occupancy everywhere, so
+    least-used placement silently stops spreading anything."""
+    env.install(adapters=("hci3", "hci4"))
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF", "hci4": "11:22:33:44:55:66"})
+    for k in range(3):
+        _foreign_file(env.dir, f"AABBCCDDEEFF.use.other-svc-{k}")  # hci3 is busy
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci4"  # steered to the idle card
+
+
+def test_a_foreign_scan_claim_steers_away_when_keyed_by_mac(env, monkeypatch):
+    env.install(adapters=("hci3", "hci4"))
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF", "hci4": "11:22:33:44:55:66"})
+    _foreign_file(env.dir, "AABBCCDDEEFF.scan")
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci4"
+
+
+def test_drain_steering_survives_mac_keyed_claims(env, monkeypatch):
+    env.install(adapters=("hci3", "hci4"))
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF", "hci4": "11:22:33:44:55:66"})
+    _foreign_file(env.dir, "AABBCCDDEEFF.drain")
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci4"

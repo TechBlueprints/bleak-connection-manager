@@ -299,6 +299,19 @@ def _note_adapter_identity(entry, hci_name):
         rewrite_adapter_config(config.adapter_config_path, {text: mac})
 
 
+def _entry(snapshot, adapter):
+    """One adapter's row from a claims() snapshot, or an empty row.
+
+    The snapshot is keyed by adapter IDENTITY (the card's MAC) while the
+    catcher works in hciN, because that is what the kernel and bleak want.
+    Every lookup has to cross that boundary, and a raw .get silently
+    returns nothing on any host where MACs actually resolve - which is
+    every real deployment, and none of the unit tests, which is exactly
+    how this survived a green suite.
+    """
+    return snapshot.get(claims.adapter_key(adapter)) or {}
+
+
 def _cap_for(config, adapter):
     """The configured link cap for an adapter, whichever way it was keyed.
 
@@ -334,7 +347,7 @@ def _undrained_adapters(candidates, snapshot):
     card to reset it, and new work placed there would land in the blast
     radius (or hold the reset off forever). Never gates: when everything is
     draining, the unfiltered list is used - a drain steers, never refuses."""
-    clear = [a for a in candidates if not (snapshot.get(a) or {}).get("drain")]
+    clear = [a for a in candidates if not _entry(snapshot, a).get("drain")]
     return clear or candidates
 
 
@@ -614,7 +627,7 @@ def _out_of_slots_error(address, exhausted, config):
     """The typed exhaustion error, with per-adapter occupancy: when this
     fires on a GX device the occupancy detail is the whole diagnosis."""
     snapshot = config.claims.claims()
-    detail = ", ".join(f"{adapter} ({(snapshot.get(adapter) or {}).get('links', cap)}/{cap} links held)" for adapter, cap in exhausted)
+    detail = ", ".join(f"{adapter} ({_entry(snapshot, adapter).get('links', cap)}/{cap} links held)" for adapter, cap in exhausted)
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
@@ -643,7 +656,7 @@ def _score_order(eligible, address_key, snapshot, config, rssi=None):
             unit = max(known[0] - known[1], 1.0)
     scored = []
     for index, adapter in enumerate(eligible):
-        entry = snapshot.get(adapter) or {}
+        entry = _entry(snapshot, adapter)
         cap = _cap_for(config, adapter)
         free = (cap - entry.get("links", 0)) if cap else None
         score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
@@ -701,7 +714,7 @@ def _acquire_adapter(address):
     own_pid = os.getpid()
 
     def foreign_scan(adapter):
-        entry = snapshot.get(adapter)
+        entry = _entry(snapshot, adapter)
         return bool(entry and entry["hard"] and entry["hard_pid"] != own_pid)
 
     eligible = [a for a in usable if not foreign_scan(a)]
@@ -716,7 +729,7 @@ def _acquire_adapter(address):
         rssi = config.sweeper.rssi_for(eligible, address_key) if config.sweeper is not None else None
         ordered = _score_order(eligible, address_key, snapshot, config, rssi)
     if logger.isEnabledFor(logging.DEBUG):
-        occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
+        occupancy = {a: _entry(snapshot, a) for a in ordered}
         logger.debug(
             f"BLE [{address}]: adapter order {ordered} "
             f"({'pinned walk' if pins else 'scored'}, occupancy {occupancy})"
@@ -751,7 +764,7 @@ def _claim_explicit(adapter, address):
     config = _config
     if config is None:
         return []
-    cap = config.link_caps.get(adapter)
+    cap = _cap_for(config, adapter)
     if cap:
         slot = config.claims.claim_slot(adapter, cap)
         if slot is None:
@@ -1225,7 +1238,7 @@ def _acquire_scan_adapter():
         # start-failure memory: scan selection has no failure-driven walk,
         # so without it a dead-but-listed adapter would win every tie
         # forever (a successful start clears the count)
-        entry = snapshot.get(adapter) or {}
+        entry = _entry(snapshot, adapter)
         occupancy = entry.get("soft", 0) + entry.get("links", 0)
         return (occupancy + _scan_failures.get(claims.adapter_key(adapter), 0), usable.index(adapter))
 
