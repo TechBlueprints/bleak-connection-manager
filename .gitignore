@@ -1,4 +1,13 @@
-python3
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 dist/
+build/
+.venv/
+.pytest_cache/
+.eggs/
+*.egg
+.coverage
+htmlcov/
+OPERATIONS.md
+python3
