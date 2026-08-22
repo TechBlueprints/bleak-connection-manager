@@ -314,7 +314,14 @@ system site-packages, handling Venus's read-only rootfs itself
 remounts). The plant is replanted at boot via `/data/rc.local`, since
 firmware updates erase the rootfs — and the replant logs to
 `/data/bcm/autowire-replant.log`, because a silent failure at the
-post-update boot is exactly the failure the replant exists to prevent. From then on, ANY Python process on
+post-update boot is exactly the failure the replant exists to prevent.
+Every successful wire also appends one line to
+`/data/bcm/autowire-events.log` — timestamp, pid, full argv, cwd, owner,
+and whether the process brought its own bleak or was served the shared
+stack (size-capped at 1 MB) — so the box can answer "what BLE software
+has ever run here" after the processes are gone. Together the three
+files make `/data/bcm` self-describing: what's planted, what's been
+wired, who's been on the radios. From then on, ANY Python process on
 the box that imports bleak gets the catcher installed over it before the
 importer can capture `bleak.BleakClient` — community drivers that have
 never heard of BCM participate in slotting, latching and drains. A

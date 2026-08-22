@@ -111,3 +111,46 @@ def test_an_explicit_install_after_autowire_registration_wins_cleanly(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "BLEConnection True"  # installed once, by the consumer
+
+
+def test_a_wire_leaves_a_durable_event_record(tmp_path):
+    """Clint's observability request: /data/bcm must answer "what BLE
+    software has ever run on this box" after the process is gone - one
+    appended line per wire with pid, full argv, cwd, and whether the
+    process brought its own bleak or was served the shared stack."""
+    import re
+
+    events = os.path.join(REPO, "autowire-events.log")
+    if os.path.exists(events):
+        os.unlink(events)
+    try:
+        result = _run(
+            "import bcm_autowire\n"
+            "import bleak\n"
+            "print(bleak.BleakClient.__name__)\n",
+            tmp_path,
+        )
+        assert result.returncode == 0, result.stderr
+        with open(events) as f:
+            line = f.read()
+        assert re.search(r"pid=\d+", line)
+        assert "owner=autowire-" in line
+        assert "bleak=own" in line  # the stub was the process's own bleak
+        assert 'argv="' in line and "cwd=" in line
+    finally:
+        if os.path.exists(events):
+            os.unlink(events)
+
+
+def test_no_event_record_without_a_wire(tmp_path):
+    events = os.path.join(REPO, "autowire-events.log")
+    if os.path.exists(events):
+        os.unlink(events)
+    result = _run(
+        "import bcm_autowire\n"
+        "import bleak\n",
+        tmp_path,
+        BCM_AUTOWIRE="0",
+    )
+    assert result.returncode == 0, result.stderr
+    assert not os.path.exists(events)  # kill switch: no wire, no record

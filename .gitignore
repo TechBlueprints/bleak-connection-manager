@@ -11,3 +11,5 @@ build/
 htmlcov/
 OPERATIONS.md
 python3
+autowire-events.log
+autowire-replant.log
