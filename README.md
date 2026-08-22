@@ -135,8 +135,15 @@ The reset primitive itself is native and stdlib-only — rfkill unblock,
 `HCIDEVDOWN`/`HCIDEVUP` bounce over a raw `AF_BLUETOOTH` socket, and
 `USBDEVFS_RESET` for a USB card that has gone silent — so no extra install
 is needed. When `bluetooth-auto-recovery` (the optional `recovery` extra)
-is importable it is preferred for its mgmt-socket handling; it is not
-vendored because its rfkill path hard-imports GPLv3 PyRIC. After a
+is importable it is preferred, for its mgmt-socket powered handling and
+its post-USB-reset re-find of an adapter that renumbered. **It can never
+be present on a Cerbo**: Venus OS has no usable pip and the package is
+not vendorable (its rfkill path hard-imports GPLv3 PyRIC), so on Venus
+the native sequence is always the one that runs — the preference only
+changes behavior in environments that already ship the library (a Home
+Assistant host, a dev box). One quirk to know there: on a non-USB adapter
+with `gone_silent` the library reports failure even after a successful
+power cycle; the native path judges by whether the card answers instead. After a
 successful reset, `bluetoothd` is restarted if the reset killed it and
 bleak's cached D-Bus manager state is invalidated so the next connect
 rebuilds from `GetManagedObjects`. `reset_adapter(adapter,
@@ -154,12 +161,17 @@ being established, then relaxes to MEDIUM (8.75–11.25ms, 8s) once it's up.
 **Venus OS caveat** (field, 2026-08-22, both Cerbos): the platform Python
 is built without bluetooth socket support — no `socket.AF_BLUETOOTH` — so
 the mgmt channel is unavailable and conn-param tuning silently no-ops
-there, by design degradation. Every other AF_BLUETOOTH user in this
-package carries a subprocess fallback (`adapter_mac` → hciconfig, the
-reset's interface bounce → `hciconfig down/up`); the tuning path has none
-because there is no subprocess equivalent for `Load Connection
-Parameters`. If tuning ever matters on Venus it needs a btmgmt-binary
-fallback — until then, assume it is inert on the flagship platform.
+there. That is the package's degradation rule working as intended: where
+a fallback exists it is used (`adapter_mac` falls back to hciconfig, the
+reset's interface bounce falls back to `hciconfig down/up`); where none
+is wired up, the feature just doesn't happen. A fill-in for the tuning
+path is known — btsocket's approach of opening the socket via ctypes
+(`libc.socket(31, SOCK_RAW, BTPROTO_HCI)`, then wrapping the fd with
+`fileno=`) sidesteps the CPython build gate entirely — but it is
+deliberately not implemented yet: landing it would activate conn-param
+tuning on Venus for the first time ever, and that first activation
+deserves its own deploy window, not a ride-along. Until then, tuning is
+inert on Venus and that is expected.
 Degrades silently to a no-op wherever the mgmt channel is unavailable
 (non-Linux, Python without `AF_BLUETOOTH`, no NET_ADMIN).
 

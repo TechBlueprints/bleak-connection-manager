@@ -17,7 +17,9 @@ AF_BLUETOOTH socket, and - for a card that has gone silent - USBDEVFS_RESET
 on the adapter's USB device node. When the optional bluetooth-auto-recovery
 package (the "recovery" extra) is importable it is preferred, for its
 mgmt-socket powered handling and post-reset adapter re-find; it is NOT
-vendorable into ext/ because its rfkill path hard-imports GPLv3 PyRIC.
+vendorable into ext/ (its rfkill path hard-imports GPLv3 PyRIC) and can
+never be present on a Cerbo (Venus has no usable pip), so on Venus the
+native sequence is always the one that runs.
 
 After any successful reset the BlueZ side is repaired too: bluetoothd is
 restarted if the reset killed it (v1's Stuck State 11), and bleak's cached
