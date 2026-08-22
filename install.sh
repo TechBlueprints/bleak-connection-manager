@@ -26,9 +26,41 @@ set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LIBPATH="$ROOT/src:$ROOT/ext:$ROOT/ext/upstream/bleak:$ROOT/ext/upstream/bleak-retry-connector/src"
 
-# submodules (bleak, bleak-retry-connector) - pinned by the checkout
+# submodules (bleak, bleak-retry-connector) - pinned by the checkout.
+# Shallow, sha-targeted, retried: consumer installers run this over RV
+# uplinks (Starlink/LTE - field 2026-08-22: a full bleak history clone
+# died twice mid-transfer), so fetch exactly the pinned commit at depth 1
+# and keep the window small. Handles every partial state a killed run can
+# leave, including a created-but-unborn submodule (no HEAD yet).
+_submodule_at_pin() {
+    sub="$1"
+    sha="$(git -C "$ROOT" ls-tree HEAD -- "$sub" | awk '{print $3}')"
+    [ -n "$sha" ] || return 1
+    cur="$(git -C "$ROOT/$sub" rev-parse HEAD 2>/dev/null || true)"
+    [ "$cur" = "$sha" ] && return 0
+    # registers config and creates the submodule repo; often lands the pin
+    # outright. Failures are fine - the sha fetch below is the real step.
+    git -C "$ROOT" submodule update --init --depth 1 --quiet -- "$sub" 2>/dev/null || true
+    cur="$(git -C "$ROOT/$sub" rev-parse HEAD 2>/dev/null || true)"
+    [ "$cur" = "$sha" ] && return 0
+    [ -e "$ROOT/$sub/.git" ] || return 1
+    n=0
+    while [ "$n" -lt 3 ]; do
+        if git -C "$ROOT/$sub" fetch --quiet --depth 1 origin "$sha" 2>/dev/null \
+            && git -C "$ROOT/$sub" checkout --quiet --detach "$sha" 2>/dev/null; then
+            return 0
+        fi
+        n=$((n + 1))
+        echo "bcm-install: fetch of $sub@$sha failed (attempt $n/3), retrying" >&2
+        sleep 5
+    done
+    return 1
+}
+
 if [ -d "$ROOT/.git" ]; then
-    git -C "$ROOT" submodule update --init --quiet
+    for sub in ext/upstream/bleak ext/upstream/bleak-retry-connector; do
+        _submodule_at_pin "$sub" || { echo "bcm-install: could not fetch $sub at its pin - flaky link? re-run install.sh" >&2; exit 1; }
+    done
 fi
 [ -f "$ROOT/ext/upstream/bleak/bleak/__init__.py" ] || { echo "bcm-install: bleak submodule missing (git submodule update --init)" >&2; exit 1; }
 

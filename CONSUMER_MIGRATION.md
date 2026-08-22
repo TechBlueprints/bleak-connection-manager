@@ -21,10 +21,17 @@ fi
 "$BCM_DIR/install.sh"
 ```
 
-`install.sh` initializes the pinned submodules (bleak v3.0.2, brc v4.6.0),
-smoke-imports the whole stack, and writes the interpreter shim
-`/data/bcm/python3`. If the smoke import fails it does NOT update the shim and
-prints the rollback command — surface that as an installer failure.
+`install.sh` fetches the pinned submodules (bleak v3.0.2, brc v4.6.0)
+shallowly and by exact sha, with retries — sized for RV uplinks
+(Starlink/LTE), ~2 MB instead of full clone history — then smoke-imports
+the whole stack and writes the interpreter shim `/data/bcm/python3`. If
+the smoke import fails it does NOT update the shim and prints the
+rollback command — surface that as an installer failure. Mind the shell:
+piping install.sh through `tail`/`tee` eats its exit code unless you
+`set -o pipefail` (BusyBox ash supports it) or check `$PIPESTATUS`; when
+in doubt, run it unpiped and capture `$?` directly. A run killed by the
+link is safe to re-run — the installer is idempotent and resumes from
+whatever partial state the death left.
 
 Do NOT pass `--autowire`. That is a separate, fleet-level decision Clint makes
 once the shared checkout has soaked.
