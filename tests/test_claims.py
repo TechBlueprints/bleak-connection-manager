@@ -514,3 +514,52 @@ def test_an_exclusive_claim_does_not_double_book_a_legacy_holder(tmp_path, monke
     assert m.drain_active("hci3") is False
     _foreign_file(tmp_path, "hci3.drain", pid=1)
     assert m.drain_active("hci3") is True  # legacy drain seen too
+
+
+def test_two_cards_sharing_one_address_are_not_merged(tmp_path, monkeypatch, caplog):
+    """Counterfeit CSR dongles ship batches with one hardcoded address, and
+    this deployment runs CSR-based cards. Keying claims by a shared address
+    would merge two physical radios into one accounting identity - slots
+    double-booked, occupancy halved, a drain on one draining the other."""
+    import logging as _logging
+
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "_duplicate_macs", set())
+    monkeypatch.setattr(claims, "_warned_duplicate_macs", set())
+    monkeypatch.setattr(
+        claims,
+        "_read_hciconfig_table",
+        lambda: {"hci1": "00:1A:7D:DA:71:05", "hci2": "00:1A:7D:DA:71:05"},
+    )
+    monkeypatch.setattr(claims, "_read_sysfs_mac", lambda a: None)
+
+    with caplog.at_level(_logging.WARNING):
+        first = claims.adapter_key("hci1")
+        second = claims.adapter_key("hci2")
+
+    assert first != second  # never merged
+    assert (first, second) == ("hci1", "hci2")  # the number is at least unique
+    assert any("more than one adapter reports" in r.message for r in caplog.records)
+
+    m = _manager(tmp_path, "svc")
+    a = m.claim_slot("hci1", 1)
+    b = m.claim_slot("hci2", 1)  # a distinct card: its own slot 0, not a refusal
+    try:
+        assert a is not None and b is not None
+        assert sorted(os.listdir(str(tmp_path))) == ["hci1.link.0", "hci2.link.0"]
+    finally:
+        m.release_all()
+
+
+def test_distinct_addresses_are_unaffected_by_the_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "_duplicate_macs", set())
+    monkeypatch.setattr(
+        claims,
+        "_read_hciconfig_table",
+        lambda: {"hci1": "00:1A:7D:DA:71:05", "hci2": "00:1A:7D:DA:71:06"},
+    )
+    monkeypatch.setattr(claims, "_read_sysfs_mac", lambda a: None)
+
+    assert claims.adapter_key("hci1") == "001A7DDA7105"
+    assert claims.adapter_key("hci2") == "001A7DDA7106"

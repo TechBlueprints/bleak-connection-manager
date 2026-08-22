@@ -180,6 +180,16 @@ _MAC_CACHE_TTL = 30.0
 _mac_cache = {}
 _mac_cache_lock = threading.Lock()
 
+# MACs seen on more than one card at once. Counterfeit CSR8510 dongles are
+# notorious for shipping a whole batch with one hardcoded address, and this
+# deployment runs CSR-based cards (0a12:0001) - if two of them ever report
+# the same address, keying claims by it would silently MERGE two physical
+# radios into one accounting identity: slots double-booked, occupancy
+# halved, a drain on one card draining the other. Cheap to detect while
+# reading the table, so it is never keyed on.
+_duplicate_macs = set()
+_warned_duplicate_macs = set()
+
 
 def _read_sysfs_mac(adapter):
     """The adapter's MAC from sysfs, or None if the attribute is absent.
@@ -224,6 +234,17 @@ def _read_hciconfig_table():
     return table
 
 
+def _note_duplicate_macs(table):
+    """Record any address claimed by more than one present adapter."""
+    seen = {}
+    for name, mac in table.items():
+        if mac == UNKNOWN_MAC:
+            continue
+        if mac in seen:
+            _duplicate_macs.add(mac)
+        seen[mac] = name
+
+
 def _read_adapter_mac(adapter):
     """One adapter's MAC. Fills the cache for every OTHER adapter it sees
     on the way, since the hciconfig read costs the same either way."""
@@ -232,6 +253,9 @@ def _read_adapter_mac(adapter):
         return mac
     table = _read_hciconfig_table()
     if table:
+        # checked where the table is CONSUMED, not inside the reader: any
+        # path that obtains a table must get the duplicate guard with it
+        _note_duplicate_macs(table)
         now = time.monotonic()
         with _mac_cache_lock:
             for name, found in table.items():
@@ -322,11 +346,34 @@ def adapter_key(adapter):
     """
     key = mac_key(adapter)
     if key is not None:
+        if _formatted(key) in _duplicate_macs:
+            _warn_duplicate(key)
         return key
-    mac = adapter_mac(str(adapter).strip())
+    name = str(adapter).strip()
+    mac = adapter_mac(name)
     if mac != UNKNOWN_MAC:
+        if mac in _duplicate_macs:
+            # two cards answering to one address: the number is wrong as an
+            # identity but it is at least unique, which beats merging them
+            _warn_duplicate(mac)
+            return _sanitize(name)
         return mac.replace(":", "").upper()
-    return _sanitize(adapter)
+    return _sanitize(name)
+
+
+def _formatted(key):
+    return ":".join(key[i : i + 2] for i in range(0, len(key), 2))
+
+
+def _warn_duplicate(mac):
+    if mac in _warned_duplicate_macs:
+        return
+    _warned_duplicate_macs.add(mac)
+    logger.warning(
+        f"bt-claims: more than one adapter reports {mac} - counterfeit dongles often share "
+        "an address. Claims for those cards fall back to hciN names, which are unstable "
+        "across a reset; give them distinct addresses (bdaddr/hcitool) to key on identity."
+    )
 
 
 def legacy_key(adapter):
