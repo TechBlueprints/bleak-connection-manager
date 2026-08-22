@@ -200,6 +200,16 @@ mtime fresh, anyone may reap a file failing both. Kinds: `hciN.scan` (hard,
 exclusive), `hciN.use.<owner>[.<qualifier>]` (soft, ranks placement),
 `hciN.link.<k>` (numbered exclusive slots).
 
+A connection's claims are tied to the truth of its link, not to the
+wrapper object: once connected they are re-checked on every heartbeat and
+released if the link is gone, so a torn-down D-Bus watch or an abandoned
+client frees its slot within a TTL instead of at process exit. Link truth
+is *observed traffic* — a notification arriving, or a `read_gatt_char` /
+`write_gatt_char` returning — which outvotes a `is_connected` that reads
+False on a broken D-Bus view. The same signal re-acquires claims that were
+lost while the link lived, so a polling consumer that never subscribes to
+notifications recovers on its next poll.
+
 `bleak_connection_manager.claims` is deliberately standalone — stdlib only,
 no bleak, vendorable verbatim — so services that only want adapter
 coordination can use it (or copy it) without any of the bleak machinery:

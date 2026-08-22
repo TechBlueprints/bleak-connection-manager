@@ -620,8 +620,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # free themselves within a TTL instead of living until process
         # exit. Armed only after a successful connect - a slow in-flight
         # attempt reads as not-connected and must not be swept. Validity is
-        # link truth, not wrapper liveness: recent notification traffic
-        # counts even when is_connected reads False (a broken D-Bus view),
+        # link truth, not wrapper liveness: recent link traffic - a
+        # notification or a completed GATT read/write - counts even when
+        # is_connected reads False (a broken D-Bus view),
         # and a wrapper collected while its backend still holds the BlueZ
         # link leaves the backend as the link's representative.
         ref = weakref.ref(self)
@@ -669,8 +670,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
 
     def _rearm_claims(self):
         # The recovery for claims lost while the link lived (a spurious
-        # release the guards could not see): data is flowing, so the
-        # connection re-acquires the accounting it held at connect time.
+        # release the guards could not see): traffic is flowing - notified
+        # or polled - so the connection re-acquires the accounting it held
+        # at connect time.
         # The link exists regardless of what the files say - losing the
         # slot race to another process degrades to a soft claim, never to
         # dropping the connection.
@@ -690,7 +692,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         if not claims:
             return
         logger.warning(
-            f"BLE [{self._catcher_address}]: link on {adapter} is alive (notifications flowing) "
+            f"BLE [{self._catcher_address}]: link on {adapter} is alive (traffic flowing) "
             "but its claims were lost, re-claimed"
         )
         self._catcher_claims = claims
@@ -847,9 +849,37 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             callback = self._make_notify_tap(callback)
         return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
 
+    async def _gatt_traffic(self, coro):
+        # A completed GATT exchange is the link's proof of life exactly as a
+        # notification is - and for a polling consumer it is the only proof
+        # there will ever be (field 2026-08-22: a thermostat driver that
+        # only ever calls read_gatt_char lost its claims to a transient
+        # is_connected false negative, and the notification tap could not
+        # re-arm them because it never subscribes to anything). Noted after
+        # the await, never before: an operation that raised proves nothing.
+        result = await coro
+        self._note_link_evidence()
+        return result
+
+    # *args/**kwargs throughout: these signatures drift across the bleak
+    # versions this package rides on (write_gatt_char's response default
+    # went bool -> None), and the wrapper has no reason to know them - it
+    # only needs to see that the call returned.
+    async def read_gatt_char(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.read_gatt_char(self, *args, **kwargs))
+
+    async def write_gatt_char(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.write_gatt_char(self, *args, **kwargs))
+
+    async def read_gatt_descriptor(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.read_gatt_descriptor(self, *args, **kwargs))
+
+    async def write_gatt_descriptor(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.write_gatt_descriptor(self, *args, **kwargs))
+
     async def disconnect(self):
         # an intentional teardown settles the accounting: a straggler
-        # notification racing it must not re-arm the claims
+        # notification or a late read racing it must not re-arm the claims
         self._catcher_settled = True
         if self._backend is None:
             return

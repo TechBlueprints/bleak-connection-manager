@@ -35,6 +35,7 @@ RECORDED_INITS = []
 SCANNER_START_RESULTS = []
 SCANNER_INIT_RESULTS = []
 RECORDED_SCANNER_INITS = []
+GATT_RESULTS = []
 
 
 class _RichBackend:
@@ -55,6 +56,24 @@ class _RichBackend:
 
     async def start_notify(self, char_specifier, callback, **kwargs):
         self.notify_callbacks[char_specifier] = callback
+
+    async def _gatt(self):
+        result = GATT_RESULTS.pop(0) if GATT_RESULTS else b"\x00"
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    async def read_gatt_char(self, char_specifier, **kwargs):
+        return await self._gatt()
+
+    async def write_gatt_char(self, char_specifier, data, response=None):
+        return await self._gatt()
+
+    async def read_gatt_descriptor(self, handle, **kwargs):
+        return await self._gatt()
+
+    async def write_gatt_descriptor(self, handle, data):
+        return await self._gatt()
 
 
 class RichBleakClient:
@@ -89,6 +108,18 @@ class RichBleakClient:
 
     async def start_notify(self, char_specifier, callback, **kwargs):
         await self._backend.start_notify(char_specifier, callback, **kwargs)
+
+    async def read_gatt_char(self, char_specifier, **kwargs):
+        return await self._backend.read_gatt_char(char_specifier, **kwargs)
+
+    async def write_gatt_char(self, char_specifier, data, response=None):
+        return await self._backend.write_gatt_char(char_specifier, data, response)
+
+    async def read_gatt_descriptor(self, handle, **kwargs):
+        return await self._backend.read_gatt_descriptor(handle, **kwargs)
+
+    async def write_gatt_descriptor(self, handle, data):
+        return await self._backend.write_gatt_descriptor(handle, data)
 
 
 class _RichScannerBackend:
@@ -221,6 +252,7 @@ def env(tmp_path, monkeypatch):
     SCANNER_START_RESULTS.clear()
     SCANNER_INIT_RESULTS.clear()
     RECORDED_SCANNER_INITS.clear()
+    GATT_RESULTS.clear()
     catcher._warned_bare_connect_addresses.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
@@ -1374,6 +1406,106 @@ def test_the_notification_tap_preserves_async_callbacks(env):
 
     asyncio.run(scenario())
     assert received == [b"\x02"]
+
+
+def test_a_polled_read_re_arms_claims_lost_while_the_link_lives(env):
+    """The prod field bug (2026-08-22, dbus-easytouchrv): the same lost-claim
+    state as the notification case, but on a consumer that never subscribes
+    to anything - it only polls read_gatt_char. Notification traffic can
+    never re-arm such a link, so the completed read has to."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        client._backend.is_connected = False  # bleak's view breaks; link is up
+        RECORDED_INITS[-1]["disconnected_callback"](client)
+        assert os.listdir(env.dir) == []  # the field state: empty claim dir
+        return client, await client.read_gatt_char("fff1")
+
+    client, value = asyncio.run(scenario())
+    assert set(os.listdir(env.dir)) == {"hci5.link.0", _soft_name("hci5")}
+    assert value == b"\x00"  # the caller still gets its data
+
+    catcher._config.claims._beat_once()  # evidence outvotes is_connected
+    assert len(os.listdir(env.dir)) == 2
+
+
+def test_a_polled_write_is_link_evidence_too(env):
+    """Write-only consumers exist (a relay driver that never reads back);
+    a completed write is the same proof of life as a read."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        client._backend.is_connected = False
+        RECORDED_INITS[-1]["disconnected_callback"](client)
+        assert os.listdir(env.dir) == []
+        await client.write_gatt_char("fff2", b"\x01", True)
+        return client
+
+    asyncio.run(scenario())
+    assert set(os.listdir(env.dir)) == {"hci5.link.0", _soft_name("hci5")}
+
+
+def test_a_failed_gatt_read_is_not_proof_of_life(env):
+    """Evidence is noted after the await, never before: a read that raised
+    says the link is gone, not that it is alive, and must not re-arm."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    GATT_RESULTS.append(RuntimeError("Not connected"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        client._backend.is_connected = False
+        RECORDED_INITS[-1]["disconnected_callback"](client)
+        with pytest.raises(RuntimeError):
+            await client.read_gatt_char("fff1")
+        return client
+
+    client = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+    assert not client._recent_link_evidence()
+
+
+def test_a_polled_read_holds_claims_the_heartbeat_would_otherwise_sweep(env, monkeypatch):
+    """The other half of the fix: for a polling consumer the read is also
+    what keeps the validity check from sweeping live claims in the first
+    place - and once the polling stops, the sweep resumes as before."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.read_gatt_char("fff1")
+        client._backend.is_connected = False  # broken view, link still up
+        return client
+
+    client = asyncio.run(scenario())
+    catcher._config.claims._beat_once()
+    assert len(os.listdir(env.dir)) == 2  # fresh poll holds the claims
+
+    monkeypatch.setattr(catcher, "_monotonic", lambda: time.monotonic() + catcher.LINK_EVIDENCE_SECONDS + 1)
+    catcher._config.claims._beat_once()
+    assert os.listdir(env.dir) == []  # polling stopped and still disconnected
+
+
+def test_a_polled_read_after_disconnect_does_not_re_arm(env):
+    """An intentional teardown settles the accounting for the polled path
+    exactly as it does for notifications: a late read racing disconnect()
+    must not resurrect the claims."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.disconnect()
+        assert os.listdir(env.dir) == []
+        await client.read_gatt_char("fff1")
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
 
 
 def test_an_abandoned_running_scanners_claim_frees_on_the_heartbeat(env):
