@@ -207,15 +207,19 @@ class BleAdapterRotation:
 
 _rotation = BleAdapterRotation()
 
-# (adapter, address) -> consecutive failed connect attempts, feeding the
-# placement score; a success there clears it (habluetooth's model)
+# (adapter-identity, address) -> consecutive failed connect attempts,
+# feeding the placement score; a success there clears it (habluetooth's
+# model). Keyed by the card's identity rather than its number for the same
+# reason claims are: after a renumber, penalties keyed by hciN would follow
+# the NUMBER - a healthy card inheriting a bad one's number would inherit
+# its record, and the bad card would shed it by moving.
 _connect_failures = {}
 
 
 def _connect_finished(adapter, address, connected):
     if not adapter:
         return
-    key = (adapter, _address_key(address))
+    key = (claims.adapter_key(adapter), _address_key(address))
     if connected:
         _connect_failures.pop(key, None)
     else:
@@ -334,18 +338,36 @@ def _undrained_adapters(candidates, snapshot):
     return clear or candidates
 
 
-# adapter -> consecutive failed scanner starts, feeding scan placement;
-# a successful start there clears it
+# adapter identity -> consecutive failed scanner starts, feeding scan
+# placement; a successful start there clears it. Keyed by identity, not
+# number, for the reason above.
 _scan_failures = {}
 
 
 def _scan_finished(adapter, started):
     if not adapter:
         return
+    key = claims.adapter_key(adapter)
     if started:
-        _scan_failures.pop(adapter, None)
+        _scan_failures.pop(key, None)
     else:
-        _scan_failures[adapter] = _scan_failures.get(adapter, 0) + 1
+        _scan_failures[key] = _scan_failures.get(key, 0) + 1
+
+
+def forget_adapter_failures(adapter):
+    """Drop an adapter's accumulated failure record.
+
+    Called after a successful hardware reset: every penalty in there was
+    charged to a card that has since been power-cycled, so it is stale
+    evidence about a radio that no longer exists in that state. Leaving it
+    is not merely unfair, it is self-reinforcing for scans - the scan
+    penalty ranks a card last, and a card ranked last is never selected to
+    have the success that would clear it.
+    """
+    key = claims.adapter_key(adapter)
+    _scan_failures.pop(key, None)
+    for pair in [k for k in _connect_failures if k[0] == key]:
+        _connect_failures.pop(pair, None)
 
 
 # every connected client and started scanner, for the drain watcher; weak
@@ -626,7 +648,7 @@ def _score_order(eligible, address_key, snapshot, config, rssi=None):
         free = (cap - entry.get("links", 0)) if cap else None
         score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
         score -= entry.get("soft", 0) * 1.01 * unit
-        score -= _connect_failures.get((adapter, address_key), 0) * 0.51 * unit
+        score -= _connect_failures.get((claims.adapter_key(adapter), address_key), 0) * 0.51 * unit
         if free is not None:
             if free <= 0:
                 score -= 100000.0
@@ -1205,7 +1227,7 @@ def _acquire_scan_adapter():
         # forever (a successful start clears the count)
         entry = snapshot.get(adapter) or {}
         occupancy = entry.get("soft", 0) + entry.get("links", 0)
-        return (occupancy + _scan_failures.get(adapter, 0), usable.index(adapter))
+        return (occupancy + _scan_failures.get(claims.adapter_key(adapter), 0), usable.index(adapter))
 
     ranked = sorted(usable, key=rank)
     for adapter in ranked:

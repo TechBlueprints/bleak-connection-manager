@@ -1980,3 +1980,37 @@ def test_the_config_rewrite_is_best_effort(tmp_path):
     conf = tmp_path / "c.conf"
     conf.write_text("adapters = hci9\n")
     assert catcher.rewrite_adapter_config(str(conf), {"hci1": "AA:BB:CC:DD:EE:FF"}) is False  # no hit
+
+
+def test_failure_memory_follows_the_card_not_the_number(env, monkeypatch):
+    """The same hazard as claim keys, in the placement score: after a
+    renumber, penalties keyed by hciN would follow the NUMBER - a healthy
+    card inheriting a bad one's number would inherit its record."""
+    env.install(adapters=("hci3",))
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    catcher._scan_finished("hci3", False)
+    catcher._connect_finished("hci3", ADDRESS, False)
+
+    assert catcher._scan_failures.get("AABBCCDDEEFF") == 1
+    # the card comes back as hci7 after a reset; its record follows it
+    _kernel_adapters(monkeypatch, {"hci7": "AA:BB:CC:DD:EE:FF"})
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci7")) == 1
+    # and a DIFFERENT card that lands on the old number inherits nothing
+    _kernel_adapters(monkeypatch, {"hci3": "11:22:33:44:55:66"})
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci3")) is None
+
+
+def test_a_successful_reset_forgets_the_cards_failure_record(env, monkeypatch):
+    """A power-cycled card should not keep paying for what the old one did -
+    and for scans the penalty is self-reinforcing: ranked last, so never
+    selected to earn the success that would clear it."""
+    env.install(adapters=("hci3",))
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    catcher._scan_finished("hci3", False)
+    catcher._connect_finished("hci3", ADDRESS, False)
+    assert catcher._scan_failures and catcher._connect_failures
+
+    catcher.forget_adapter_failures("hci3")
+
+    assert catcher._scan_failures == {}
+    assert catcher._connect_failures == {}
