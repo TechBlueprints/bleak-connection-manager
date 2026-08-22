@@ -353,6 +353,55 @@ def _drain_watch():
         loop.call_soon_threadsafe(_spawn_migration, scanner._drain_restart, "rescan")
 
 
+# addresses already warned about a duplicate claimant, once per process
+_warned_duplicate_claimants = set()
+
+
+def _warn_duplicate_claimant(address):
+    """Flag a second live instance of THIS service claiming the same device.
+
+    The field signature of an orphaned driver process (prod 2026-08-22): a
+    TERM-immune leftover survives the supervisor's restart and fights the
+    new instance for the same battery, a ~8s connect/disconnect flap that
+    reads exactly like radio failure and burned 45 minutes of diagnosis.
+    The claim files already carry everything needed to name it: same owner
+    base, different pid, same MAC qualifier. Warn once per address."""
+    config = _config
+    if config is None:
+        return
+    key = _address_key(address)
+    if key in _warned_duplicate_claimants:
+        return
+    mac = _mac_qualifier(address)
+    if not mac:
+        return
+    # the manager's owner is the sanitized "<service>-<pid>"; the base is
+    # everything before our own pid suffix
+    own = f"-{os.getpid()}"
+    full = config.claims.owner
+    base = full[: -len(own)] if full.endswith(own) else full
+    try:
+        names = os.listdir(config.claims.claim_dir)
+    except OSError:
+        return
+    for name in names:
+        rest = name.partition(".use.")[2]
+        if not rest or not rest.endswith(f".{mac}"):
+            continue
+        holder = rest[: -len(mac) - 1]
+        if not holder.startswith(f"{base}-") or holder == full:
+            continue
+        if not config.claims._is_live(os.path.join(config.claims.claim_dir, name)):
+            continue
+        _warned_duplicate_claimants.add(key)
+        logger.warning(
+            f"BLE [{address}]: another live instance of this service ({holder}) also claims this "
+            "device - an orphaned process fighting this one produces a connect/disconnect flap "
+            "that looks like radio failure. Check for a leftover pid."
+        )
+        return
+
+
 # addresses already warned about bare connect() calls, once per process -
 # a reconnect loop hitting this every few seconds would flood the log
 _warned_bare_connect_addresses = set()
@@ -935,6 +984,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             mgmt.load_medium(adapter_used, self._catcher_address)
         self._catcher_adapter_used = adapter_used
         self._catcher_settled = False
+        _warn_duplicate_claimant(self._catcher_address)
         self._catcher_explicit = bool(explicit)
         self._catcher_drain_kicked = None
         self._catcher_loop = asyncio.get_running_loop()

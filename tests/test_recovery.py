@@ -302,3 +302,45 @@ def test_is_bluetoothd_alive_scans_proc_comm(tmp_path, monkeypatch):
     assert recovery.is_bluetoothd_alive() is True
     (proc / "comm").write_text("python3\n")
     assert recovery.is_bluetoothd_alive() is False
+
+
+def test_bounce_falls_back_to_hciconfig_without_af_bluetooth(monkeypatch):
+    """Venus OS ships a Python built without bluetooth socket support, so
+    the ioctl bounce must degrade to the runbook's hciconfig down/up."""
+    import subprocess as sp
+
+    monkeypatch.setattr(recovery.socket, "AF_BLUETOOTH", None, raising=False)
+    runs = []
+
+    def fake_run(argv, **kwargs):
+        runs.append(argv)
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return R()
+
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    monkeypatch.setattr(recovery.time, "sleep", lambda s: None)
+
+    assert recovery._bounce_interface(1) is True
+    assert runs == [["hciconfig", "hci1", "down"], ["hciconfig", "hci1", "up"]]
+
+
+def test_hciconfig_bounce_reports_a_failed_up(monkeypatch):
+    monkeypatch.setattr(recovery.socket, "AF_BLUETOOTH", None, raising=False)
+
+    def fake_run(argv, **kwargs):
+        class R:
+            returncode = 1 if argv[-1] == "up" else 0
+            stdout = ""
+            stderr = "Operation not possible due to RF-kill"
+
+        return R()
+
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    monkeypatch.setattr(recovery.time, "sleep", lambda s: None)
+
+    assert recovery._bounce_interface(0) is False

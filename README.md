@@ -150,6 +150,16 @@ By default (`tune_conn_params=True`) each routed connect pre-seeds the
 kernel with habluetooth's FAST parameters (7.5ms interval, 10s supervision
 timeout) over the BlueZ management socket so they apply to the connection
 being established, then relaxes to MEDIUM (8.75–11.25ms, 8s) once it's up.
+
+**Venus OS caveat** (field, 2026-08-22, both Cerbos): the platform Python
+is built without bluetooth socket support — no `socket.AF_BLUETOOTH` — so
+the mgmt channel is unavailable and conn-param tuning silently no-ops
+there, by design degradation. Every other AF_BLUETOOTH user in this
+package carries a subprocess fallback (`adapter_mac` → hciconfig, the
+reset's interface bounce → `hciconfig down/up`); the tuning path has none
+because there is no subprocess equivalent for `Load Connection
+Parameters`. If tuning ever matters on Venus it needs a btmgmt-binary
+fallback — until then, assume it is inert on the flagship platform.
 Degrades silently to a no-op wherever the mgmt channel is unavailable
 (non-Linux, Python without `AF_BLUETOOTH`, no NET_ADMIN).
 

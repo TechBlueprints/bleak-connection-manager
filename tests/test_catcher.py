@@ -1841,3 +1841,35 @@ def test_the_drain_watcher_moves_a_running_scanner(env):
     first, moved = asyncio.run(scenario())
     assert first == "hci5"
     assert moved == "hci6"  # restarted off the draining card
+
+
+def test_a_duplicate_claimant_from_another_pid_is_flagged(env, caplog):
+    """The orphaned-process signature (prod 2026-08-22): a second live
+    instance of the same service claiming the same device produced a 45
+    minute connect/disconnect flap that read as radio failure. The claim
+    files name the culprit; the catcher should say so."""
+    import logging as _logging
+
+    env.install(adapters=("hci5",))
+    mac = ADDRESS.replace(":", "")
+    _foreign_file(env.dir, f"hci5.use.{OWNER}-99999.{mac}")  # orphan: same service, other pid
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    with caplog.at_level(_logging.WARNING):
+        asyncio.run(client.connect())
+
+    assert any("another live instance of this service" in r.message for r in caplog.records)
+
+
+def test_an_unrelated_services_claim_is_not_flagged(env, caplog):
+    import logging as _logging
+
+    env.install(adapters=("hci5",))
+    mac = ADDRESS.replace(":", "")
+    _foreign_file(env.dir, f"hci5.use.other-svc-99999.{mac}")  # different service, same device
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    with caplog.at_level(_logging.WARNING):
+        asyncio.run(client.connect())
+
+    assert not any("another live instance" in r.message for r in caplog.records)

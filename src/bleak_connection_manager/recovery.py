@@ -152,18 +152,43 @@ def _rfkill_unblock(adapter):
         return False
 
 
+def _bounce_interface_hciconfig(dev_id):
+    """The subprocess fallback: Venus OS ships a Python built without
+    bluetooth socket support (no socket.AF_BLUETOOTH - field 2026-08-22,
+    both Cerbos), so on the flagship platform the ioctl path cannot even
+    open its socket. hciconfig is present there and is literally the
+    runbook remedy this function automates."""
+    adapter = f"hci{dev_id}"
+    try:
+        subprocess.run(["hciconfig", adapter, "down"], capture_output=True, timeout=10)
+        time.sleep(0.5)
+        result = subprocess.run(["hciconfig", adapter, "up"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            logger.warning(f"bt-recovery: hciconfig {adapter} up failed: {detail or result.returncode}")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"bt-recovery: hciconfig bounce of {adapter} failed: {repr(e)}")
+        return False
+
+
 def _bounce_interface(dev_id):
-    """hciconfig down/up without hciconfig: HCIDEVDOWN then HCIDEVUP over a
-    raw AF_BLUETOOTH socket. Blocking (caller runs it in an executor).
-    Returns whether the up ioctl succeeded - down failing is fine (the
-    interface may already be down, which is why it is being reset)."""
+    """hciconfig down/up: HCIDEVDOWN then HCIDEVUP over a raw AF_BLUETOOTH
+    socket, falling back to the hciconfig subprocess where the platform
+    Python cannot open one. Blocking (caller runs it in an executor).
+    Returns whether the up succeeded - down failing is fine (the interface
+    may already be down, which is why it is being reset)."""
     af = getattr(socket, "AF_BLUETOOTH", None)
     if af is None:
-        logger.warning("bt-recovery: no AF_BLUETOOTH on this platform, cannot bounce")
-        return False
+        return _bounce_interface_hciconfig(dev_id)
     from fcntl import ioctl
 
-    sock = socket.socket(af, socket.SOCK_RAW, BTPROTO_HCI)
+    try:
+        sock = socket.socket(af, socket.SOCK_RAW, BTPROTO_HCI)
+    except OSError as e:
+        logger.debug(f"bt-recovery: cannot open AF_BLUETOOTH socket ({repr(e)}), using hciconfig")
+        return _bounce_interface_hciconfig(dev_id)
     try:
         try:
             ioctl(sock.fileno(), HCIDEVDOWN, dev_id)
