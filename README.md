@@ -133,6 +133,65 @@ being established, then relaxes to MEDIUM (8.75–11.25ms, 8s) once it's up.
 Degrades silently to a no-op wherever the mgmt channel is unavailable
 (non-Linux, Python without `AF_BLUETOOTH`, no NET_ADMIN).
 
+## Post-connect validation (optional)
+
+A connect that returns success is not always a usable link: GATT discovery
+can come back empty, the characteristic the caller needs can be missing, a
+phantom connection can read as connected until the first real read fails.
+v1 answered this with a `validate_connection` callback, and it is here
+unchanged in meaning — `async (client) -> bool`, run once the link is up,
+and **a rejection is a connection failure**: the link is disconnected, its
+claims are released, the adapter takes the failure in the placement score
+and the pin walk, and `ConnectionValidationError` (a `BleakError`) is
+raised so the retry loop above — bleak-retry-connector — attempts again,
+on the next radio. A validator that raises counts as a rejection.
+
+Two ways in, per client and process-wide:
+
+```python
+from bleak_connection_manager import validate_char_exists
+
+# per client: establish_connection passes surplus kwargs to the client class
+client = await establish_connection(
+    BleakClientWithServiceCache, device, name,
+    validate_connection=validate_char_exists("6e400003-b5a3-f393-e0a9-e50e24dcca9e"),
+)
+
+# process-wide fallback: validates connections made deep inside a library
+# the driver never calls directly (a vendored BMS library, say)
+install_bleak_catcher("dbus-blebattery.0", validate_connection=validate_gatt_services)
+```
+
+The client kwarg wins over the installed default; `client.connect(
+validate_connection=...)` wins over both. With neither, nothing is
+validated and connects behave exactly as before.
+
+The built-ins live in `bleak_connection_manager.validators` (stdlib only,
+duck-typed on the client — the module imports without bleak), weakest to
+strongest: `validate_gatt_services` (service table non-empty),
+`validate_char_exists(uuid)`, `validate_read_char(uuid, timeout=5.0)`
+(reads the characteristic, so a phantom link or dead HCI handle fails
+here). Any `async (client) -> bool` of your own works just as well.
+
+**Chips that register GATT late** (Telink-based ones notably) announce
+ServicesResolved with only the Generic Attribute service present and add
+the vendor services seconds later. v1 waited 2s/4s/8s for them, re-reading
+the service table from BlueZ between tries, around *every* validator. The
+catcher itself never retries, so here that wait is explicit — wrap the
+validator in it where you want v1's behaviour:
+
+```python
+from bleak_connection_manager import tolerate_late_gatt, validate_char_exists
+
+validate_connection=tolerate_late_gatt(validate_char_exists(UUID))   # 2s, 4s, 8s
+```
+
+It gives up early if the link drops while waiting, and `refresh_services(
+client)` — the cache-bypassing GATT re-read it uses — is exported for
+validators that want to do their own waiting. Validation runs inside
+`connect()`, so whatever it spends comes out of bleak-retry-connector's
+60-second per-attempt safety timeout — budget slow validators accordingly.
+
 ## The claims layer
 
 Coordination uses the bt-claims file convention under `/run/bt-claims`
@@ -162,13 +221,16 @@ plain claims coordination without adopting any of this package — see
 
 | Name | Purpose |
 | --- | --- |
-| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True, scan_to_score=False)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
+| `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
 | `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False)` | Claims-gated hardware reset (needs the `recovery` extra); refuses while other live processes hold claims on the card. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |
 | `BLEConnectionWithServiceCache` | Adds bleak-retry-connector's service-cache surface (`set_cached_services` no-op, guarded `clear_cache`). |
 | `BLEScanner` | The adapter-bound, hard-claiming scanner (deferred init, routes and claims at `start()`). |
 | `OutOfConnectionSlotsError` | `BleakError` subclass raised when every eligible adapter's cap is fully claimed. |
+| `ConnectionValidationError` | `BleakError` subclass raised when `validate_connection` rejects a link (after it has been torn down). |
+| `validate_gatt_services`, `validate_char_exists(uuid)`, `validate_read_char(uuid, timeout=5.0)` | Built-in post-connect validators (`bleak_connection_manager.validators`). |
+| `tolerate_late_gatt(validator, waits=(2.0, 4.0, 8.0))`, `refresh_services(client)` | Wrap a validator to wait out late-registering GATT services; the cache-bypassing service re-read it uses. |
 
 ## Tests
 

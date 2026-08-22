@@ -227,7 +227,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False):
+    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None):
         catcher.install_bleak_catcher(
             OWNER,
             adapters=adapters,
@@ -235,6 +235,7 @@ def env(tmp_path, monkeypatch):
             claim_dir=str(tmp_path),
             wrap_scanner=wrap_scanner,
             scan_to_score=scan_to_score,
+            validate_connection=validate_connection,
         )
 
     with _stubs_installed():
@@ -1393,3 +1394,167 @@ def test_an_abandoned_running_scanners_claim_frees_on_the_heartbeat(env):
     gc.collect()
     catcher._config.claims._beat_once()
     assert "hci5.scan" not in os.listdir(env.dir)
+
+
+# -- post-connect validation ----------------------------------------------
+
+
+def _validator(result, seen=None):
+    """A validator that records the client it saw and returns/raises `result`."""
+
+    async def _validate(client):
+        if seen is not None:
+            seen.append(client)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    return _validate
+
+
+def test_a_rejected_link_is_torn_down_and_counted_as_a_failed_connect(env):
+    """v1's contract: validation failing IS a connection failure - the link
+    goes down, the claims go with it, and the adapter takes the blame."""
+    env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 2})
+    backends = []
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(False, backends),
+    )
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect())
+
+    assert backends and backends[0] is client  # the validator sees the client
+    assert client.is_connected is False
+    assert os.listdir(env.dir) == []  # slot and soft claim both released
+    assert catcher._rotation.index(ADDRESS) == 1
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect())  # the retry above us walks on
+    assert [r["adapter"] for r in RECORDED_INITS] == ["hci5", "hci6"]
+
+
+def test_the_underlying_link_is_disconnected_before_the_failure_is_raised(env):
+    """A rejected link left up is the phantom the caller was validating
+    against; BlueZ would hold it until something else cleared it."""
+    env.install(adapters=("hci5",))
+    backends = []
+
+    async def _validate(client):
+        backends.append(client._backend)
+        assert client._backend.is_connected is True
+        return False
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True, validate_connection=_validate)
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect())
+
+    assert backends[0].is_connected is False
+    assert client._backend is None
+
+
+def test_a_validator_that_raises_counts_as_a_rejection(env):
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(RuntimeError("read failed")),
+    )
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect())
+
+    assert os.listdir(env.dir) == []
+
+
+def test_a_passing_validator_leaves_the_connection_and_its_claims_alone(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(True),
+    )
+
+    asyncio.run(client.connect())
+
+    assert client.is_connected is True
+    assert set(os.listdir(env.dir)) == {"hci5.link.0", _soft_name("hci5")}
+    assert catcher._rotation.index(ADDRESS) == 0
+
+
+def test_the_validator_kwarg_never_reaches_the_real_client_init(env):
+    """It rides in on establish_connection's kwargs passthrough; bleak's own
+    __init__ would reject it."""
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(True),
+    )
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["extra"] == []
+
+
+def test_a_validator_never_runs_when_the_connect_itself_failed(env):
+    env.install(adapters=("hci5",))
+    seen = []
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(True, seen),
+    )
+    CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.connect())
+
+    assert seen == []
+
+
+def test_the_installed_validator_applies_to_clients_that_carry_none(env):
+    """The point of a process-wide validator: connections made deep inside a
+    library the driver never calls directly still get validated."""
+    env.install(adapters=("hci5",), validate_connection=_validator(False))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect())
+
+
+def test_a_client_validator_overrides_the_installed_one(env):
+    env.install(adapters=("hci5",), validate_connection=_validator(False))
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(True),
+    )
+
+    asyncio.run(client.connect())
+
+    assert client.is_connected is True
+
+
+def test_a_per_call_validator_overrides_both(env):
+    env.install(adapters=("hci5",), validate_connection=_validator(True))
+    client = sys.modules["bleak"].BleakClient(
+        ADDRESS,
+        _is_retry_client=True,
+        validate_connection=_validator(True),
+    )
+
+    with pytest.raises(catcher.ConnectionValidationError):
+        asyncio.run(client.connect(validate_connection=_validator(False)))
+
+
+def test_an_unvalidated_install_connects_exactly_as_before(env):
+    env.install(adapters=("hci5",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert client.is_connected is True
