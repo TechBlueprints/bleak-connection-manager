@@ -36,7 +36,7 @@ import struct
 import subprocess
 import time
 
-from . import mgmt
+from . import claims, mgmt
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,10 @@ except ImportError:
     recover_adapter = None
     HAS_AUTO_RECOVERY = False
 
-UNKNOWN_MAC = "00:00:00:00:00:00"
+# adapter identity lives in claims.py: it is the module that must name a
+# card stably, it is stdlib-only, and one implementation beats two
+UNKNOWN_MAC = claims.UNKNOWN_MAC
+adapter_mac = claims.adapter_mac
 
 # module-level so tests can point them at a fake tree
 BT_SYSFS = "/sys/class/bluetooth"
@@ -73,47 +76,6 @@ BTPROTO_HCI = 1
 # then their disconnect must round-trip a reconnect elsewhere
 DRAIN_TIMEOUT = 60.0
 _DRAIN_POLL = 2.0
-
-# adapter -> (mac, monotonic); short-lived because a reset can take a card
-# from all-zeros to a real address, and long enough that selection (which
-# asks per candidate per connect) does not spawn hciconfig in a tight loop
-# on kernels with no sysfs address attribute
-_MAC_CACHE_TTL = 30.0
-_mac_cache = {}
-
-
-def _read_adapter_mac(adapter):
-    # sysfs first - but some kernels (Venus OS Cerbos among them) expose no
-    # address attribute under /sys/class/bluetooth/hciN/ at all, so fall
-    # back to parsing hciconfig, which does report BD Address there
-    try:
-        with open(f"/sys/class/bluetooth/{adapter}/address") as f:
-            mac = f.read().strip().upper()
-            if mac:
-                return mac
-    except OSError:
-        pass
-    try:
-        result = subprocess.run(["hciconfig", str(adapter)], capture_output=True, text=True, timeout=5)
-        match = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", result.stdout)
-        if match:
-            return match.group(1).upper()
-    except Exception:
-        pass
-    return UNKNOWN_MAC
-
-
-def adapter_mac(adapter):
-    """The adapter's own MAC (sysfs, then hciconfig), or the all-zeros
-    unknown value - which is also what a genuinely failed adapter reports."""
-    now = time.monotonic()
-    cached = _mac_cache.get(adapter)
-    if cached is not None and now - cached[1] < _MAC_CACHE_TTL:
-        return cached[0]
-    mac = _read_adapter_mac(adapter)
-    _mac_cache[adapter] = (mac, now)
-    return mac
-
 
 def _rfkill_unblock(adapter):
     """Clear soft rfkill blocks on bluetooth switches, best effort.
@@ -273,8 +235,8 @@ async def _native_recover(dev_id, adapter, gone_silent):
             return False  # not USB and the bounce failed: nothing worked
     elif not bounced:
         return False
-    _mac_cache.pop(adapter, None)
-    alive = _read_adapter_mac(adapter) != UNKNOWN_MAC
+    claims.invalidate_adapter_mac(adapter)
+    alive = claims.adapter_mac(adapter) != UNKNOWN_MAC
     if not alive:
         logger.warning(f"bt-recovery: {adapter} still reports no MAC after reset")
     return alive
@@ -457,7 +419,7 @@ async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=F
         except Exception as e:
             logger.warning(f"bt-recovery: reset of {adapter} failed: {repr(e)}")
             return False
-        _mac_cache.pop(adapter, None)
+        claims.invalidate_adapter_mac(adapter)
         if ok:
             if not await restart_bluetoothd():
                 logger.error(f"bt-recovery: {adapter} reset but bluetoothd could not be revived")

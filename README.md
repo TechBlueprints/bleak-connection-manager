@@ -36,6 +36,28 @@ per address per process.
 
 ## Adapter configuration
 
+Adapters may be named by `hciN` **or by the adapter's own MAC**, in any
+spelling — colons, dashes, dots, spaces or none, any case — anywhere an
+adapter is configured (`adapters=`, `link_caps=` keys, and the right-hand
+side of a `DEVICE@ADAPTER` pin). The MAC is the stable identity: `hciN`
+numbering changes under a USB reset or a replug, so a MAC entry is resolved
+to whatever number the card answers to at the moment it is used, and a card
+that renumbers keeps its pins, caps and claims.
+
+Pass `adapter_config_path=` to `install_bleak_catcher` and the first
+successful read of an `hciN` entry rewrites that entry in your config file
+to the MAC it proved to be, leaving a comment above the line:
+
+```ini
+# bcm: hci3 was detected as AA:BB:CC:DD:EE:FF and rewritten
+adapters = AA:BB:CC:DD:EE:FF,hci5
+```
+
+The rewrite is line-oriented and format-agnostic (INI, conf, shell-style
+all work), respects token boundaries (`hci1` never matches inside `hci10`),
+skips commented-out lines, and is best effort — a config that cannot be
+written is never worth breaking a connection over.
+
 Entries are raw strings, passed verbatim:
 
 - `MAC@hciX` pins that device to that adapter; repeating the MAC gives an
@@ -236,11 +258,16 @@ validators that want to do their own waiting. Validation runs inside
 
 Coordination uses the bt-claims file convention under `/run/bt-claims`
 (tmpfs): heartbeated `<pid> <service> <since>` files, live = pid alive AND
-mtime fresh, anyone may reap a file failing both. Kinds: `hciN.scan` (hard,
-exclusive), `hciN.use.<owner>[.<qualifier>]` (soft, ranks placement),
-`hciN.link.<k>` (numbered exclusive slots), `hciN.drain` (exclusive,
-convention 0.3: "this card is about to be reset — place elsewhere, and
-move your links off it if you can").
+mtime fresh, anyone may reap a file failing both. Files are keyed by the
+**adapter's own MAC** (colons stripped, uppercase — convention 0.4), because
+hciN numbering changes under a USB reset or a replug without a reboot, and a
+claim keyed by number can come to name a different radio than its writer
+meant. Kinds: `<MAC>.scan` (hard, exclusive), `<MAC>.use.<owner>[.<qualifier>]`
+(soft, ranks placement), `<MAC>.link.<k>` (numbered exclusive slots),
+`<MAC>.drain` (exclusive: "this card is about to be reset — place elsewhere,
+and move your links off it if you can"). Readers canonicalize pre-0.4 `hciN.*`
+files, and exclusive claims check the legacy name before taking one, so a
+fleet mid-upgrade cannot double-book a slot.
 
 A connection's claims are tied to the truth of its link, not to the
 wrapper object: once connected they are re-checked on every heartbeat and

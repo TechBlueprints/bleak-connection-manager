@@ -6,25 +6,44 @@ module implements a file convention any service can follow without linking a
 library or coordinating a rollout - a shell script participates with touch,
 ls and noclobber. Everything below the line is the whole contract.
 
-The convention (0.3)
+The convention (0.4)
 --------------------
 
-Directory: /run/bt-claims (tmpfs: a reboot clears every claim, which also
-makes hciN-keyed names safe - claims are statements about the current
-numbering by live processes, and both die with the boot).
+Directory: /run/bt-claims (tmpfs: a reboot clears every claim - claims are
+statements by live processes, and both die with the boot).
 
-Three claim kinds, visible in the filename:
+Claims are keyed by the ADAPTER'S OWN MAC, colons stripped and uppercased
+(0.4). hciN numbering is not stable - a USB reset renumbers a card, and so
+does replugging it, both without a reboot - so a claim keyed by number can
+come to name a different radio than the one its writer meant. The MAC is
+the card. Every API here still accepts hciN as a convenience spelling and
+resolves it (sysfs, then hciconfig) at use time, as does a MAC written any
+way a human might type it: colons, dashes, dots, spaces, or none, any case.
+An adapter whose MAC cannot be read at all - a dead controller reporting
+all-zeros - degrades to its hciN name, because coordination must never fail
+closed just because a card will not identify itself.
 
-    hci4.scan                   hard claim: one well-known name per adapter.
+Convention 0.3 and earlier keyed files by hciN. Readers here canonicalize
+every filename they find, so a 0.4 process counts a 0.3 process's claims
+correctly, and exclusive claims (scan, link slots, drain) check the legacy
+name before taking one - a mixed-version fleet cannot double-book a slot.
+A 0.3 process cannot see 0.4 names, which is the usual version-skew
+degradation: coordination quality, never correctness of the link itself.
+
+Three claim kinds, visible in the filename (shown with an example MAC key
+AABBCCDDEEFF; hciN in the 0.3 spelling):
+
+    AABBCCDDEEFF.scan           hard claim: one well-known name per adapter.
                                 "I am actively scanning here; use another
                                 card." Created with O_EXCL, so two racing
                                 claimants cannot both win.
-    hci3.use.<owner>[.<qual>]   soft claim: one file per claimant, optionally
+    AABBCCDDEEFF.use.<owner>[.<qual>]
+                                soft claim: one file per claimant, optionally
                                 qualified (this package qualifies by device
                                 MAC, one file per connection). "I am using
                                 this card, but I can share if you cannot
                                 find another." Never blocks, only ranks.
-    hci3.link.<k>               link slot: numbered exclusive claim,
+    AABBCCDDEEFF.link.<k>       link slot: numbered exclusive claim,
                                 k < the deployment-configured per-adapter
                                 capacity. "One of this card's usable
                                 connections is mine." Caps are opt-in
@@ -32,7 +51,7 @@ Three claim kinds, visible in the filename:
                                 undocumented and not discoverable - and
                                 bound established-link capacity, not
                                 connection-attempt pacing.
-    hci2.drain                  drain claim (0.3): one well-known name per
+    AABBCCDDEEFF.drain          drain claim (0.3): one well-known name per
                                 adapter, O_EXCL like the scan claim. "This
                                 card is about to be reset; place new work
                                 elsewhere and, if you can, move your links
@@ -92,10 +111,12 @@ project imports) so other projects can vendor it verbatim.
 
 import logging
 import os
+import re
+import subprocess
 import threading
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +150,152 @@ def _pid_alive(pid):
 def _sanitize(part):
     """Claim-name components must stay within a filename-safe charset."""
     return "".join(c if c.isalnum() or c in "._-" else "-" for c in str(part))
+
+
+# -- adapter identity ------------------------------------------------------
+#
+# A card's hciN number is not stable: a USB reset renumbers it, and so does
+# replugging - both WITHOUT a reboot, which is what the tmpfs-clears-at-boot
+# argument used to rest on. The MAC is the card. Claims are therefore keyed
+# by MAC (colons stripped, uppercase) and hciN is accepted everywhere as a
+# convenience spelling that resolves to one.
+
+BT_SYSFS = "/sys/class/bluetooth"
+UNKNOWN_MAC = "00:00:00:00:00:00"
+_HCI_RE = re.compile(r"^hci\d+$")
+_HEX12_RE = re.compile(r"^[0-9A-F]{12}$")
+# separators seen in the wild for the same address: colons, dashes, dots,
+# spaces, or nothing at all
+_MAC_SEPARATORS = ":-. \t_"
+
+# adapter -> (mac, monotonic). Short-lived because a reset can take a card
+# from all-zeros to a real address, long enough that per-connect lookups do
+# not spawn hciconfig in a tight loop on kernels with no sysfs address.
+_MAC_CACHE_TTL = 30.0
+_mac_cache = {}
+_mac_cache_lock = threading.Lock()
+
+
+def _read_adapter_mac(adapter):
+    # sysfs first - but some kernels (Venus OS Cerbos among them) expose no
+    # address attribute under /sys/class/bluetooth/hciN/ at all, so fall
+    # back to parsing hciconfig, which does report BD Address there
+    try:
+        with open(os.path.join(BT_SYSFS, str(adapter), "address")) as f:
+            mac = f.read().strip().upper()
+            if mac:
+                return mac
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(["hciconfig", str(adapter)], capture_output=True, text=True, timeout=5)
+        match = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", result.stdout)
+        if match:
+            return match.group(1).upper()
+    except Exception:
+        pass
+    return UNKNOWN_MAC
+
+
+def adapter_mac(adapter):
+    """The adapter's own MAC (sysfs, then hciconfig), or the all-zeros
+    unknown value - which is also what a genuinely failed adapter reports."""
+    now = time.monotonic()
+    with _mac_cache_lock:
+        cached = _mac_cache.get(adapter)
+        if cached is not None and now - cached[1] < _MAC_CACHE_TTL:
+            return cached[0]
+    mac = _read_adapter_mac(adapter)
+    with _mac_cache_lock:
+        _mac_cache[adapter] = (mac, now)
+    return mac
+
+
+def invalidate_adapter_mac(adapter=None):
+    """Drop cached MACs. A reset is exactly when a cached MAC goes stale."""
+    with _mac_cache_lock:
+        if adapter is None:
+            _mac_cache.clear()
+        else:
+            _mac_cache.pop(adapter, None)
+
+
+def present_hci_names():
+    """Every hciN the kernel currently exposes, sorted by index."""
+    try:
+        names = [n for n in os.listdir(BT_SYSFS) if _HCI_RE.match(n)]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: int(n[3:]))
+
+
+def hci_for(adapter):
+    """The hciN name an adapter currently answers to, or None.
+
+    hciN in, the same name back (it IS the current numbering). A MAC in -
+    in any spelling - the card carrying it right now, which is the whole
+    point: config and claim files name the card, and the number is looked
+    up at use time.
+    """
+    text = str(adapter).strip()
+    if _HCI_RE.match(text):
+        return text
+    key = mac_key(text)
+    if key is None:
+        return None
+    for name in present_hci_names():
+        mac = adapter_mac(name)
+        if mac != UNKNOWN_MAC and mac.replace(":", "").upper() == key:
+            return name
+    return None
+
+
+def mac_key(value):
+    """Any spelling of a MAC -> the canonical AABBCCDDEEFF key, else None.
+
+    Deliberately permissive, because this value is typed by humans into
+    config files: case is ignored, and the octet separator may be colons,
+    dashes, dots, spaces, underscores, or absent entirely. Anything that
+    is not twelve hex digits after separator-stripping is not a MAC (an
+    hciN name included), and the caller decides what that means.
+    """
+    text = str(value).strip()
+    if not text:
+        return None
+    for sep in _MAC_SEPARATORS:
+        text = text.replace(sep, "")
+    text = text.upper()
+    return text if _HEX12_RE.match(text) else None
+
+
+def adapter_key(adapter):
+    """The claim-file key for an adapter: its MAC, colons stripped.
+
+    Accepts a MAC or an hciN name. An hciN whose MAC cannot be read (a
+    dead controller reporting all-zeros, a kernel with neither sysfs nor
+    hciconfig) degrades to the sanitized hciN name - coordination is an
+    optimization and must never fail closed just because a card will not
+    identify itself.
+    """
+    key = mac_key(adapter)
+    if key is not None:
+        return key
+    mac = adapter_mac(str(adapter).strip())
+    if mac != UNKNOWN_MAC:
+        return mac.replace(":", "").upper()
+    return _sanitize(adapter)
+
+
+def legacy_key(adapter):
+    """The pre-0.4 (hciN) claim-file key for an adapter, or None.
+
+    Read-side compatibility: a process still running convention 0.3 names
+    its claims hciN.*, and this fleet updates one service at a time.
+    """
+    name = hci_for(adapter)
+    if name is None:
+        return None
+    return name if name != adapter_key(adapter) else None
 
 
 class Claim:
@@ -248,9 +415,12 @@ class ClaimManager:
         except OSError:
             return state
         for name in names:
-            adapter, sep, rest = name.partition(".")
+            prefix, sep, rest = name.partition(".")
             if not sep:
                 continue
+            # a pre-0.4 process names its files hciN.*; canonicalize so both
+            # spellings of the same card land in one entry
+            adapter = adapter_key(prefix)
             path = os.path.join(self.claim_dir, name)
             entry = state.setdefault(adapter, {"hard": None, "hard_pid": None, "soft": 0, "soft_owners": [], "links": 0, "drain": False, "drain_pid": None})
             if rest == "scan":
@@ -284,9 +454,13 @@ class ClaimManager:
         except OSError:
             return 0
         own = os.getpid()
-        prefix = f"{adapter}."
+        wanted = {adapter_key(adapter)}
+        legacy = legacy_key(adapter)
+        if legacy:
+            wanted.add(legacy)
         for name in names:
-            if not name.startswith(prefix):
+            prefix, sep, _rest = name.partition(".")
+            if not sep or prefix not in wanted:
                 continue
             path = os.path.join(self.claim_dir, name)
             if not self._is_live(path):
@@ -304,23 +478,44 @@ class ClaimManager:
         """
         with self._lock:
             held = list(self._held)
+        # keyed off the claim's PATH, not the name it was created with: the
+        # path carries the canonical key chosen when the claim was taken,
+        # while the caller's spelling ("hci3") goes stale the moment the
+        # card renumbers - which is the whole reason for this convention
+        wanted = adapter_key(adapter)
         return sum(
             1
             for claim in held
-            if claim.adapter == adapter
+            if os.path.basename(claim.path).partition(".")[0] == wanted
             and not claim.released
             and not claim.path.endswith(".drain")
         )
 
     def drain_active(self, adapter):
         """Whether a live drain claim exists on the adapter (any process)."""
-        path = os.path.join(self.claim_dir, f"{adapter}.drain")
-        return self._is_live(path)
+        path, legacy = self._names(adapter, "drain")
+        return self._is_live(path) or (bool(legacy) and self._is_live(legacy))
 
     # -- claiming ----------------------------------------------------------
 
+    def _names(self, adapter, suffix):
+        """(canonical path, legacy path or None) for one claim name.
+
+        The legacy path is what a pre-0.4 process would have created for
+        the same card. Exclusive claims consult it before taking a name,
+        so a mixed-version fleet cannot double-book one slot.
+        """
+        canonical = os.path.join(self.claim_dir, f"{adapter_key(adapter)}.{suffix}")
+        legacy = legacy_key(adapter)
+        return canonical, (os.path.join(self.claim_dir, f"{legacy}.{suffix}") if legacy else None)
+
+    def _legacy_held(self, adapter, suffix):
+        """Whether a pre-0.4 process holds this exclusive name right now."""
+        _canonical, legacy = self._names(adapter, suffix)
+        return bool(legacy) and self._is_live(legacy)
+
     def _soft_path(self, adapter, qualifier=None):
-        name = f"{adapter}.use.{self.owner}"
+        name = f"{adapter_key(adapter)}.use.{self.owner}"
         if qualifier:
             name += f".{_sanitize(qualifier)}"
         return os.path.join(self.claim_dir, name)
@@ -345,7 +540,9 @@ class ClaimManager:
 
     def claim_hard(self, adapter):
         """Take the adapter's single hard claim, or None if someone holds it."""
-        path = os.path.join(self.claim_dir, f"{adapter}.scan")
+        path, _legacy = self._names(adapter, "scan")
+        if self._legacy_held(adapter, "scan"):
+            return None  # a pre-0.4 process is scanning this card
         try:
             os.makedirs(self.claim_dir, exist_ok=True)
             _write_claim_file(path, exclusive=True, service=self.owner)
@@ -379,7 +576,9 @@ class ClaimManager:
         at a time, and a second would-be resetter backing off on None knows
         the card is already being handled.
         """
-        path = os.path.join(self.claim_dir, f"{adapter}.drain")
+        path, _legacy = self._names(adapter, "drain")
+        if self._legacy_held(adapter, "drain"):
+            return None
         try:
             os.makedirs(self.claim_dir, exist_ok=True)
             _write_claim_file(path, exclusive=True, service=self.owner)
@@ -419,7 +618,9 @@ class ClaimManager:
             logger.debug(f"bt-claims: claim directory unusable, links uncoordinated: {repr(e)}")
             return self._phantom(adapter)
         for k in range(cap):
-            path = os.path.join(self.claim_dir, f"{adapter}.link.{k}")
+            path, legacy = self._names(adapter, f"link.{k}")
+            if legacy and self._is_live(legacy):
+                continue  # a pre-0.4 process holds this slot of this card
             try:
                 _write_claim_file(path, exclusive=True, service=self.owner)
             except FileExistsError:
@@ -451,7 +652,7 @@ class ClaimManager:
         released Claim never heartbeats and unlinks nothing, but is truthy,
         so the caller proceeds uncoordinated instead of treating the outage
         as exhaustion."""
-        claim = Claim(adapter, os.path.join(self.claim_dir, f"{adapter}.link.phantom"), exclusive=True)
+        claim = Claim(adapter, os.path.join(self.claim_dir, f"{adapter_key(adapter)}.link.phantom"), exclusive=True)
         claim.released = True
         return claim
 

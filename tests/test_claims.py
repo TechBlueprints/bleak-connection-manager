@@ -15,6 +15,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from bleak_connection_manager import claims  # noqa: E402
 from bleak_connection_manager.claims import ClaimManager  # noqa: E402
 
 
@@ -405,3 +406,111 @@ def test_the_on_beat_hook_fires_after_the_sweep_and_may_raise(tmp_path):
         assert not claim.released
     finally:
         m.release(claim)
+
+
+# -- adapter identity: MAC-keyed claims (convention 0.4) -------------------
+
+
+def _fake_adapters(monkeypatch, mapping):
+    """Present hciN -> MAC, as the kernel would report it."""
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "present_hci_names", lambda: sorted(mapping))
+    monkeypatch.setattr(claims, "_read_adapter_mac", lambda a: mapping.get(a, claims.UNKNOWN_MAC))
+
+
+def test_mac_parsing_accepts_every_spelling():
+    """Config values are typed by humans: any separator, any case."""
+    for text in (
+        "AA:BB:CC:DD:EE:FF", "aa:bb:cc:dd:ee:ff", "AABBCCDDEEFF", "aabbccddeeff",
+        "AA-BB-CC-DD-EE-FF", "aa.bb.cc.dd.ee.ff", "AA BB CC DD EE FF", " Aa:bB:Cc:dD:eE:fF ",
+    ):
+        assert claims.mac_key(text) == "AABBCCDDEEFF", text
+    for text in ("hci0", "", "not-a-mac", "AABBCCDDEE", "GG:BB:CC:DD:EE:FF"):
+        assert claims.mac_key(text) is None, text
+
+
+def test_claims_are_keyed_by_the_adapters_mac(tmp_path, monkeypatch):
+    """The card, not the number: a claim taken on hci3 is filed under the
+    MAC, so a renumbering cannot make it name a different radio."""
+    _fake_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    m = _manager(tmp_path, "svc")
+    claim = m.claim_soft("hci3", qualifier="C8478C000001")
+    try:
+        assert os.listdir(str(tmp_path)) == ["AABBCCDDEEFF.use.svc.C8478C000001"]
+    finally:
+        m.release(claim)
+
+
+def test_a_renumbered_card_keeps_its_claims(tmp_path, monkeypatch):
+    """The bug this convention change exists for: a USB reset renumbers
+    hci3 to hci7 with no reboot. The claim still names the same card, and
+    a query by EITHER spelling still finds it."""
+    _fake_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    m = _manager(tmp_path, "svc")
+    claim = m.claim_slot("hci3", 2)
+    try:
+        assert os.listdir(str(tmp_path)) == ["AABBCCDDEEFF.link.0"]
+        # the card comes back as hci7 after a reset
+        _fake_adapters(monkeypatch, {"hci7": "AA:BB:CC:DD:EE:FF"})
+        assert m.own_use("hci7") == 1
+        assert m.own_use("AA:BB:CC:DD:EE:FF") == 1
+        assert m.claims()["AABBCCDDEEFF"]["links"] == 1
+    finally:
+        m.release(claim)
+
+
+def test_an_adapter_may_be_named_by_mac_anywhere(tmp_path, monkeypatch):
+    _fake_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    m = _manager(tmp_path, "svc")
+    hard = m.claim_hard("aa-bb-cc-dd-ee-ff")  # a third spelling of the card
+    try:
+        assert hard is not None
+        assert os.listdir(str(tmp_path)) == ["AABBCCDDEEFF.scan"]
+        assert m.claims()["AABBCCDDEEFF"]["hard"] is not None
+    finally:
+        m.release(hard)
+
+
+def test_a_dead_card_degrades_to_its_hci_name(tmp_path, monkeypatch):
+    """All-zeros MAC (a failed controller): coordination must not fail
+    closed just because the card will not identify itself."""
+    _fake_adapters(monkeypatch, {"hci0": claims.UNKNOWN_MAC})
+    m = _manager(tmp_path, "svc")
+    claim = m.claim_soft("hci0")
+    try:
+        assert os.listdir(str(tmp_path)) == ["hci0.use.svc"]
+    finally:
+        m.release(claim)
+
+
+def test_a_pre_0_4_processes_claims_are_still_counted(tmp_path, monkeypatch):
+    """Mixed-version fleet: a 0.3 process files hci3.link.0. A 0.4 process
+    must count it as occupancy on that card, whichever way it asks."""
+    _fake_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    m = _manager(tmp_path, "svc")
+    _foreign_file(tmp_path, "hci3.link.0", pid=1)
+
+    assert m.foreign_use("hci3") == 1
+    assert m.foreign_use("AA:BB:CC:DD:EE:FF") == 1
+    assert m.claims()["AABBCCDDEEFF"]["links"] == 1
+
+
+def test_an_exclusive_claim_does_not_double_book_a_legacy_holder(tmp_path, monkeypatch):
+    """The transition hazard: without a legacy check, a 0.4 process would
+    take AABBCC..link.0 while a 0.3 process holds hci3.link.0 - both
+    believing they own slot 0 of one card."""
+    _fake_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    m = _manager(tmp_path, "svc")
+    _foreign_file(tmp_path, "hci3.link.0", pid=1)
+    _foreign_file(tmp_path, "hci3.scan", pid=1)
+
+    slot = m.claim_slot("hci3", 2)
+    try:
+        assert slot is not None
+        assert os.path.basename(slot.path) == "AABBCCDDEEFF.link.1"  # slot 0 respected
+    finally:
+        m.release(slot)
+    assert m.claim_hard("hci3") is None  # legacy scanner still holds the card
+    assert m.drain_active("hci3") is False
+    _foreign_file(tmp_path, "hci3.drain", pid=1)
+    assert m.drain_active("hci3") is True  # legacy drain seen too

@@ -9,6 +9,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from bleak_connection_manager import recovery  # noqa: E402
+from bleak_connection_manager import claims as claims_mod  # noqa: E402
 from bleak_connection_manager.claims import ClaimManager  # noqa: E402
 
 
@@ -106,8 +107,8 @@ def test_adapter_mac_falls_back_to_hciconfig(monkeypatch):
             out = "hci0:\tType: Primary  Bus: UART\n\tBD Address: 00:00:00:00:00:00  ACL MTU: 0:0\n"
         return _FakeCompleted(out)
 
-    monkeypatch.setattr(recovery, "_mac_cache", {})
-    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    monkeypatch.setattr(claims_mod, "_mac_cache", {})
+    monkeypatch.setattr(claims_mod.subprocess, "run", fake_run)
     assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
     assert recovery.adapter_mac("hci0") == recovery.UNKNOWN_MAC  # dead card detected
 
@@ -121,8 +122,8 @@ def test_adapter_mac_is_cached_between_selections(monkeypatch):
         calls.append(argv)
         return _FakeCompleted("hci1:\n\tBD Address: 00:11:22:33:44:55\n")
 
-    monkeypatch.setattr(recovery, "_mac_cache", {})
-    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    monkeypatch.setattr(claims_mod, "_mac_cache", {})
+    monkeypatch.setattr(claims_mod.subprocess, "run", fake_run)
     assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
     assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
     assert len(calls) == 1
@@ -279,8 +280,8 @@ def test_native_recover_succeeds_on_a_bounced_uart_card(tmp_path, monkeypatch):
     monkeypatch.setattr(recovery, "_rfkill_unblock", lambda adapter: False)
     monkeypatch.setattr(recovery, "_bounce_interface", lambda dev_id: True)
     monkeypatch.setattr(recovery, "_usb_reset", lambda adapter: None)
-    monkeypatch.setattr(recovery, "_read_adapter_mac", lambda adapter: "AA:BB:CC:DD:EE:FF")
-    recovery._mac_cache.clear()
+    monkeypatch.setattr(claims_mod, "_read_adapter_mac", lambda adapter: "AA:BB:CC:DD:EE:FF")
+    claims_mod.invalidate_adapter_mac()
 
     assert asyncio.run(recovery._native_recover(0, "hci0", True)) is True
 
@@ -289,7 +290,7 @@ def test_native_recover_fails_when_nothing_answers(monkeypatch):
     monkeypatch.setattr(recovery, "_rfkill_unblock", lambda adapter: False)
     monkeypatch.setattr(recovery, "_bounce_interface", lambda dev_id: False)
     monkeypatch.setattr(recovery, "_usb_reset", lambda adapter: None)
-    recovery._mac_cache.clear()
+    claims_mod.invalidate_adapter_mac()
 
     assert asyncio.run(recovery._native_recover(0, "hci0", True)) is False
 

@@ -37,6 +37,7 @@ from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
 from . import mgmt, recovery
+from . import claims as claims
 from .claims import CLAIM_DIR, CLAIM_TTL, HEARTBEAT_INTERVAL, ClaimManager
 
 # habluetooth's scanner watchdog thresholds (const.py:96-108), derived
@@ -114,7 +115,15 @@ def parse_adapter_entries(entries):
     without returning it to a pool shared with other devices.
 
     Plain hciX entries form the pool used by every device that is not pinned.
-    Returns (pins, pool), with pins keyed by upper case MAC address and each
+
+    An adapter may be named either by its hciN number or by its OWN MAC, in
+    any spelling (colons, dashes, dots, spaces or none; any case). The MAC
+    is the stable identity - hciN numbering changes under a USB reset or a
+    replug - so a MAC entry is kept verbatim and resolved to whatever hciN
+    the card answers to at the moment it is used. A device MAC pinned to an
+    adapter MAC is written the same way: DEVICE@ADAPTER.
+
+    Returns (pins, pool), with pins keyed by upper case device MAC and each
     value a list of adapters in priority order.
     """
     pins = {}
@@ -234,6 +243,75 @@ def _device_path_adapter(address_or_ble_device):
         return None
     match = re.match(r"/org/bluez/(hci\d+)/", str(details.get("path") or ""))
     return match.group(1) if match else None
+
+
+def _resolve_adapter_entry(entry):
+    """A configured adapter entry -> the hciN it names right now, or None.
+
+    hciN entries pass through; a MAC entry is looked up against the cards
+    the kernel currently exposes. None means "not present at the moment" -
+    a card can be unplugged, or renumbered while we were not looking - and
+    callers treat that the way they already treat an absent adapter.
+    """
+    text = str(entry).strip()
+    if not text:
+        return None
+    key = claims.mac_key(text)
+    if key is None:
+        return text  # an hciN name (or something the kernel will reject)
+    return claims.hci_for(text)
+
+
+def _resolve_entries(entries):
+    """Configured entries -> present hciN names, order preserved, dropping
+    the ones no card answers to. Also records every hciN entry that turned
+    out to name a card with a readable MAC, for the config rewrite."""
+    resolved = []
+    for entry in entries:
+        name = _resolve_adapter_entry(entry)
+        if name is None:
+            continue
+        _note_adapter_identity(entry, name)
+        if name not in resolved:
+            resolved.append(name)
+    return resolved
+
+
+# configured hciN entries observed to carry a real MAC: {entry: mac}. Filled
+# on first successful read of each card and drained by the config rewrite.
+_observed_identities = {}
+
+
+def _note_adapter_identity(entry, hci_name):
+    text = str(entry).strip()
+    if claims.mac_key(text) is not None or text in _observed_identities:
+        return
+    mac = claims.adapter_mac(hci_name)
+    if mac == claims.UNKNOWN_MAC:
+        return
+    _observed_identities[text] = mac
+    config = _config
+    if config is not None and config.adapter_config_path:
+        rewrite_adapter_config(config.adapter_config_path, {text: mac})
+
+
+def _cap_for(config, adapter):
+    """The configured link cap for an adapter, whichever way it was keyed.
+
+    Caps may be written against hciN or against the card's MAC; the lookup
+    canonicalizes both sides so a renumbered card keeps its cap.
+    """
+    # accepts the config object or a bare caps mapping
+    caps = getattr(config, "link_caps", config)
+    if not caps:
+        return None
+    if adapter in caps:
+        return caps[adapter]
+    key = claims.adapter_key(adapter)
+    for name, cap in caps.items():
+        if claims.adapter_key(name) == key:
+            return cap
+    return None
 
 
 def _responsive_adapters(candidates):
@@ -412,6 +490,7 @@ class _CatcherConfig:
         self.owner = owner
         self.pins = pins
         self.pool = pool
+        self.adapter_config_path = None
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
@@ -517,7 +596,7 @@ def _out_of_slots_error(address, exhausted, config):
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
-def _score_order(eligible, address_key, snapshot, caps, rssi=None):
+def _score_order(eligible, address_key, snapshot, config, rssi=None):
     """Candidates best-first, by habluetooth-parity connect scoring.
 
     habluetooth scores connection paths as RSSI minus penalties
@@ -543,7 +622,7 @@ def _score_order(eligible, address_key, snapshot, caps, rssi=None):
     scored = []
     for index, adapter in enumerate(eligible):
         entry = snapshot.get(adapter) or {}
-        cap = caps.get(adapter)
+        cap = _cap_for(config, adapter)
         free = (cap - entry.get("links", 0)) if cap else None
         score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
         score -= entry.get("soft", 0) * 1.01 * unit
@@ -582,9 +661,9 @@ def _acquire_adapter(address):
     pins = config.pins.get(address_key)
     present = present_adapters()
     if pins:
-        candidates = list(pins)
+        candidates = _resolve_entries(pins)
     elif config.pool:
-        candidates = list(config.pool)
+        candidates = _resolve_entries(config.pool)
     elif present:
         candidates = sorted(present, key=_hci_sort_key)
     else:
@@ -613,7 +692,7 @@ def _acquire_adapter(address):
         ordered = eligible[start:] + eligible[:start]
     else:
         rssi = config.sweeper.rssi_for(eligible, address_key) if config.sweeper is not None else None
-        ordered = _score_order(eligible, address_key, snapshot, config.link_caps, rssi)
+        ordered = _score_order(eligible, address_key, snapshot, config, rssi)
     if logger.isEnabledFor(logging.DEBUG):
         occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
         logger.debug(
@@ -622,7 +701,7 @@ def _acquire_adapter(address):
         )
     exhausted = []
     for adapter in ordered:
-        cap = config.link_caps.get(adapter)
+        cap = _cap_for(config, adapter)
         if cap:
             slot = config.claims.claim_slot(adapter, cap)
             if slot is None:
@@ -837,7 +916,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         if config is None or not adapter:
             return
         claims = []
-        cap = config.link_caps.get(adapter)
+        cap = _cap_for(config, adapter)
         if cap:
             slot = config.claims.claim_slot(adapter, cap)
             if slot is not None:
@@ -1080,14 +1159,14 @@ def _scan_candidates(config, present):
     adapter the kernel exposes - like connection placement, an unconfigured
     install uses everything and the config acts as an allowlist."""
     if config.pool:
-        return list(config.pool)
+        return _resolve_entries(config.pool)
     seen = []
     for adapters in config.pins.values():
         for adapter in adapters:
             if adapter not in seen:
                 seen.append(adapter)
     if seen:
-        return seen
+        return _resolve_entries(seen)
     if present:
         return sorted(present, key=_hci_sort_key)
     return []
@@ -1375,7 +1454,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -1386,9 +1465,16 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     owner names this process's claims; the pid is appended to disambiguate
     restart races (the old process's claims awaiting reap while the new one
     starts). adapters are raw config strings, verbatim ("MAC@hciX" pins,
-    plain "hciX" pools - see parse_adapter_entries). link_caps maps adapter
-    name to its established-link capacity; caps are opt-in, an uncapped
-    adapter is never slot-gated. wrap_scanner additionally rebinds
+    plain "hciX" pools - see parse_adapter_entries). An adapter may be named
+    by hciN or by its own MAC in any spelling; the MAC is the stable
+    identity, since hciN numbering changes under a USB reset or a replug,
+    and a MAC entry is resolved to the current number at use time. Pass
+    adapter_config_path to have the FIRST successful read of an hciN entry
+    rewrite that entry in the consumer's config file to the MAC it proved
+    to be, with a comment recording the substitution - the number stops
+    being load-bearing without anyone having to hand-edit anything.
+    link_caps maps adapter name (either spelling) to its established-link
+    capacity; caps are opt-in, an uncapped adapter is never slot-gated. wrap_scanner additionally rebinds
     bleak.BleakScanner to the adapter-bound, hard-claiming BLEScanner -
     opt-in because it changes which adapter unrelated code scans on.
     tune_conn_params loads habluetooth's fast-then-medium connection
@@ -1435,6 +1521,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         validate_connection=validate_connection,
     )
     _config.claims.on_beat = _drain_watch
+    _config.adapter_config_path = adapter_config_path
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
     bleak.BleakClient = BLEConnection
@@ -1460,3 +1547,59 @@ def uninstall_bleak_catcher():
             _config.sweeper.stop()
         _config.claims.release_all()
         _config = None
+
+
+def rewrite_adapter_config(path, mapping):
+    """Rewrite hciN adapter names in a config file to the MACs they proved
+    to be, leaving a comment recording what happened.
+
+    Line-oriented and format-agnostic on purpose: it substitutes the hciN
+    token wherever it appears in a value and inserts a comment above that
+    line, which is what INI, conf and shell-style files all understand. A
+    line already commented out is left alone. Best effort in every failure
+    mode - a config that cannot be read or written is not worth breaking a
+    connection over, and the resolution itself is unaffected.
+
+        # bcm: hci3 was detected as AA:BB:CC:DD:EE:FF and rewritten
+        adapters = AA:BB:CC:DD:EE:FF,hci5
+    """
+    if not path or not mapping:
+        return False
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot read {path}: {repr(e)}")
+        return False
+    out = []
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        replaced = line
+        hits = []
+        if stripped and not stripped.startswith(("#", ";")):
+            for entry, mac in mapping.items():
+                # word-boundary so hci1 never matches inside hci10
+                pattern = rf"(?<![0-9A-Za-z]){re.escape(entry)}(?![0-9A-Za-z])"
+                if re.search(pattern, replaced):
+                    replaced = re.sub(pattern, mac, replaced)
+                    hits.append((entry, mac))
+        if hits:
+            indent = line[: len(line) - len(line.lstrip())]
+            for entry, mac in hits:
+                out.append(f"{indent}# bcm: {entry} was detected as {mac} and rewritten\n")
+            changed = True
+        out.append(replaced)
+    if not changed:
+        return False
+    try:
+        tmp = f"{path}.bcm-tmp"
+        with open(tmp, "w") as f:
+            f.writelines(out)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot write {path}: {repr(e)}")
+        return False
+    for entry, mac in mapping.items():
+        logger.warning(f"adapter config: {entry} was detected as {mac}, rewritten in {path}")
+    return True

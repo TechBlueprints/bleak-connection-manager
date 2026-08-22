@@ -259,11 +259,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None):
+    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None):
         catcher.install_bleak_catcher(
             OWNER,
             adapters=adapters,
             link_caps=link_caps,
+            adapter_config_path=adapter_config_path,
             claim_dir=str(tmp_path),
             wrap_scanner=wrap_scanner,
             scan_to_score=scan_to_score,
@@ -1873,3 +1874,109 @@ def test_an_unrelated_services_claim_is_not_flagged(env, caplog):
         asyncio.run(client.connect())
 
     assert not any("another live instance" in r.message for r in caplog.records)
+
+
+# -- adapter identity by MAC (convention 0.4) ------------------------------
+
+
+def _kernel_adapters(monkeypatch, mapping):
+    """Present hciN -> MAC, for both the catcher and the claims layer."""
+    monkeypatch.setattr(catcher.claims, "_mac_cache", {})
+    monkeypatch.setattr(catcher.claims, "present_hci_names", lambda: sorted(mapping))
+    monkeypatch.setattr(catcher.claims, "_read_adapter_mac", lambda a: mapping.get(a, catcher.claims.UNKNOWN_MAC))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: set(mapping))
+    catcher._observed_identities.clear()
+
+
+def test_an_adapter_configured_by_mac_routes_to_its_current_number(env, monkeypatch):
+    """The point of the change: config names the card, and the hciN it is
+    handed to bleak is looked up at connect time."""
+    env.install(adapters=("AA:BB:CC:DD:EE:FF",))
+    _kernel_adapters(monkeypatch, {"hci7": "AA:BB:CC:DD:EE:FF"})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci7"
+
+
+def test_a_renumbered_card_follows_its_mac(env, monkeypatch):
+    """Same config, same card, different number after a USB reset - the
+    connect follows the card rather than the stale number."""
+    env.install(adapters=("aabbccddeeff",))  # a third spelling, no colons
+    _kernel_adapters(monkeypatch, {"hci3": "AA:BB:CC:DD:EE:FF"})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci3"
+
+    _kernel_adapters(monkeypatch, {"hci9": "AA:BB:CC:DD:EE:FF"})
+    client2 = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client2.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci9"
+
+
+def test_a_mac_that_no_present_card_answers_to_is_skipped(env, monkeypatch):
+    """An unplugged card is simply absent - selection falls through to the
+    adapters that are there rather than handing bleak a name it cannot use."""
+    env.install(adapters=("AA:BB:CC:DD:EE:FF", "hci5"))
+    _kernel_adapters(monkeypatch, {"hci5": "11:22:33:44:55:66"})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"
+
+
+def test_link_caps_may_be_keyed_by_mac(env, monkeypatch):
+    """A cap follows the card too: keyed by MAC, honored on whatever number
+    the card currently has."""
+    env.install(adapters=("hci4",), link_caps={"AA:BB:CC:DD:EE:FF": 1})
+    _kernel_adapters(monkeypatch, {"hci4": "AA:BB:CC:DD:EE:FF"})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert any(n.startswith("AABBCCDDEEFF.link.") for n in os.listdir(env.dir))
+
+
+def test_an_hci_entry_is_rewritten_to_its_mac_in_the_config(env, monkeypatch, tmp_path):
+    """First successful read of the card rewrites the config entry to the
+    MAC it proved to be, with a comment recording the substitution."""
+    conf = tmp_path / "driver.conf"
+    conf.write_text(
+        "# BLE settings\n"
+        "adapters = hci4,hci5\n"
+        "[caps]\n"
+        "hci4 = 5\n"
+        "# hci4 in a comment is left alone\n"
+    )
+    env.install(adapters=("hci4",), adapter_config_path=str(conf))
+    _kernel_adapters(monkeypatch, {"hci4": "AA:BB:CC:DD:EE:FF", "hci5": "11:22:33:44:55:66"})
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    text = conf.read_text()
+    assert "# bcm: hci4 was detected as AA:BB:CC:DD:EE:FF and rewritten" in text
+    assert "adapters = AA:BB:CC:DD:EE:FF,hci5" in text  # hci5 untouched: not read yet
+    assert "AA:BB:CC:DD:EE:FF = 5" in text  # the cap key follows the card
+    assert "# hci4 in a comment is left alone" in text
+
+
+def test_the_config_rewrite_respects_token_boundaries(tmp_path):
+    """hci1 must never match inside hci10."""
+    conf = tmp_path / "c.conf"
+    conf.write_text("adapters = hci1,hci10\n")
+
+    assert catcher.rewrite_adapter_config(str(conf), {"hci1": "AA:BB:CC:DD:EE:FF"}) is True
+
+    assert "adapters = AA:BB:CC:DD:EE:FF,hci10" in conf.read_text()
+
+
+def test_the_config_rewrite_is_best_effort(tmp_path):
+    """An unreadable or unwritable config is never worth breaking a
+    connection over."""
+    assert catcher.rewrite_adapter_config(str(tmp_path / "nope.conf"), {"hci1": "AA:BB:CC:DD:EE:FF"}) is False
+    conf = tmp_path / "c.conf"
+    conf.write_text("adapters = hci9\n")
+    assert catcher.rewrite_adapter_config(str(conf), {"hci1": "AA:BB:CC:DD:EE:FF"}) is False  # no hit
