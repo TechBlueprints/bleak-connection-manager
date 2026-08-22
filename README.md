@@ -269,6 +269,70 @@ verbatim in [`ext/bt_claims.py`](ext/bt_claims.py) for anyone who wants the
 plain claims coordination without adopting any of this package — see
 [`ext/README.md`](ext/README.md) for provenance.
 
+## Deployment: the shared install (Venus OS)
+
+Vendoring this stack per consumer means every fix is N re-vendor passes,
+and the claims convention pays for version skew (an old consumer ignores
+drain claims it has never heard of). The supported alternative: the
+shared install IS a git checkout of this repository at `/data/bcm` — the
+one directory that survives a Venus firmware update — with bleak and
+bleak-retry-connector as submodules pinned to the field-validated
+upstream releases (v3.0.2 / v4.6.0) and `dbus_fast`, `bluetooth_adapters`
+and `aiooui` vendored in `ext/`. Each consumer's installer converges it:
+
+```sh
+BCM_DIR=/data/bcm
+if [ -d "$BCM_DIR/.git" ]; then
+    git -C "$BCM_DIR" fetch -q origin && git -C "$BCM_DIR" merge -q --ff-only origin/main
+else
+    git clone -q https://github.com/TechBlueprints/bleak-connection-manager "$BCM_DIR"
+fi
+"$BCM_DIR/install.sh"
+```
+
+`--ff-only` means a stale consumer can never move the fleet backwards.
+`install.sh` initializes submodules, smoke-imports the whole stack, and
+writes the interpreter shim `/data/bcm/python3` — the ONE place the
+shared path is written down. A consumer's runit script uses it with a
+standalone fallback, so public repos keep working from a bare clone:
+
+```sh
+BCM_PY=/data/bcm/python3
+[ -x "$BCM_PY" ] || BCM_PY=python3
+exec "$BCM_PY" main.py
+```
+
+Rollback: `git -C /data/bcm checkout <hash> && /data/bcm/install.sh`.
+Canary: a second clone at a pinned hash plus `BCM_ROOT=<that-clone>` in
+one service's run script; the rest of the fleet rides the main checkout.
+
+### Autowire (opt-in): every Python bleak consumer, no opt-in needed
+
+`install.sh --autowire` plants a `.pth` plus `bcm_autowire.py` in the
+system site-packages (replanted at boot via `/data/rc.local`, since
+firmware updates erase the rootfs). From then on, ANY Python process on
+the box that imports bleak gets the catcher installed over it before the
+importer can capture `bleak.BleakClient` — community drivers that have
+never heard of BCM participate in slotting, latching and drains. A
+process with its own vendored bleak keeps it (the hook wraps whatever
+bleak the process brought and never overrides its choices); a process
+with none is served the shared checkout's. Fleet defaults come from
+`/data/bcm/autowire.conf` (JSON, keys as `install_bleak_catcher`); a
+consumer's own explicit `install_bleak_catcher` call supersedes the
+autowired one — and a process that imports `bleak_connection_manager`
+itself is never autowired at all: the finder stands down the moment the
+package appears in `sys.modules` (a deliberate consumer installs
+explicitly, with its own owner and config), and the `/data/bcm/python3`
+shim exports the kill switch for the same reason. Kill switch:
+`BCM_AUTOWIRE=0` in the environment.
+
+Scope honesty: this covers Python+bleak only — C programs talking to
+BlueZ directly (Victron's `dbus-ble-sensors`) and `bluetoothctl` remain
+outside the claims convention either way. And because a `.pth` runs at
+the startup of every Python interpreter on the machine, `bcm_autowire.py`
+is built to never raise: enable autowire only after the shared checkout
+itself has soaked on the fleet.
+
 ## Public API
 
 | Name | Purpose |

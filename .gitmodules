@@ -1,0 +1,6 @@
+[submodule "ext/upstream/bleak"]
+	path = ext/upstream/bleak
+	url = https://github.com/hbldh/bleak.git
+[submodule "ext/upstream/bleak-retry-connector"]
+	path = ext/upstream/bleak-retry-connector
+	url = https://github.com/Bluetooth-Devices/bleak-retry-connector.git

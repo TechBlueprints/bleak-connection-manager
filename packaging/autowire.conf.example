@@ -1,0 +1,7 @@
+{
+  "adapters": [],
+  "link_caps": {},
+  "wrap_scanner": true,
+  "scan_to_score": false,
+  "tune_conn_params": true
+}

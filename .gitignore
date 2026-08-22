@@ -1,12 +1,4 @@
+python3
 __pycache__/
-*.py[cod]
-*.egg-info/
+*.pyc
 dist/
-build/
-.venv/
-.pytest_cache/
-.eggs/
-*.egg
-.coverage
-htmlcov/
-OPERATIONS.md

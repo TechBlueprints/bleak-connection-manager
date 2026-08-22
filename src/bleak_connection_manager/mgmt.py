@@ -60,6 +60,7 @@ class _SockaddrHci(ctypes.Structure):
 _lock = threading.Lock()
 _sock = None
 _available = None
+_announced = False
 
 
 def _pack_bdaddr(address):
@@ -138,7 +139,7 @@ def load_conn_params(adapter, address, params):
     Never raises and never waits for the reply; any failure turns tuning
     off for the process rather than perturbing the connect path it serves.
     """
-    global _available
+    global _available, _announced
     match = re.match(r"hci(\d+)$", str(adapter))
     if not match or not available():
         return False
@@ -156,6 +157,13 @@ def load_conn_params(adapter, address, params):
                 except (BlockingIOError, InterruptedError):
                     break
             sock.send(packet)
+            if not _announced:
+                # once per process, at INFO: "tuning is active" must be a
+                # greppable fact, not an inference from a socket opening
+                # (field 2026-08-22: it silently no-opped on Venus for the
+                # platform's entire history and nobody could tell)
+                _announced = True
+                logger.info(f"conn-param tuning active: mgmt channel open, parameters loading (first: {adapter})")
             return True
         except OSError as e:
             logger.debug(f"mgmt LOAD_CONN_PARAM failed, disabling tuning: {repr(e)}")
