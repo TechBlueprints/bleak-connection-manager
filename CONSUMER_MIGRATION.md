@@ -59,9 +59,45 @@ KEEP service-specific deps (aiobmsble, velib_python, etc.). Remove the
 path. Keep the `install_bleak_catcher(...)` call exactly as it is — owner,
 adapters, link_caps, validators all unchanged.
 
-If the repo must stay runnable standalone for third parties, either keep a
-vendored set for that purpose (the run-script fallback uses it automatically)
-or document the shared install as a prerequisite — maintainer's choice.
+If the repo must stay runnable standalone for third parties, keep a
+vendored set and defer to whatever the interpreter already provides. The
+reference pattern (contributed from dbus-easytouchrv's migration, the first
+through this checklist — adapt the subpath list to your vendored set):
+
+```python
+def _ensure_ble_stack() -> None:
+    """Put the vendored ext/ BLE stack on sys.path unless already provided
+    (by the shared /data/bcm shim, or by test stubs)."""
+    if "bleak_connection_manager" in sys.modules:
+        return
+    try:
+        import importlib.util
+        if importlib.util.find_spec("bleak_connection_manager") is not None:
+            return
+    except (ImportError, ValueError):
+        pass
+    _ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+    for _sub in [
+        os.path.join(_ext, "bleak-connection-manager", "src"),
+        os.path.join(_ext, "bleak-connection-manager", "ext"),
+        os.path.join(_ext, "bleak-retry-connector", "src"),
+        os.path.join(_ext, "bluetooth-adapters", "src"),
+        os.path.join(_ext, "aiooui", "src"),
+        os.path.join(_ext, "bleak"),
+    ]:
+        if os.path.isdir(_sub) and _sub not in sys.path:
+            sys.path.insert(0, _sub)
+```
+
+Design notes that make this shape correct:
+1. The `sys.modules` check comes first — cheap, and it is what makes test
+   stubs work (ModuleType entries with `__spec__ = None` make `find_spec`
+   raise `ValueError`, which is also why that except clause catches it).
+2. Call it lazily from the function that installs the catcher, not at
+   module import — entry points then need zero path knowledge.
+3. The ImportError/ValueError swallow means a weird interpreter state
+   degrades to "insert ext paths" — the safe direction: worst case you
+   shadow the shim with your vendored copy, never running with no stack.
 
 ## 4. Verify after deploy
 
