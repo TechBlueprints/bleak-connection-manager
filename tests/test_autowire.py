@@ -137,6 +137,13 @@ def test_a_wire_leaves_a_durable_event_record(tmp_path):
         assert "owner=autowire-" in line
         assert "bleak=own" in line  # the stub was the process's own bleak
         assert 'argv="' in line and "cwd=" in line
+        # On Linux (where this ships) argv comes from /proc/self/cmdline and
+        # carries the -c code; macOS has no /proc, so the subprocess here
+        # exercises the sys.argv fallback. The parsing itself is covered
+        # directly below, on both platforms.
+        if os.path.exists("/proc/self/cmdline"):
+            assert "import bcm_autowire" in line
+            assert "owner=autowire--c" not in line
     finally:
         if os.path.exists(events):
             os.unlink(events)
@@ -154,3 +161,53 @@ def test_no_event_record_without_a_wire(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert not os.path.exists(events)  # kill switch: no wire, no record
+
+
+def test_the_owner_is_derived_from_the_real_command_line(tmp_path):
+    """A script gives its basename, -m gives the module, -c has no name to
+    give and says so rather than degrading to a flag."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bcm_autowire_probe", os.path.join(REPO, "packaging", "bcm_autowire.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod._derive_owner(["/usr/bin/python3", "/data/apps/foo/driver.py"]) == "driver.py"
+    assert mod._derive_owner(["python3", "-u", "/data/apps/foo/driver.py"]) == "driver.py"
+    assert mod._derive_owner(["python3", "-m", "pkg.mod"]) == "pkg.mod"
+    assert mod._derive_owner(["python3", "-c", "import bleak"]) == "inline"
+    assert mod._derive_owner(["python3"]) == "python"
+
+
+def _probe_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bcm_autowire_probe", os.path.join(REPO, "packaging", "bcm_autowire.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_command_line_comes_from_proc_not_sys_argv(tmp_path, monkeypatch):
+    """The prod bug: `python3 -c "..."` has sys.argv == ['-c'], so the code -
+    the only identifying thing about a mystery one-liner - was lost. /proc
+    carries the true NUL-separated line."""
+    mod = _probe_module()
+    fake = tmp_path / "cmdline"
+    fake.write_bytes(b"python3\x00-c\x00import bleak; go()\x00")
+    monkeypatch.setattr(mod, "_CMDLINE", str(fake))
+
+    assert mod._command_line() == ["python3", "-c", "import bleak; go()"]
+    assert mod._derive_owner(mod._command_line()) == "inline"
+
+
+def test_the_command_line_falls_back_when_proc_is_absent(tmp_path, monkeypatch):
+    mod = _probe_module()
+    monkeypatch.setattr(mod, "_CMDLINE", str(tmp_path / "nope"))
+    monkeypatch.setattr(mod.sys, "argv", ["/data/apps/foo/driver.py", "--flag"])
+
+    assert mod._command_line() == ["/data/apps/foo/driver.py", "--flag"]

@@ -18,8 +18,9 @@ convention, autowired or not.
 
 Config: /data/bcm/autowire.conf (JSON), keys matching
 install_bleak_catcher: adapters, link_caps, wrap_scanner, scan_to_score,
-tune_conn_params. Owner defaults to the process name. Kill switch:
-BCM_AUTOWIRE=0 in the environment.
+tune_conn_params. Owner is derived from the process's real command line
+(/proc/self/cmdline, not sys.argv). Kill switch: BCM_AUTOWIRE=0 in the
+environment.
 
 Never from inside BCM: a process that imports bleak_connection_manager
 itself is a deliberate consumer - it installs the catcher explicitly,
@@ -34,6 +35,7 @@ import sys
 _ROOT = os.environ.get("BCM_AUTOWIRE_ROOT", "/data/bcm")
 _CONF = os.path.join(_ROOT, "autowire.conf")
 _EVENTS = os.path.join(_ROOT, "autowire-events.log")
+_CMDLINE = "/proc/self/cmdline"  # module-level so tests can point it elsewhere
 _EVENTS_MAX = 1_000_000  # a crash-looping script must not grow it forever
 _served_shared = False
 
@@ -45,6 +47,48 @@ def _lib_paths():
         os.path.join(_ROOT, "ext", "upstream", "bleak"),
         os.path.join(_ROOT, "ext", "upstream", "bleak-retry-connector", "src"),
     ]
+
+
+def _command_line():
+    """The process's real command line, as a list.
+
+    sys.argv is not it: for `python3 -c "..."` it is just ['-c'], so the
+    code - the single most identifying thing about a mystery one-liner -
+    vanishes, and `-m pkg.mod` loses the module name the same way. Anything
+    that rewrites sys.argv can lie outright. /proc/self/cmdline carries the
+    true, full, NUL-separated line and costs a read.
+    """
+    try:
+        with open(_CMDLINE, "rb") as f:
+            parts = [p.decode("utf-8", "replace") for p in f.read().split(b"\0") if p]
+        if parts:
+            return parts
+    except OSError:
+        pass
+    return [a for a in sys.argv if a]
+
+
+def _derive_owner(parts):
+    """A short name for the process, from its real command line.
+
+    A script path gives its basename; `-m pkg.mod` gives the module; `-c`
+    has no name to give, so it is labelled as inline code and the argv
+    field in the record carries the actual source.
+    """
+    rest = parts[1:] if len(parts) > 1 else []
+    index = 0
+    while index < len(rest):
+        item = rest[index]
+        if item == "-m" and index + 1 < len(rest):
+            return rest[index + 1]
+        if item.startswith("-c"):
+            return "inline"
+        if item.startswith("-"):
+            index += 1
+            continue
+        return os.path.basename(item) or "python"
+    name = os.path.basename(parts[0]) if parts else "python"
+    return "python" if name.startswith("python") else name
 
 
 def _record_wire(owner):
@@ -66,7 +110,11 @@ def _record_wire(owner):
         source = "shared" if _served_shared else "own"
         origin = getattr(bleak_mod, "__file__", None) or "?"
         version = getattr(bleak_mod, "__version__", "") or ""
-        argv = " ".join(sys.argv).replace("\n", " ") or "?"
+        # the real line, not sys.argv - and capped, because a -c payload
+        # can be arbitrarily long and this file is size-guarded
+        argv = " ".join(_command_line()).replace("\n", " ") or "?"
+        if len(argv) > 400:
+            argv = argv[:400] + "..."
         try:
             cwd = os.getcwd()
         except OSError:
@@ -103,7 +151,7 @@ def _install_catcher():
                 config.update(loaded)
         except Exception:
             pass  # no conf, or a broken one: fleet defaults
-        owner = os.path.basename(sys.argv[0] or "") or "python"
+        owner = _derive_owner(_command_line())
         if owner.startswith("python"):
             owner = "autowired-python"
         config.setdefault("adapters", ())
