@@ -309,8 +309,12 @@ one service's run script; the rest of the fleet rides the main checkout.
 ### Autowire (opt-in): every Python bleak consumer, no opt-in needed
 
 `install.sh --autowire` plants a `.pth` plus `bcm_autowire.py` in the
-system site-packages (replanted at boot via `/data/rc.local`, since
-firmware updates erase the rootfs). From then on, ANY Python process on
+system site-packages, handling Venus's read-only rootfs itself
+(remount-rw, plant, remount-ro; a boot needing no changes never
+remounts). The plant is replanted at boot via `/data/rc.local`, since
+firmware updates erase the rootfs — and the replant logs to
+`/data/bcm/autowire-replant.log`, because a silent failure at the
+post-update boot is exactly the failure the replant exists to prevent. From then on, ANY Python process on
 the box that imports bleak gets the catcher installed over it before the
 importer can capture `bleak.BleakClient` — community drivers that have
 never heard of BCM participate in slotting, latching and drains. A

@@ -33,8 +33,12 @@ in doubt, run it unpiped and capture `$?` directly. A run killed by the
 link is safe to re-run — the installer is idempotent and resumes from
 whatever partial state the death left.
 
-Do NOT pass `--autowire`. That is a separate, fleet-level decision Clint makes
-once the shared checkout has soaked.
+Do NOT pass `--autowire` from a consumer installer. Autowire is a
+fleet-level, per-box decision (already enabled on the prod Cerbo by Clint);
+when it is enabled, `install.sh --autowire` handles the read-only Venus
+rootfs itself (remount-rw, plant, remount-ro) and registers a boot-time
+replant in `/data/rc.local` that logs to `/data/bcm/autowire-replant.log` —
+check that log after any firmware update.
 
 ## 2. Run script: exec through the shim, with standalone fallback
 

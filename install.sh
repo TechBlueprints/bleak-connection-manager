@@ -96,18 +96,56 @@ echo "bcm-install: shim ready at $ROOT/python3 ($VERSION)"
 # --autowire: sitewide hook. A .pth runs in EVERY python process on the
 # box, so this is opt-in and the module it loads is built to never raise.
 if [ "$1" = "--autowire" ]; then
-    SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+    SITE="${BCM_SITE:-$(python3 -c 'import site; print(site.getsitepackages()[0])')}"
     [ -d "$SITE" ] || { echo "bcm-install: no site-packages at $SITE" >&2; exit 1; }
-    cp "$ROOT/packaging/bcm_autowire.py" "$SITE/bcm_autowire.py"
-    printf 'import bcm_autowire\n' > "$SITE/bcm_autowire.pth"
-    echo "bcm-install: autowire planted in $SITE"
+    # idempotence first: on a normal boot the plant is intact and nothing
+    # below (including the remount dance) needs to run
+    if cmp -s "$ROOT/packaging/bcm_autowire.py" "$SITE/bcm_autowire.py" 2>/dev/null \
+        && [ "$(cat "$SITE/bcm_autowire.pth" 2>/dev/null)" = "import bcm_autowire" ]; then
+        echo "bcm-install: autowire already planted in $SITE"
+    else
+        # Venus mounts the rootfs read-only (field 2026-08-22, prod): the
+        # plant - and every post-firmware-update REPLANT, which is the
+        # whole point - must handle the remount itself, and must never
+        # exit early while the rootfs is left rw
+        REMOUNTED=0
+        if touch "$SITE/.bcm-write-test" 2>/dev/null; then
+            rm -f "$SITE/.bcm-write-test"
+        else
+            echo "bcm-install: rootfs is read-only, remounting rw for the autowire plant"
+            if mount -o remount,rw /; then
+                REMOUNTED=1
+            else
+                echo "bcm-install: autowire plant FAILED: cannot remount rootfs rw" >&2
+                exit 1
+            fi
+        fi
+        PLANTED=1
+        cp "$ROOT/packaging/bcm_autowire.py" "$SITE/bcm_autowire.py" || PLANTED=0
+        if [ "$PLANTED" = 1 ]; then
+            printf 'import bcm_autowire\n' > "$SITE/bcm_autowire.pth" || PLANTED=0
+        fi
+        if [ "$REMOUNTED" = 1 ]; then
+            mount -o remount,ro / || echo "bcm-install: WARNING: could not remount rootfs read-only" >&2
+        fi
+        [ "$PLANTED" = 1 ] || { echo "bcm-install: autowire plant FAILED writing into $SITE" >&2; exit 1; }
+        echo "bcm-install: autowire planted in $SITE"
+    fi
     # the rootfs (and the .pth with it) is erased by firmware updates;
-    # /data/rc.local replants it on every boot
+    # /data/rc.local replants on every boot. The replant logs to a file
+    # instead of /dev/null: a failed replant after a firmware update is
+    # exactly the event that must not disappear silently.
     RC=/data/rc.local
-    LINE="[ -x $ROOT/install.sh ] && $ROOT/install.sh --autowire >/dev/null 2>&1 # bcm-autowire"
+    LOG="$ROOT/autowire-replant.log"
+    LINE="[ -x $ROOT/install.sh ] && $ROOT/install.sh --autowire > $LOG 2>&1 # bcm-autowire"
     if [ -w /data ]; then
         touch "$RC"; chmod 755 "$RC"
-        grep -q "# bcm-autowire" "$RC" 2>/dev/null || echo "$LINE" >> "$RC"
-        echo "bcm-install: replant registered in $RC"
+        if grep -q "# bcm-autowire" "$RC" 2>/dev/null; then
+            # refresh the registered line (older registrations logged to /dev/null)
+            grep -v "# bcm-autowire" "$RC" > "$RC.tmp" && echo "$LINE" >> "$RC.tmp" && mv "$RC.tmp" "$RC" && chmod 755 "$RC"
+        else
+            echo "$LINE" >> "$RC"
+        fi
+        echo "bcm-install: replant registered in $RC (logs to $LOG)"
     fi
 fi
