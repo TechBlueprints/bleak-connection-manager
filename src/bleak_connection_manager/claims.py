@@ -6,7 +6,7 @@ module implements a file convention any service can follow without linking a
 library or coordinating a rollout - a shell script participates with touch,
 ls and noclobber. Everything below the line is the whole contract.
 
-The convention (0.2)
+The convention (0.3)
 --------------------
 
 Directory: /run/bt-claims (tmpfs: a reboot clears every claim, which also
@@ -32,6 +32,24 @@ Three claim kinds, visible in the filename:
                                 undocumented and not discoverable - and
                                 bound established-link capacity, not
                                 connection-attempt pacing.
+    hci2.drain                  drain claim (0.3): one well-known name per
+                                adapter, O_EXCL like the scan claim. "This
+                                card is about to be reset; place new work
+                                elsewhere and, if you can, move your links
+                                off it." Held by the process performing the
+                                recovery, heartbeated like any claim, and
+                                released when the reset - or the abandoned
+                                attempt - is over, so a dead resetter's
+                                drain is reaped like anything else. Draining
+                                steers, never gates: placement ranks a
+                                draining card behind every other candidate
+                                but still uses it when nothing else is
+                                usable, and a claimant that cannot move (its
+                                only working card, an operator pin) simply
+                                stays - its live claims continue to veto the
+                                reset, and the resetter gives up at its
+                                deadline rather than pulling a card out from
+                                under it.
 
 File content is one line: "<pid> <service> <since-epoch>". This
 implementation writes the manager's sanitized owner string as <service>, so
@@ -59,6 +77,15 @@ Soft claims are shareable by design, so two services placing at the same
 moment may briefly co-locate; distinct preference orders make that rare, and
 it is legal when it happens.
 
+A claim is a statement about a link, not the link itself, and the two can
+drift: the claim can outlive the link (release it - that is what validity
+checks are for) or the link can outlive the claim (re-acquire it - the link
+exists regardless of what the files say). When judging whether the thing a
+claim accounts for still exists, trust what was observed on the link - a
+notification arriving, a GATT operation returning - over any cached
+connection property; caches of link state go stale precisely in the failure
+modes this convention exists to survive (field-validated twice, 2026-08).
+
 This file is deliberately standalone (stdlib only, no asyncio, no bleak, no
 project imports) so other projects can vendor it verbatim.
 """
@@ -68,7 +95,7 @@ import os
 import threading
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +205,12 @@ class ClaimManager:
         self._held = []
         self._beat = None
         self._lock = threading.Lock()
+        # optional zero-argument callable invoked after every heartbeat
+        # sweep, on the heartbeat thread. The hook for periodic work that
+        # wants the claim cadence without a second timer (this package's
+        # bleak catcher watches for drain claims here). Exceptions are
+        # swallowed: a broken hook must not stop the heartbeat.
+        self.on_beat = None
 
     # -- liveness ----------------------------------------------------------
 
@@ -203,7 +236,8 @@ class ClaimManager:
         """Live-claim snapshot of the directory, keyed by adapter.
 
         {adapter: {"hard": path-or-None, "hard_pid": pid-or-None,
-                   "soft": count, "soft_owners": [...], "links": count}}
+                   "soft": count, "soft_owners": [...], "links": count,
+                   "drain": bool, "drain_pid": pid-or-None}}
 
         hard_pid lets a caller distinguish a foreign scanner's hard claim
         from one held by its own process.
@@ -218,11 +252,15 @@ class ClaimManager:
             if not sep:
                 continue
             path = os.path.join(self.claim_dir, name)
-            entry = state.setdefault(adapter, {"hard": None, "hard_pid": None, "soft": 0, "soft_owners": [], "links": 0})
+            entry = state.setdefault(adapter, {"hard": None, "hard_pid": None, "soft": 0, "soft_owners": [], "links": 0, "drain": False, "drain_pid": None})
             if rest == "scan":
                 if self._is_live(path):
                     entry["hard"] = path
                     entry["hard_pid"] = _read_pid(path)
+            elif rest == "drain":
+                if self._is_live(path):
+                    entry["drain"] = True
+                    entry["drain_pid"] = _read_pid(path)
             elif rest.startswith("use."):
                 if self._is_live(path):
                     entry["soft"] += 1
@@ -257,6 +295,27 @@ class ClaimManager:
             if pid is not None and pid != own:
                 count += 1
         return count
+
+    def own_use(self, adapter):
+        """Count of live claims THIS manager holds on the adapter.
+
+        The drain claim itself is excluded: it marks the recovery, it is not
+        usage, and counting it would make a resetter wait on itself.
+        """
+        with self._lock:
+            held = list(self._held)
+        return sum(
+            1
+            for claim in held
+            if claim.adapter == adapter
+            and not claim.released
+            and not claim.path.endswith(".drain")
+        )
+
+    def drain_active(self, adapter):
+        """Whether a live drain claim exists on the adapter (any process)."""
+        path = os.path.join(self.claim_dir, f"{adapter}.drain")
+        return self._is_live(path)
 
     # -- claiming ----------------------------------------------------------
 
@@ -308,6 +367,37 @@ class ClaimManager:
                 return None
         except OSError as e:
             logger.debug(f"bt-claims: could not hard-claim {adapter}: {repr(e)}")
+            return None
+        claim = Claim(adapter, path, exclusive=True, service=self.owner)
+        self._hold(claim)
+        return claim
+
+    def claim_drain(self, adapter):
+        """Take the adapter's single drain claim, or None if someone holds it.
+
+        The exclusivity is the coordination: one process performs a recovery
+        at a time, and a second would-be resetter backing off on None knows
+        the card is already being handled.
+        """
+        path = os.path.join(self.claim_dir, f"{adapter}.drain")
+        try:
+            os.makedirs(self.claim_dir, exist_ok=True)
+            _write_claim_file(path, exclusive=True, service=self.owner)
+        except FileExistsError:
+            if self._is_live(path):
+                return None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            try:
+                _write_claim_file(path, exclusive=True, service=self.owner)
+            except OSError:
+                return None
+        except OSError as e:
+            logger.debug(f"bt-claims: could not drain-claim {adapter}: {repr(e)}")
             return None
         claim = Claim(adapter, path, exclusive=True, service=self.owner)
         self._hold(claim)
@@ -387,10 +477,11 @@ class ClaimManager:
         """Pick an adapter from a preference-ordered list and claim it soft.
 
         Adapters hard-claimed by another live process are avoided; among the
-        rest, fewer live soft claims plus held link slots wins, preference
-        order breaks ties. When everything is hard-claimed, the preferred
-        adapter is used anyway: a scanner's claim must never keep this
-        service off the air.
+        rest, a card being drained ranks behind every card that is not, then
+        fewer live soft claims plus held link slots wins, preference order
+        breaks ties. When everything is hard-claimed, the preferred adapter
+        is used anyway: a scanner's claim must never keep this service off
+        the air, and a drain steers placement but never refuses it.
 
         Returns (adapter, Claim-or-None); (None, None) only for an empty list.
         """
@@ -401,7 +492,7 @@ class ClaimManager:
         if not open_adapters:
             logger.info(f"bt-claims: every allowed adapter is hard-claimed, using {adapters[0]} anyway")
             open_adapters = list(adapters)
-        ranked = sorted(open_adapters, key=lambda a: ((state.get(a) or {}).get("soft", 0) + (state.get(a) or {}).get("links", 0), adapters.index(a)))
+        ranked = sorted(open_adapters, key=lambda a: (bool((state.get(a) or {}).get("drain")), (state.get(a) or {}).get("soft", 0) + (state.get(a) or {}).get("links", 0), adapters.index(a)))
         adapter = ranked[0]
         return adapter, self.claim_soft(adapter)
 
@@ -430,8 +521,18 @@ class ClaimManager:
             if valid:
                 claim.touch()
             else:
-                logger.debug(f"bt-claims: releasing {os.path.basename(claim.path)}: what it accounted for is gone")
+                # info, not debug: a validity release is the record of a
+                # claim/link divergence - the exact event field diagnosis
+                # needs to see (2026-08-22: prod lost a claim invisibly
+                # because this line was below the deployed log level)
+                logger.info(f"bt-claims: releasing {os.path.basename(claim.path)}: what it accounted for is gone")
                 self.release(claim)
+        hook = self.on_beat
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                logger.debug("bt-claims: on_beat hook raised", exc_info=True)
 
     def _heartbeat_loop(self):
         while True:

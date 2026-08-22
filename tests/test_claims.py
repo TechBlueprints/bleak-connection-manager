@@ -325,3 +325,83 @@ def test_release_all_releases_everything(tmp_path):
     assert len(os.listdir(str(tmp_path))) == 3
     m.release_all()
     assert os.listdir(str(tmp_path)) == []
+
+
+# -- drain (convention 0.3) ------------------------------------------------
+
+
+def test_the_drain_claim_is_exclusive(tmp_path):
+    m = _manager(tmp_path, "resetter")
+    other = _manager(tmp_path, "second")
+    drain = m.claim_drain("hci1")
+    try:
+        assert drain is not None
+        assert os.path.exists(os.path.join(str(tmp_path), "hci1.drain"))
+        assert other.claim_drain("hci1") is None  # one recovery at a time
+    finally:
+        m.release(drain)
+    assert other.claim_drain("hci1") is not None  # released: available again
+
+
+def test_a_stale_drain_is_taken_over(tmp_path):
+    m = _manager(tmp_path, "resetter")
+    _foreign_file(tmp_path, "hci1.drain", pid=99999999, aged=3600)
+    assert m.claim_drain("hci1") is not None
+
+
+def test_drain_active_sees_any_live_drain(tmp_path):
+    m = _manager(tmp_path, "svc")
+    assert m.drain_active("hci1") is False
+    _foreign_file(tmp_path, "hci1.drain", pid=1)  # foreign live
+    assert m.drain_active("hci1") is True
+    assert m.drain_active("hci2") is False
+
+
+def test_choose_steers_away_from_a_draining_card(tmp_path):
+    """hci1 is preferred and idle, but a live drain outranks idleness; the
+    fallback still uses a draining card when it is the only candidate."""
+    m = _manager(tmp_path, "svc")
+    _foreign_file(tmp_path, "hci1.drain", pid=1)
+    adapter, claim = m.choose(["hci1", "hci2"])
+    m.release(claim)
+    assert adapter == "hci2"
+    adapter, claim = m.choose(["hci1"])  # never gates
+    m.release(claim)
+    assert adapter == "hci1"
+
+
+def test_own_use_counts_held_claims_but_not_the_drain(tmp_path):
+    m = _manager(tmp_path, "svc")
+    soft = m.claim_soft("hci1")
+    slot = m.claim_slot("hci1", 2)
+    drain = m.claim_drain("hci1")
+    try:
+        assert m.own_use("hci1") == 2  # soft + slot; the drain is not usage
+        assert m.own_use("hci2") == 0
+        m.release(slot)
+        assert m.own_use("hci1") == 1
+    finally:
+        m.release_all()
+
+
+def test_the_snapshot_reports_drain(tmp_path):
+    m = _manager(tmp_path, "svc")
+    _foreign_file(tmp_path, "hci1.drain", pid=1)
+    state = m.claims()
+    assert state["hci1"]["drain"] is True
+    assert state["hci1"]["drain_pid"] == 1
+
+
+def test_the_on_beat_hook_fires_after_the_sweep_and_may_raise(tmp_path):
+    m = _manager(tmp_path, "svc")
+    fired = []
+    m.on_beat = lambda: fired.append(True)
+    claim = m.claim_soft("hci1")
+    try:
+        m._beat_once()
+        assert fired == [True]
+        m.on_beat = lambda: 1 / 0  # a broken hook must not stop the beat
+        m._beat_once()
+        assert not claim.released
+    finally:
+        m.release(claim)
