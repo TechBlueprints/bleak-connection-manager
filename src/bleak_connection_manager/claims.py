@@ -105,8 +105,13 @@ notification arriving, a GATT operation returning - over any cached
 connection property; caches of link state go stale precisely in the failure
 modes this convention exists to survive (field-validated twice, 2026-08).
 
-This file is deliberately standalone (stdlib only, no asyncio, no bleak, no
-project imports) so other projects can vendor it verbatim.
+This file is deliberately standalone - stdlib only, no asyncio, no bleak,
+no imports from anywhere else in this package - so a service that wants
+adapter coordination WITHOUT the bleak catcher can copy this one file into
+its own tree and import it directly. The docstring above is the whole
+specification; a participant that would rather not import anything can
+follow it with ls, touch and cat. If you copy this file, record the commit
+you took it from, so a convention bump can be traced.
 """
 
 import logging

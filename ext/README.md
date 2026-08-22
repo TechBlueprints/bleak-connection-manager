@@ -37,24 +37,3 @@ shared-install stack served by /data/bcm.
 
 Per the standing rule, both pin UPSTREAM commits - never TechBlueprints
 fork branches. Bump pins deliberately, one at a time, with a fleet soak.
-
-## bt_claims.py
-
-The bt-claims reference implementation, vendored for anyone who wants the
-plain adapter-claims coordination (`/run/bt-claims` file convention) without
-adopting this package's bleak catcher stack — copy the one file, or import
-it from here; it is stdlib-only with no dependencies on this repository.
-
-- Source: https://github.com/TechBlueprints/bt-claims
-  (local: /Users/clint/techblueprints/bt-claims), commit 5ceb50a,
-  version 0.4.0, license MIT (see BT_CLAIMS_LICENSE).
-- Do not edit this copy; fix things upstream and re-vendor.
-
-As of 0.4 the upstream `bt_claims.py`, this vendored copy, and
-`bleak_connection_manager.claims` in this package are **byte-identical** —
-one implementation of the full convention (MAC-keyed adapter identity,
-scan claims, qualified soft claims, `link.<k>` slots, `drain` claims,
-`claims()` snapshot, `foreign_use`/`own_use`, heartbeat validity checks,
-the `on_beat` hook),
-published under two module names. Import whichever name
-suits your tree; keep all three in lockstep when re-vendoring.

@@ -291,10 +291,17 @@ claim = manager.claim_hard("hci0")     # exclusive scan claim, or None
 adapter, soft = manager.choose(["hci0", "hci1"])  # ranked placement
 ```
 
-The upstream bt-claims reference library (convention 0.1) is also vendored
-verbatim in [`ext/bt_claims.py`](ext/bt_claims.py) for anyone who wants the
-plain claims coordination without adopting any of this package — see
-[`ext/README.md`](ext/README.md) for provenance.
+**Using the claims layer on its own.** This repository is the single home
+of the convention and its reference implementation — there is no separate
+library to track. [`claims.py`](src/bleak_connection_manager/claims.py) is
+one stdlib-only file with no imports from anywhere else in this package
+(no bleak, no asyncio, no project imports), and the module docstring is
+the complete specification. Any service that wants adapter coordination
+without adopting the bleak catcher can copy that one file into its own
+tree and import it directly, or participate at the file level with nothing
+but `ls`, `touch` and `cat` — a shell script is a legitimate participant.
+Copies should record the commit they came from, so a convention bump can
+be traced.
 
 ## Deployment: the shared install (Venus OS)
 
