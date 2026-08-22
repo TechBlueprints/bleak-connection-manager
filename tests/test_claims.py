@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for the bt-claims convention implementation (0.2: link slots added).
+"""Tests for the claims convention implementation (0.4: MAC-keyed adapters).
 
 The first block is the bt-claims 0.1 reference suite, ported; the second
 covers the 0.2 additions - numbered exclusive link slots, the qualified soft

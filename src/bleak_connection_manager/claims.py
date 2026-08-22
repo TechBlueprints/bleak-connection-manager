@@ -181,25 +181,63 @@ _mac_cache = {}
 _mac_cache_lock = threading.Lock()
 
 
-def _read_adapter_mac(adapter):
-    # sysfs first - but some kernels (Venus OS Cerbos among them) expose no
-    # address attribute under /sys/class/bluetooth/hciN/ at all, so fall
-    # back to parsing hciconfig, which does report BD Address there
+def _read_sysfs_mac(adapter):
+    """The adapter's MAC from sysfs, or None if the attribute is absent.
+
+    Free (no subprocess) where it exists - but Venus OS exposes no address
+    attribute for ANY adapter (field 2026-08-22: both Cerbos, all seven
+    cards on prod), which is what makes the hciconfig path below the
+    normal one rather than the fallback it looks like.
+    """
     try:
         with open(os.path.join(BT_SYSFS, str(adapter), "address")) as f:
             mac = f.read().strip().upper()
-            if mac:
-                return mac
+            return mac or None
     except OSError:
-        pass
+        return None
+
+
+def _read_hciconfig_table():
+    """{hciN: MAC} for every adapter, from ONE hciconfig call.
+
+    Bare hciconfig prints every interface, so the whole table costs one
+    process spawn instead of one per card. That matters on the deployment
+    this serves: seven adapters, no sysfs address attribute, and identity
+    resolved on every placement decision.
+    """
+    table = {}
     try:
-        result = subprocess.run(["hciconfig", str(adapter)], capture_output=True, text=True, timeout=5)
-        match = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", result.stdout)
-        if match:
-            return match.group(1).upper()
+        result = subprocess.run(["hciconfig"], capture_output=True, text=True, timeout=5)
     except Exception:
-        pass
-    return UNKNOWN_MAC
+        return table
+    current = None
+    for line in result.stdout.splitlines():
+        head = re.match(r"^(hci\d+):", line)
+        if head:
+            current = head.group(1)
+            continue
+        if current:
+            found = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", line)
+            if found:
+                table[current] = found.group(1).upper()
+                current = None
+    return table
+
+
+def _read_adapter_mac(adapter):
+    """One adapter's MAC. Fills the cache for every OTHER adapter it sees
+    on the way, since the hciconfig read costs the same either way."""
+    mac = _read_sysfs_mac(adapter)
+    if mac:
+        return mac
+    table = _read_hciconfig_table()
+    if table:
+        now = time.monotonic()
+        with _mac_cache_lock:
+            for name, found in table.items():
+                if name != adapter:
+                    _mac_cache[name] = (found, now)
+    return table.get(str(adapter), UNKNOWN_MAC)
 
 
 def adapter_mac(adapter):

@@ -101,11 +101,12 @@ def test_adapter_mac_falls_back_to_hciconfig(monkeypatch):
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        name = argv[1]
-        out = "hci1:\tType: Primary  Bus: USB\n\tBD Address: 00:11:22:33:44:55  ACL MTU: 310:10\n"
-        if name == "hci0":
-            out = "hci0:\tType: Primary  Bus: UART\n\tBD Address: 00:00:00:00:00:00  ACL MTU: 0:0\n"
-        return _FakeCompleted(out)
+        # bare hciconfig prints every interface at once
+        return _FakeCompleted(
+            "hci1:\tType: Primary  Bus: USB\n\tBD Address: 00:11:22:33:44:55  ACL MTU: 310:10\n"
+            "\n"
+            "hci0:\tType: Primary  Bus: UART\n\tBD Address: 00:00:00:00:00:00  ACL MTU: 0:0\n"
+        )
 
     monkeypatch.setattr(claims_mod, "_mac_cache", {})
     monkeypatch.setattr(claims_mod.subprocess, "run", fake_run)
@@ -120,12 +121,19 @@ def test_adapter_mac_is_cached_between_selections(monkeypatch):
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        return _FakeCompleted("hci1:\n\tBD Address: 00:11:22:33:44:55\n")
+        return _FakeCompleted(
+            "hci1:\n\tBD Address: 00:11:22:33:44:55\n"
+            "\n"
+            "hci2:\n\tBD Address: 00:11:22:33:44:66\n"
+        )
 
     monkeypatch.setattr(claims_mod, "_mac_cache", {})
     monkeypatch.setattr(claims_mod.subprocess, "run", fake_run)
     assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
     assert recovery.adapter_mac("hci1") == "00:11:22:33:44:55"
+    # the same single read already answered for the other card: seven
+    # adapters on prod must not mean seven spawns
+    assert recovery.adapter_mac("hci2") == "00:11:22:33:44:66"
     assert len(calls) == 1
 
 

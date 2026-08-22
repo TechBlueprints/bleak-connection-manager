@@ -44,6 +44,18 @@ numbering changes under a USB reset or a replug, so a MAC entry is resolved
 to whatever number the card answers to at the moment it is used, and a card
 that renumbers keeps its pins, caps and claims.
 
+**Plain `hciN` entries are accepted forever** — the vast majority of
+configuration written by users everywhere spells adapters that way, and
+nothing here deprecates it.
+
+Rewriting the config is **opt-in and off by default**, because the file
+belongs to the consumer and other code may parse it. In particular, a
+driver that keeps its own adapter parser for a non-catcher fallback path
+(the rollback other code depends on) must be taught to translate MACs
+*before* the rewrite is enabled, or that fallback breaks silently the
+first time it reads a rewritten file. Enable it only when the whole
+consumer understands MACs.
+
 Pass `adapter_config_path=` to `install_bleak_catcher` and the first
 successful read of an `hciN` entry rewrites that entry in your config file
 to the MAC it proved to be, leaving a comment above the line:
