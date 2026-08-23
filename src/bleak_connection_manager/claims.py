@@ -105,6 +105,16 @@ notification arriving, a GATT operation returning - over any cached
 connection property; caches of link state go stale precisely in the failure
 modes this convention exists to survive (field-validated twice, 2026-08).
 
+Known limit, worth stating plainly: this convention only ever sees
+processes that participate in it. A service that drives a radio some other
+way - raw HCI sockets, a C program talking to BlueZ directly, an operator
+at bluetoothctl - holds no claims and appears in no occupancy score, so
+every score on such a host is structurally blind to that use. This is not
+a gap a future adoption closes; it is the boundary of a file-convention
+approach. (Concretely, on the deployment this was built for, one service
+scans over raw HCI and is permanently invisible here.) Coordination is an
+optimization over what it can see, never a guarantee about the radio.
+
 This file is deliberately standalone - stdlib only, no asyncio, no bleak,
 no imports from anywhere else in this package - so a service that wants
 adapter coordination WITHOUT the bleak catcher can copy this one file into

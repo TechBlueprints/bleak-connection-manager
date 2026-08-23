@@ -297,6 +297,13 @@ every 30 seconds against a 30 second floor is a coin flip, not a margin. The sam
 lost while the link lived, so a polling consumer that never subscribes to
 notifications recovers on its next poll.
 
+**Known limit.** The convention only sees processes that participate in
+it. A service driving a radio another way — raw HCI sockets, a C program
+talking to BlueZ directly, someone at `bluetoothctl` — holds no claims and
+appears in no occupancy score, so scores on such a host are structurally
+blind to that use. That is the boundary of a file-convention approach, not
+something a future migration fixes.
+
 `bleak_connection_manager.claims` is deliberately standalone — stdlib only,
 no bleak, vendorable verbatim — so services that only want adapter
 coordination can use it (or copy it) without any of the bleak machinery:

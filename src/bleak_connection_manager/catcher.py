@@ -64,13 +64,20 @@ RSSI_STALE_SECONDS = RSSI_SWEEP_INTERVAL * 2 + RSSI_SWEEP_DURATION
 # within one TTL - but that floor is only right for a consumer whose
 # traffic is FASTER than it.
 #
-# A consumer whose cadence sits at or above the floor would flicker: field
-# 2026-08-23, power-watchdog's device notifies about every 30 seconds
-# against a 30 second floor, which is not a margin but a coin flip, and
-# that driver treats silence up to 120s as perfectly healthy. So the window
-# adapts: it is the floor, or a multiple of this client's own observed
-# traffic interval, whichever is larger, capped so a genuinely dead link
-# still frees its claims in bounded time. Erring toward holding a claim too
+# A consumer whose cadence sits at or above the floor would flicker rather
+# than lapse cleanly, which is the kind of thing that gets misfiled as a
+# transient for months. The case that prompted this (2026-08-23) is
+# power-watchdog: one long-lived notification session, and a driver that
+# treats silence up to its own 120s liveness timeout as healthy. Its
+# device's nominal ~30s cadence - equal to this floor, so a coin flip
+# rather than a margin - is DERIVED FROM A COMMENT IN THAT DRIVER'S
+# SOURCE, not measured: the unit was powered off and nobody has observed
+# its traffic. Which is the argument for adapting rather than picking a
+# bigger constant. The window is the floor, or a multiple of this client's
+# own observed interval once it has shown one, capped so a genuinely dead
+# link still frees its claims in bounded time - so whatever that device
+# actually does, the window is sized from it at runtime and the unverified
+# number never becomes load-bearing. Erring toward holding a claim too
 # long is the convention's stated preference - a claim wrongly held is
 # bounded by process life, a claim wrongly released overcommits the card.
 LINK_EVIDENCE_SECONDS = CLAIM_TTL
