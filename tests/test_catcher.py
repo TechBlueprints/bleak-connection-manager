@@ -2093,3 +2093,63 @@ def test_drain_steering_survives_mac_keyed_claims(env, monkeypatch):
     asyncio.run(client.connect())
 
     assert RECORDED_INITS[-1]["adapter"] == "hci4"
+
+
+def test_a_disconnect_event_during_the_handshake_keeps_the_claims(env):
+    """Field 2026-08-23 (prod shyion, 4 of 28 transient sessions): a
+    disconnected callback fires mid-handshake, before the link has ever
+    been up. Both earlier guards pass - it IS the current generation, and
+    is_connected IS False because the link is not up YET - so the claims
+    connect() had just taken were released a second before first traffic
+    re-armed them. Between the two, the numbered link slot reads free
+    while a connect is in flight on it, so a capped adapter can be
+    OVER-subscribed, not merely under-counted."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    fired = []
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        real_connect = client._backend.connect if client._backend else None
+
+        async def connect_firing_disconnect(pair, **kwargs):
+            # the event arrives while the handshake is still running
+            RECORDED_INITS[-1]["disconnected_callback"](client)
+            fired.append(True)
+            client._backend.is_connected = True
+
+        original_init = RichBleakClient.__init__
+
+        def patched_init(self, *a, **k):
+            original_init(self, *a, **k)
+            self._backend.connect = connect_firing_disconnect
+
+        RichBleakClient.__init__ = patched_init
+        try:
+            await client.connect()
+        finally:
+            RichBleakClient.__init__ = original_init
+        return client
+
+    client = asyncio.run(scenario())
+    assert fired == [True]  # the event really did fire mid-handshake
+    assert client.is_connected is True
+    held = sorted(os.listdir(env.dir))
+    assert "hci5.link.0" in held  # the slot was never surrendered
+    assert _soft_name("hci5") in held
+
+
+def test_a_failed_connect_still_releases_after_a_handshake_event(env):
+    """The in-flight guard must not leak claims when the connect then
+    fails - connect()'s own finally is what releases there."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(RuntimeError):
+            await client.connect()
+        RECORDED_INITS[-1]["disconnected_callback"](client)  # late straggler
+        return client
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []

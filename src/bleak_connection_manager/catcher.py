@@ -819,6 +819,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_last_rearm = None
         self._catcher_loop = None
         self._catcher_explicit = False
+        # the generation whose connect() is in flight right now, or 0. A
+        # disconnected event arriving while this is set describes a link
+        # that is not up yet, not one that went down.
+        self._catcher_connecting = 0
         # the adapter this client was already kicked off during a drain -
         # at most one forced migration per adapter per connect
         self._catcher_drain_kicked = None
@@ -861,7 +865,27 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # only when the wrapper's own view agrees the link is down. A
         # spurious event with the link still up releases nothing; if the
         # link really is gone, the validity heartbeat sweeps within a beat.
+        #
+        # Third guard (field 2026-08-23, prod shyion: 4 of 28 transient
+        # sessions): a disconnected event can arrive DURING the handshake,
+        # before the link has ever been up. Both guards above pass - it is
+        # genuinely the current generation, and is_connected is genuinely
+        # False because the link is not up YET - so the claims connect()
+        # just took were released a second before first traffic re-armed
+        # them. "Not up yet" is not "went down", and the difference is not
+        # visible in either of the other two tests. While connect() is in
+        # flight nothing here releases: if that connect fails, its own
+        # finally releases the claims, and if the link dies later the
+        # heartbeat sweeps it.
         def _disconnected(client):
+            if generation == self._catcher_generation and self._catcher_connecting == generation:
+                logger.debug(
+                    f"BLE [{self._catcher_address}]: disconnect event during the connect "
+                    "handshake, ignored (the link is not up yet, not down)"
+                )
+                if raw_callback is not None:
+                    raw_callback(client)
+                return
             if generation == self._catcher_generation and not self.is_connected:
                 if any(not c.released for c in self._catcher_claims):
                     # the release reason, on the record: if the next line is
@@ -1025,6 +1049,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._release_claims()
         self._catcher_generation += 1
         generation = self._catcher_generation
+        # in flight from here until connect() returns either way: the
+        # backend is constructed below and can fire its disconnected
+        # callback the moment it exists
+        self._catcher_connecting = generation
         config = _config
         self._catcher_manager = config.claims if config is not None else None
         if config is not None and config.sweeper is not None:
@@ -1059,6 +1087,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         except BaseException:
             # claims must not outlive a client that never got a backend;
             # not a radio failure, so the walk index stays put
+            self._catcher_connecting = 0
             self._release_claims()
             raise
         adapter_used = explicit or adapter
@@ -1085,6 +1114,8 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             _rotation.connect_failed(self._catcher_address)
             raise
         finally:
+            # no longer in flight, whatever the outcome
+            self._catcher_connecting = 0
             if not connected:
                 # finally, not except: a cancelled connect (asyncio timeout
                 # machinery above us) must release the claims too, and the
