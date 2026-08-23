@@ -20,7 +20,7 @@
 # stack, which was the whole point. Size is bounded by keeping only 3.
 COMM="$1"; PID="$2"; SIG="$3"
 CORES=/data/cores
-KEEP=3
+KEEP=3          # per process name, not total
 MIN_FREE_K=300000
 
 case "$COMM" in
@@ -37,5 +37,10 @@ fi
 
 OUT="$CORES/core.$COMM.$PID.sig$SIG.$(date +%s)"
 cat > "$OUT"
-ls -t "$CORES"/core.* 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do rm -f "$f"; done
+# Prune PER PROCESS NAME, not globally. A global newest-N evicts by age
+# alone, so a rare small core is displaced by common large ones - field
+# 2026-08-23: the first bluetoothd core (3.7MB, the C-only one that is by
+# far the easiest to analyse) was pruned by three python cores of 48MB
+# each within an hour of being captured.
+ls -t "$CORES"/core."$COMM".* 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do rm -f "$f"; done
 echo "$(date) captured $OUT (sig$SIG) $(wc -c < "$OUT") bytes" >> "$CORES/capture.log"
