@@ -2153,3 +2153,97 @@ def test_a_failed_connect_still_releases_after_a_handshake_event(env):
 
     asyncio.run(scenario())
     assert os.listdir(env.dir) == []
+
+
+# -- the evidence window adapts to the consumer's cadence -----------------
+
+
+def _notify_at(client, tap, monkeypatch, times):
+    """Drive notifications at given monotonic offsets."""
+    base = time.monotonic()
+    for offset in times:
+        monkeypatch.setattr(catcher, "_monotonic", lambda o=offset: base + o)
+        tap("fff4", b"\x01")
+    return base
+
+
+def test_a_thirty_second_cadence_is_not_a_coin_flip(env, monkeypatch):
+    """Field 2026-08-23: power-watchdog's device notifies about every 30s
+    against a 30s floor - the same number, so any jitter expired the
+    evidence before the traffic that would refresh it, while the driver
+    itself treats silence up to 120s as healthy."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda s, d: None)
+        return client
+
+    client = asyncio.run(scenario())
+    tap = client._backend.notify_callbacks["fff4"]
+    base = _notify_at(client, tap, monkeypatch, [0, 30, 60, 90])
+
+    client._backend.is_connected = False  # the stranded property this exists for
+    # 45s of silence: late for a 30s cadence, but far inside the driver's
+    # own 120s liveness tolerance. The old fixed floor swept here.
+    monkeypatch.setattr(catcher, "_monotonic", lambda: base + 90 + 45)
+    catcher._config.claims._beat_once()
+
+    assert len(os.listdir(env.dir)) == 2  # claims held
+
+
+def test_a_dead_link_still_frees_within_the_adapted_window(env, monkeypatch):
+    """Adapting is a grace, not immortality: past the window the sweep
+    releases exactly as before."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda s, d: None)
+        return client
+
+    client = asyncio.run(scenario())
+    tap = client._backend.notify_callbacks["fff4"]
+    base = _notify_at(client, tap, monkeypatch, [0, 30, 60])
+
+    client._backend.is_connected = False
+    monkeypatch.setattr(catcher, "_monotonic", lambda: base + 60 + catcher.LINK_EVIDENCE_MAX + 1)
+    catcher._config.claims._beat_once()
+
+    assert os.listdir(env.dir) == []
+
+
+def test_a_fast_consumer_keeps_the_floor(env, monkeypatch):
+    """A 10s poller must not have its window shrunk below the floor - the
+    adaptation only ever widens."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda s, d: None)
+        return client
+
+    client = asyncio.run(scenario())
+    tap = client._backend.notify_callbacks["fff4"]
+    _notify_at(client, tap, monkeypatch, [0, 2, 4, 6])
+
+    assert client._evidence_window() == catcher.LINK_EVIDENCE_SECONDS
+
+
+def test_the_window_is_capped(env, monkeypatch):
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.start_notify("fff4", lambda s, d: None)
+        return client
+
+    client = asyncio.run(scenario())
+    tap = client._backend.notify_callbacks["fff4"]
+    _notify_at(client, tap, monkeypatch, [0, 3600, 7200])
+
+    assert client._evidence_window() == catcher.LINK_EVIDENCE_MAX

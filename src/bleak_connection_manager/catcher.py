@@ -57,11 +57,25 @@ RSSI_SWEEP_INTERVAL = 300.0
 RSSI_SWEEP_DURATION = 10.0
 RSSI_STALE_SECONDS = RSSI_SWEEP_INTERVAL * 2 + RSSI_SWEEP_DURATION
 
-# Notifications are proof the link is alive whatever bleak's connected flag
-# says (field 2026-08-21: a broken D-Bus view read disconnected while data
-# flowed). Evidence goes stale on the same bound the claim convention uses
-# for its own liveness, so a silently dead link is swept within one TTL.
+# Notifications and completed GATT calls are proof the link is alive
+# whatever bleak's connected flag says (field 2026-08-21: a broken D-Bus
+# view read disconnected while data flowed). Evidence goes stale on the
+# claim convention's own liveness bound, so a silently dead link is swept
+# within one TTL - but that floor is only right for a consumer whose
+# traffic is FASTER than it.
+#
+# A consumer whose cadence sits at or above the floor would flicker: field
+# 2026-08-23, power-watchdog's device notifies about every 30 seconds
+# against a 30 second floor, which is not a margin but a coin flip, and
+# that driver treats silence up to 120s as perfectly healthy. So the window
+# adapts: it is the floor, or a multiple of this client's own observed
+# traffic interval, whichever is larger, capped so a genuinely dead link
+# still frees its claims in bounded time. Erring toward holding a claim too
+# long is the convention's stated preference - a claim wrongly held is
+# bounded by process life, a claim wrongly released overcommits the card.
 LINK_EVIDENCE_SECONDS = CLAIM_TTL
+LINK_EVIDENCE_MULTIPLE = 3.0
+LINK_EVIDENCE_MAX = 300.0
 
 # Ceiling on the courtesy disconnect of a link that failed validation: it is
 # already known bad, so waiting on BlueZ past this costs the caller's retry
@@ -816,6 +830,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # re-arm claims
         self._catcher_settled = True
         self._catcher_last_evidence = None
+        # smoothed interval between this client's traffic events, sizing the
+        # evidence window to the cadence it actually shows
+        self._catcher_traffic_gap = None
         self._catcher_last_rearm = None
         self._catcher_loop = None
         self._catcher_explicit = False
@@ -902,9 +919,20 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
 
         return _disconnected
 
+    def _evidence_window(self):
+        """How long this client's silence stays consistent with a live link.
+
+        The floor for a consumer that has not shown its cadence yet, and a
+        multiple of its own observed traffic interval once it has.
+        """
+        gap = self._catcher_traffic_gap
+        if not gap:
+            return LINK_EVIDENCE_SECONDS
+        return min(LINK_EVIDENCE_MAX, max(LINK_EVIDENCE_SECONDS, gap * LINK_EVIDENCE_MULTIPLE))
+
     def _recent_link_evidence(self):
         stamp = self._catcher_last_evidence
-        return stamp is not None and _monotonic() - stamp <= LINK_EVIDENCE_SECONDS
+        return stamp is not None and _monotonic() - stamp <= self._evidence_window()
 
     def _arm_claim_validity(self):
         # Backstop for the release paths: once the connection is up, its
@@ -951,7 +979,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         return _notify
 
     def _note_link_evidence(self):
-        self._catcher_last_evidence = _monotonic()
+        now = _monotonic()
+        previous = self._catcher_last_evidence
+        if previous is not None:
+            # smoothed rather than last-gap, so one late notification does
+            # not swing the window, and one early one does not shrink it
+            gap = now - previous
+            current = self._catcher_traffic_gap
+            self._catcher_traffic_gap = gap if current is None else (current * 0.7 + gap * 0.3)
+        self._catcher_last_evidence = now
         if self._catcher_settled or self._backend is None:
             return
         if any(not claim.released for claim in self._catcher_claims):
@@ -1047,6 +1083,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # and opens a new generation: stale disconnect events from the
         # backend being replaced lose their power to release
         self._release_claims()
+        # a new session measures its own cadence: a gap spanning the previous
+        # session would size the window off an idle period, not traffic
+        self._catcher_last_evidence = None
+        self._catcher_traffic_gap = None
         self._catcher_generation += 1
         generation = self._catcher_generation
         # in flight from here until connect() returns either way: the

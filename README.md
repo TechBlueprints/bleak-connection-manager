@@ -287,7 +287,13 @@ released if the link is gone, so a torn-down D-Bus watch or an abandoned
 client frees its slot within a TTL instead of at process exit. Link truth
 is *observed traffic* — a notification arriving, or a `read_gatt_char` /
 `write_gatt_char` returning — which outvotes a `is_connected` that reads
-False on a broken D-Bus view. The same signal re-acquires claims that were
+False on a broken D-Bus view. How long silence stays consistent with a
+live link **adapts to each connection's own cadence**: the floor is the
+claim TTL, but a client whose traffic interval approaches or exceeds that
+gets a window sized from what it actually does (capped, so a genuinely
+dead link still frees its claims in bounded time). A fixed floor would
+flicker for exactly the consumers that need it most — a device notifying
+every 30 seconds against a 30 second floor is a coin flip, not a margin. The same signal re-acquires claims that were
 lost while the link lived, so a polling consumer that never subscribes to
 notifications recovers on its next poll.
 
