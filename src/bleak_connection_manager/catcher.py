@@ -84,6 +84,11 @@ LINK_EVIDENCE_SECONDS = CLAIM_TTL
 LINK_EVIDENCE_MULTIPLE = 3.0
 LINK_EVIDENCE_MAX = 300.0
 
+# Ceiling on closing a previous connection's D-Bus connection before
+# reconnecting. Bounded because a wedged predecessor must not block the
+# reconnect the caller actually asked for.
+BACKEND_RETIRE_TIMEOUT = 10.0
+
 # Ceiling on the courtesy disconnect of a link that failed validation: it is
 # already known bad, so waiting on BlueZ past this costs the caller's retry
 # budget for nothing (v1's DISCONNECT_TIMEOUT).
@@ -1100,6 +1105,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # backend is constructed below and can fire its disconnected
         # callback the moment it exists
         self._catcher_connecting = generation
+        # after the generation bump, so the retiring backend's own
+        # disconnected callback is already neutered and cannot release the
+        # claims this connect is about to take
+        await self._retire_previous_backend()
         config = _config
         self._catcher_manager = config.claims if config is not None else None
         if config is not None and config.sweeper is not None:
@@ -1201,6 +1210,43 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         if callable(callback):
             callback = self._make_notify_tap(callback)
         return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
+
+    async def _retire_previous_backend(self):
+        """Close the D-Bus connection a previous connect left open.
+
+        bleak's BlueZ client opens its OWN system-bus connection per
+        connection session ("Each BLE connection session needs a new D-Bus
+        connection to avoid a BlueZ quirk") and closes it in exactly one
+        place: disconnect(). What runs when a link drops on its own is
+        _cleanup_all(), which removes the device watcher and clears the
+        service cache but leaves the bus connected - despite promising in
+        its docstring to free "all otherwise leaked resources".
+
+        This wrapper re-runs the real __init__ on every connect, so a
+        reconnect that did not pass through disconnect() dropped the
+        previous backend on the floor with its bus still attached: one
+        leaked system-bus connection per reconnect cycle, against dbus's
+        per-user ceiling of 256. Field 2026-08-24: a driver retrying one
+        unreachable thermostat reached 148 connections and saturated the
+        system bus for every process running as root - no new connection
+        for any of them, for eight hours.
+
+        A failed connect does not reach here: its own finally clears the
+        backend, and bleak's AsyncExitStack closes the bus on that path
+        (only the success path calls stack.pop_all()).
+        """
+        if self._backend is None:
+            return
+        try:
+            await asyncio.wait_for(_ORIGINAL_BLEAK_CLIENT.disconnect(self), timeout=BACKEND_RETIRE_TIMEOUT)
+        except Exception:
+            # a wedged predecessor must never block the reconnect that is
+            # the caller's actual request
+            logger.debug(
+                f"BLE [{self._catcher_address}]: retiring the previous backend raised",
+                exc_info=True,
+            )
+        self._backend = None
 
     async def _gatt_traffic(self, coro):
         # A completed GATT exchange is the link's proof of life exactly as a

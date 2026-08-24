@@ -43,6 +43,7 @@ class _RichBackend:
         self.adapter = adapter
         self.address = address
         self.is_connected = False
+        self.disconnects = 0
         self.notify_callbacks = {}
 
     async def connect(self, pair, **kwargs):
@@ -52,6 +53,7 @@ class _RichBackend:
         self.is_connected = True
 
     async def disconnect(self):
+        self.disconnects += 1
         self.is_connected = False
 
     async def start_notify(self, char_specifier, callback, **kwargs):
@@ -2247,3 +2249,70 @@ def test_the_window_is_capped(env, monkeypatch):
     _notify_at(client, tap, monkeypatch, [0, 3600, 7200])
 
     assert client._evidence_window() == catcher.LINK_EVIDENCE_MAX
+
+
+def test_a_reconnect_retires_the_previous_backend(env):
+    """Field 2026-08-24, prod: bleak's BlueZ client owns a private system-bus
+    connection per session and closes it ONLY in disconnect() - the
+    _cleanup_all() that runs when a link drops leaves it attached. This
+    wrapper re-runs the real __init__ on every connect, so a reconnect that
+    did not pass through disconnect() orphaned the previous backend WITH its
+    bus: one leaked connection per retry, against a per-user ceiling of 256.
+    One driver retrying an unreachable device reached 148 and saturated the
+    system bus for every root process on the box."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        first = client._backend
+        assert first.disconnects == 0
+        # the link drops on its own - no disconnect() call anywhere - and the
+        # consumer's retry loop simply connects again on the same client
+        first.is_connected = False
+        await client.connect()
+        return first, client._backend
+
+    first, second = asyncio.run(scenario())
+    assert first is not second           # a new backend, as the design intends
+    assert first.disconnects == 1        # and the old one was closed, not orphaned
+
+
+def test_retiring_a_wedged_backend_does_not_block_the_reconnect(env, monkeypatch):
+    """A predecessor that will not close must never cost the caller the
+    reconnect it actually asked for."""
+    env.install(adapters=("hci5",))
+    monkeypatch.setattr(catcher, "BACKEND_RETIRE_TIMEOUT", 0.05)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        client._backend.disconnect = never_returns
+        await client.connect()          # must still complete
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True
+
+
+def test_a_failed_connect_does_not_reach_the_retire_path(env):
+    """bleak closes the bus itself on a failed connect (only the success path
+    calls stack.pop_all()), and our finally clears the backend - so there is
+    nothing to retire and no double disconnect."""
+    env.install(adapters=("hci5",))
+    CONNECT_RESULTS.append(RuntimeError("boom"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(RuntimeError):
+            await client.connect()
+        assert client._backend is None
+        await client.connect()
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True
