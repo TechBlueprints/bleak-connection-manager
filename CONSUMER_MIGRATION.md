@@ -82,7 +82,23 @@ Two acceptable resolutions, and you should pick one deliberately:
   installer failure and refuse to start, so a broken convergence is loud
   rather than a downgrade.
 
-What is not acceptable is a fail-soft fallback nobody updates.
+What is not acceptable is a fail-soft fallback nobody updates. If you take
+the first option, prefer a *mechanism* over a promise: have the installer
+compare the two shas after converging and report when the vendored copy is
+an ancestor, with the distance and what it costs. Report only *behind* —
+ahead or diverged is a deliberate pin, and warning on it trains people to
+ignore the line.
+
+One thing to expect if you build that check: **you will not be able to
+provoke it by hand on a box.** A `git submodule update --init` earlier in
+the same installer undoes any staling you do to the working tree before
+the comparison runs. That is correct — the question is whether the repo's
+*pin* lags the shared checkout, not whether someone poked the tree — but
+it means the warning cannot be demonstrated live, and an implementer may
+wrongly conclude it does not work. Cover it with a test that builds two
+clones of one history at different points and asserts all four cases:
+behind warns with the distance, in-step and ahead stay silent, and a
+missing vendored tree is tolerated rather than an error.
 
 If the repo must stay runnable standalone for third parties, keep a
 vendored set and defer to whatever the interpreter already provides. The

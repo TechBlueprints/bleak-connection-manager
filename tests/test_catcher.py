@@ -12,6 +12,27 @@ the stub classes regardless of what the environment has installed.
 Foreign processes are simulated with pid-1 claim files (kill(1, 0) raises
 PermissionError, which counts as alive); stale ones with a dead pid and an
 aged mtime.
+
+A standing question for anything added here, because this suite has twice
+been green over a live defect for the same underlying reason: WHAT FACT IS
+THIS ASSERTION RESTING ON, AND DOES PRODUCTION SUPPLY THAT FACT?
+
+- Adapter identity (2026-08-22): claims are keyed by a card's MAC and the
+  catcher works in hciN, so every lookup crosses that boundary. The tests
+  run where no MAC is readable, so adapter_key("hci5") degraded to "hci5"
+  and both sides of every comparison agreed - for a reason unrelated to
+  correctness. Seven raw lookups were broken on every real box. Tests that
+  cross that boundary must use MACs that actually resolve (_kernel_adapters).
+- Cancellation (2026-08-25): cleanup placed after an await is skipped when
+  a CancelledError passes through `except Exception`. Every test exercised
+  the RAISING path, which is the one where that handler works, so the hole
+  opened exactly where the tests did not look. Cancellation tests must
+  assert on the CLEANUP, never on the exception - asserting that
+  CancelledError propagates passes against broken and fixed code alike.
+
+Both were found from outside this repo, by people standing where the fact
+was visible. A new test earns its keep by failing against the code before
+the fix; run it that way before trusting it.
 """
 
 import asyncio
