@@ -306,13 +306,27 @@ def present_hci_names():
     return sorted(names, key=lambda n: int(n[3:]))
 
 
-def hci_for(adapter):
+def hci_for(adapter, fresh=True):
     """The hciN name an adapter currently answers to, or None.
 
     hciN in, the same name back (it IS the current numbering). A MAC in -
-    in any spelling - the card carrying it right now, which is the whole
-    point: config and claim files name the card, and the number is looked
-    up at use time.
+    in any spelling - the card carrying it RIGHT NOW, resolved against the
+    live numbering rather than a cached mapping.
+
+    Fresh by default, and deliberately: naming a card by its MAC is a
+    statement that its number may change, so a caller asking this question
+    has no use for a stale answer. The hazard is not theoretical - a
+    consumer resolving a MAC here to open a RAW HCI SOCKET on the result
+    could, within one cache TTL, have programmed a scan onto whatever card
+    had since inherited the number.
+
+    Pass fresh=False only where the caller has already refreshed, or where
+    staleness is genuinely tolerable, because the refill costs one
+    hciconfig call on a host with no sysfs address attribute (about 11ms on
+    a Cerbo, against ~19us cached). Both in-tree users do exactly that:
+    the catcher refreshes ONCE for a whole configured list rather than per
+    entry, and legacy_key is a pre-0.4 compatibility lookup where a stale
+    number costs at most a briefly missed legacy claim.
     """
     text = str(adapter).strip()
     if _HCI_RE.match(text):
@@ -320,6 +334,10 @@ def hci_for(adapter):
     key = mac_key(text)
     if key is None:
         return None
+    if fresh:
+        # the next adapter_mac below refills the whole table in one call,
+        # so this costs one subprocess rather than one per adapter
+        invalidate_adapter_mac()
     for name in present_hci_names():
         mac = adapter_mac(name)
         if mac != UNKNOWN_MAC and mac.replace(":", "").upper() == key:
@@ -392,7 +410,9 @@ def legacy_key(adapter):
     Read-side compatibility: a process still running convention 0.3 names
     its claims hciN.*, and this fleet updates one service at a time.
     """
-    name = hci_for(adapter)
+    # fresh=False: a stale number here costs at most a briefly missed
+    # pre-0.4 claim, and this runs on every claim-name construction
+    name = hci_for(adapter, fresh=False)
     if name is None:
         return None
     return name if name != adapter_key(adapter) else None

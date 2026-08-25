@@ -290,7 +290,10 @@ def _resolve_adapter_entry(entry):
     key = claims.mac_key(text)
     if key is None:
         return text  # an hciN name (or something the kernel will reject)
-    return claims.hci_for(text)
+    # fresh=False because _resolve_entries has already refreshed once for
+    # the whole list - resolving each entry fresh would cost one hciconfig
+    # call per configured adapter instead of one per placement
+    return claims.hci_for(text, fresh=False)
 
 
 def _resolve_entries(entries):

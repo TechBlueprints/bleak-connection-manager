@@ -563,3 +563,51 @@ def test_distinct_addresses_are_unaffected_by_the_guard(tmp_path, monkeypatch):
 
     assert claims.adapter_key("hci1") == "001A7DDA7105"
     assert claims.adapter_key("hci2") == "001A7DDA7106"
+
+
+def test_hci_for_is_fresh_by_default(tmp_path, monkeypatch):
+    """A direct caller resolving a MAC to open a raw HCI socket on the
+    result must not be handed a cached number: within one TTL that would
+    program a scan onto whatever card had inherited it. Reported by the
+    sensors-py session, whose own docstring already required this and whose
+    backend did not supply it."""
+    live = {"hci3": "AA:BB:CC:DD:EE:FF", "hci4": "11:22:33:44:55:66"}
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "present_hci_names", lambda: sorted(live))
+    monkeypatch.setattr(claims, "_read_adapter_mac", lambda a: live.get(a, claims.UNKNOWN_MAC))
+
+    assert claims.hci_for("AA:BB:CC:DD:EE:FF") == "hci3"   # populates the cache
+    live["hci3"], live["hci4"] = "11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"
+
+    # no TTL expiry, no manual invalidation - the card renumbered and the
+    # very next resolution must follow it
+    assert claims.hci_for("AA:BB:CC:DD:EE:FF") == "hci4"
+
+
+def test_hci_for_honours_an_explicit_opt_out(tmp_path, monkeypatch):
+    """fresh=False is for callers that already refreshed, or that can
+    tolerate staleness - it must actually use the cache, or the catcher
+    would pay one hciconfig call per configured adapter."""
+    live = {"hci3": "AA:BB:CC:DD:EE:FF"}
+    reads = []
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "present_hci_names", lambda: sorted(live))
+
+    def counted(a):
+        reads.append(a)
+        return live.get(a, claims.UNKNOWN_MAC)
+
+    monkeypatch.setattr(claims, "_read_adapter_mac", counted)
+
+    assert claims.hci_for("AA:BB:CC:DD:EE:FF") == "hci3"
+    before = len(reads)
+    assert claims.hci_for("AA:BB:CC:DD:EE:FF", fresh=False) == "hci3"
+    assert len(reads) == before          # served from cache, no new read
+
+
+def test_an_hci_name_costs_nothing_to_resolve(monkeypatch):
+    """There is nothing to resolve for a number, so it must not refresh."""
+    monkeypatch.setattr(claims, "_mac_cache", {})
+    monkeypatch.setattr(claims, "_read_adapter_mac",
+                        lambda a: (_ for _ in ()).throw(AssertionError("should not read")))
+    assert claims.hci_for("hci7") == "hci7"
