@@ -63,6 +63,27 @@ KEEP service-specific deps (aiobmsble, velib_python, etc.). Remove the
 path. Keep the `install_bleak_catcher(...)` call exactly as it is — owner,
 adapters, link_caps, validators all unchanged.
 
+**If you keep a vendored fallback, keep it CURRENT.** This is the trap
+worth spelling out, found the hard way (2026-08-25): a consumer whose
+installer treats convergence as non-fatal — fetch fails, smoke import
+fails, log it and carry on with the vendored copy — has built a path that
+is taken *precisely when something has already gone wrong*. If that
+vendored copy is pinned at some older commit, the box quietly runs the old
+stack **as a consequence of the failure**, and the bug you shipped a fix
+for is live again on the one box that just told you it was unhealthy. The
+fallback is not a safety net if it is stale; it is a silent downgrade.
+
+Two acceptable resolutions, and you should pick one deliberately:
+
+- **Keep both paths current** — bump the vendored copy whenever you bump
+  the shared checkout, so either path carries the same fixes. Preferred
+  when the repo must stay runnable standalone.
+- **Make convergence fatal** — treat a failed fetch or smoke import as an
+  installer failure and refuse to start, so a broken convergence is loud
+  rather than a downgrade.
+
+What is not acceptable is a fail-soft fallback nobody updates.
+
 If the repo must stay runnable standalone for third parties, keep a
 vendored set and defer to whatever the interpreter already provides. The
 reference pattern (contributed from dbus-easytouchrv's migration, the first
