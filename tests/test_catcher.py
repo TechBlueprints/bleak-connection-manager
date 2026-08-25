@@ -33,6 +33,17 @@ THIS ASSERTION RESTING ON, AND DOES PRODUCTION SUPPLY THAT FACT?
 Both were found from outside this repo, by people standing where the fact
 was visible. A new test earns its keep by failing against the code before
 the fix; run it that way before trusting it.
+
+The same shape shows up in production predicates, not just in tests, and
+it is worth a name: THE ADJACENT PREDICATE - a check that is correct about
+something true and nearby, but not about the thing that matters. It is
+harder to spot than a wrong check, because reading it confirms the intent
+while the code answers a different question. The scan claim's validity was
+`ref() is not None`: a true and useful test of "has this scanner been
+collected", written for an abandoned scanner nobody can stop, silently
+standing in for "is a scan running" - so a finished scan went on claiming
+an exclusive card forever (2026-08-25). Ask what question the predicate
+answers, then ask whether that is the question you meant.
 """
 
 import asyncio
