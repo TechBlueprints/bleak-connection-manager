@@ -89,6 +89,11 @@ LINK_EVIDENCE_MAX = 300.0
 # reconnect the caller actually asked for.
 BACKEND_RETIRE_TIMEOUT = 10.0
 
+# Ceiling on waiting for an orphaned per-session D-Bus connection to finish
+# closing. The socket is already released by the synchronous disconnect();
+# this only waits for the acknowledgement, so it is bounded tightly.
+ORPHAN_BUS_TIMEOUT = 2.0
+
 # Ceiling on the courtesy disconnect of a link that failed validation: it is
 # already known bad, so waiting on BlueZ past this costs the caller's retry
 # budget for nothing (v1's DISCONNECT_TIMEOUT).
@@ -1211,6 +1216,66 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             callback = self._make_notify_tap(callback)
         return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
 
+    async def _close_orphaned_bus(self):
+        """Close a per-session D-Bus connection bleak left attached.
+
+        bleak's disconnect() closes the bus in three statements that sit
+        AFTER its try/finally, so anything raising inside skips them:
+
+            try:
+                if self.is_connected:
+                    reply = await self._bus.call(... "Disconnect" ...)
+                    assert_reply(reply)          # raises: "Not connected"
+                    async with async_timeout(10):
+                        await self._disconnecting_event.wait()
+            finally:
+                self._disconnecting_event = None  # clears only this
+            self._bus.disconnect()                # skipped when it raised
+            await self._bus.wait_for_disconnect()
+            self._bus = None
+
+        Disconnecting from a peer that is already gone is the common case -
+        BlueZ answers Disconnect with org.bluez.Error.Failed "Not connected"
+        and assert_reply turns that into an exception - and a slow or
+        cancelled teardown strands it the same way. _cleanup_all() does not
+        recover it: it removes the device watcher and clears the service
+        cache but never touches _bus, despite promising to free "all
+        otherwise leaked resources". So the connection survives with nothing
+        referencing it, against dbus's per-user ceiling of 256.
+
+        Nulling _bus afterwards matters as much as closing it: bleak's own
+        `if self._bus is None` guards then see the session as closed, so a
+        later disconnect() is a clean no-op rather than a second attempt on
+        a dead socket. Everything is getattr-guarded, so a bleak that fixes
+        or renames this degrades to a no-op rather than breaking.
+
+        Field 2026-08-24 (cerbo): one wedged thermostat retrying every 900s
+        leaked exactly one connection and one fd per attempt, permanently,
+        until the bus hit its ceiling and every root process on the box was
+        refused a connection.
+        """
+        backend = self._backend
+        bus = getattr(backend, "_bus", None) if backend is not None else None
+        if bus is None:
+            return False
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(bus.wait_for_disconnect(), timeout=ORPHAN_BUS_TIMEOUT)
+        except Exception:
+            pass
+        try:
+            backend._bus = None
+        except Exception:
+            pass
+        logger.info(
+            f"BLE [{self._catcher_address}]: closed a D-Bus connection bleak left attached "
+            "after an incomplete disconnect"
+        )
+        return True
+
     async def _retire_previous_backend(self):
         """Close the D-Bus connection a previous connect left open.
 
@@ -1246,6 +1311,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 f"BLE [{self._catcher_address}]: retiring the previous backend raised",
                 exc_info=True,
             )
+        # and whether it raised or not, bleak may have left the session's
+        # own bus attached - swallowing the exception above without this
+        # would tidy the reference away and leak the connection
+        await self._close_orphaned_bus()
         self._backend = None
 
     async def _gatt_traffic(self, coro):
@@ -1285,6 +1354,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         try:
             return await _ORIGINAL_BLEAK_CLIENT.disconnect(self)
         finally:
+            # the raising path through bleak's disconnect() skips its own
+            # bus teardown; the exception still propagates to the caller,
+            # it just no longer takes a system-bus connection with it
+            await self._close_orphaned_bus()
             self._release_claims()
 
 

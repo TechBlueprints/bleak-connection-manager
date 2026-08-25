@@ -38,12 +38,27 @@ RECORDED_SCANNER_INITS = []
 GATT_RESULTS = []
 
 
+class _FakeBus:
+    """Stands in for the per-session dbus-fast MessageBus bleak opens."""
+
+    def __init__(self):
+        self.connected = True
+
+    def disconnect(self):
+        self.connected = False
+
+    async def wait_for_disconnect(self):
+        return None
+
+
 class _RichBackend:
     def __init__(self, adapter, address):
         self.adapter = adapter
         self.address = address
         self.is_connected = False
         self.disconnects = 0
+        self.disconnect_error = None
+        self._bus = _FakeBus()
         self.notify_callbacks = {}
 
     async def connect(self, pair, **kwargs):
@@ -54,7 +69,15 @@ class _RichBackend:
 
     async def disconnect(self):
         self.disconnects += 1
+        if self.disconnect_error is not None:
+            # bleak's real disconnect() closes its bus in statements AFTER
+            # the try/finally, so a raise here leaves _bus attached
+            raise self.disconnect_error
         self.is_connected = False
+        bus = getattr(self, "_bus", None)
+        if bus is not None:
+            bus.disconnect()
+            self._bus = None
 
     async def start_notify(self, char_specifier, callback, **kwargs):
         self.notify_callbacks[char_specifier] = callback
@@ -2316,3 +2339,79 @@ def test_a_failed_connect_does_not_reach_the_retire_path(env):
 
     client = asyncio.run(scenario())
     assert client.is_connected is True
+
+
+def test_a_raising_disconnect_does_not_strand_its_dbus_connection(env):
+    """Field 2026-08-24, fleet-wide: bleak closes the session bus in three
+    statements AFTER its try/finally, so a Disconnect that answers
+    "Not connected" - the ordinary case when the peer is already gone -
+    skips them and strands the connection. _cleanup_all never recovers it.
+    One leaked connection per failed disconnect, against a ceiling of 256."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        bus = client._backend._bus
+        client._backend.disconnect_error = RuntimeError("[org.bluez.Error.Failed] Not connected")
+        with pytest.raises(RuntimeError):
+            await client.disconnect()      # the error still reaches the caller
+        return bus, client._backend
+
+    bus, backend = asyncio.run(scenario())
+    assert bus.connected is False          # closed rather than stranded
+    assert backend._bus is None            # and bleak's own guards see it closed
+
+
+def test_a_raising_disconnect_during_retirement_is_also_closed(env):
+    """The same defect on the reconnect path, where the exception is
+    swallowed - tidying the reference away without closing the bus would
+    leak it silently, which is worse than the raise."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        first = client._backend
+        bus = first._bus
+        first.disconnect_error = RuntimeError("[org.bluez.Error.Failed] Not connected")
+        first.is_connected = False
+        await client.connect()             # reconnect retires the predecessor
+        return bus, first
+
+    bus, first = asyncio.run(scenario())
+    assert bus.connected is False
+    assert first._bus is None
+
+
+def test_a_clean_disconnect_leaves_nothing_to_close(env):
+    """When bleak completes its own teardown the helper is a no-op - it must
+    not double-close or log on the ordinary path."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        bus = client._backend._bus
+        await client.disconnect()
+        return bus, client._backend
+
+    bus, backend = asyncio.run(scenario())
+    assert bus.connected is False
+    assert backend._bus is None
+
+
+def test_the_helper_degrades_when_bleak_has_no_such_attribute(env):
+    """getattr-guarded throughout: a bleak that fixes or renames this must
+    make the helper a no-op, not an error."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        del client._backend._bus
+        assert await client._close_orphaned_bus() is False
+        await client.disconnect()
+        return True
+
+    assert asyncio.run(scenario()) is True
