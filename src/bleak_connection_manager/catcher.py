@@ -1541,6 +1541,9 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_start_time = 0.0
         self._catcher_watchdog = None
         self._catcher_restarting = False
+        # True only between a successful start() and stop(); the hard scan
+        # claim is valid for exactly this window
+        self._catcher_scanning = False
         self._catcher_tasks = set()
         self._catcher_loop = None
         self._catcher_explicit = False
@@ -1558,14 +1561,26 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             claim.release()
 
     def _arm_claim_validity(self):
-        # an abandoned running scanner can never be stopped by its owner:
-        # when the wrapper is collected, the scan claim frees itself on the
-        # next heartbeat rather than marking the card scanning forever
+        # The hard claim says "I am scanning here, use another card", so it
+        # must be valid for exactly as long as that is true. Two ways it
+        # stops being true: the wrapper is collected without anyone calling
+        # stop() (an abandoned running scanner its owner can no longer
+        # stop), or the scan simply ended. Keying validity on the object's
+        # existence alone covered only the first, so a scanner that was
+        # started, finished, and is still referenced went on announcing an
+        # exclusive scan indefinitely - field 2026-08-25: a single 12s
+        # discovery held a shared card's .scan claim for minutes afterwards,
+        # steering every other process off a card nobody was scanning on.
         claim = self._catcher_claim
         if claim is None:
             return
         ref = weakref.ref(self)
-        claim.validity = lambda: ref() is not None
+
+        def _still_scanning():
+            scanner = ref()
+            return scanner is not None and scanner._catcher_scanning
+
+        claim.validity = _still_scanning
 
     def _make_detection_callback(self, raw_callback):
         # every advertisement stamps the liveness clock the watchdog reads -
@@ -1703,6 +1718,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 self._release_scan_claim()
                 self._backend = None
         _scan_finished(explicit or adapter, True)
+        self._catcher_scanning = True
         self._catcher_adapter = explicit or adapter
         self._catcher_explicit = bool(explicit)
         self._catcher_drain_kicked = None
@@ -1731,7 +1747,11 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
 
     async def stop(self):
         self._cancel_watchdog()
+        self._catcher_scanning = False
         if self._backend is None:
+            # nothing to stop, but a claim may still be held - releasing it
+            # is the whole point of being asked to stop
+            self._release_scan_claim()
             return
         try:
             return await _ORIGINAL_BLEAK_SCANNER.stop(self)

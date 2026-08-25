@@ -2588,3 +2588,73 @@ def test_hci_entries_pay_nothing_for_the_fresh_resolve(env, monkeypatch):
     asyncio.run(client.connect())
 
     assert calls == []
+
+
+def test_a_finished_scan_stops_holding_its_hard_claim(env):
+    """Field 2026-08-25: a single 12s discovery held a SHARED card's .scan
+    claim for minutes after the discovery ended, announcing an exclusive
+    scan on a card nobody was scanning on and steering every other process
+    off it. The claim says "I am scanning here" and must be valid for
+    exactly as long as that is true."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert os.listdir(env.dir) == ["hci5.scan"]
+        await scanner.stop()
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []          # released with the activity
+    assert scanner._catcher_scanning is False  # and the scanner is still alive
+
+
+def test_a_stopped_but_referenced_scanner_is_swept(env):
+    """The backstop for the same thing: even if a release were missed, the
+    heartbeat must not keep refreshing a claim for a scan that has ended.
+    Keying validity on the object's existence covered only collection."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        claim = scanner._catcher_claim
+        # simulate the release being missed while the scan itself has ended
+        scanner._catcher_scanning = False
+        return scanner, claim
+
+    scanner, claim = asyncio.run(scenario())
+    assert claim.validity() is False
+    catcher._config.claims._beat_once()
+    assert os.listdir(env.dir) == []          # swept, not refreshed forever
+
+
+def test_stop_releases_the_claim_even_with_no_backend(env):
+    """stop() early-returned before releasing when there was no backend to
+    stop - releasing is the whole point of being asked to stop."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        scanner._backend = None               # nothing left to stop
+        await scanner.stop()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []
+
+
+def test_a_running_scan_keeps_its_claim(env):
+    """The guard must not over-fire: a scan that IS running keeps saying so."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        catcher._config.claims._beat_once()
+        held = os.listdir(env.dir)
+        await scanner.stop()
+        return held
+
+    assert asyncio.run(scenario()) == ["hci5.scan"]
