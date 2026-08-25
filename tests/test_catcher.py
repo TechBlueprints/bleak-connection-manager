@@ -2410,7 +2410,7 @@ def test_the_helper_degrades_when_bleak_has_no_such_attribute(env):
         client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
         await client.connect()
         del client._backend._bus
-        assert await client._close_orphaned_bus() is False
+        assert client._close_orphaned_bus() is False
         await client.disconnect()
         return True
 
@@ -2467,3 +2467,57 @@ def test_fd_exhaustion_is_also_not_the_radios_fault(env):
 
     asyncio.run(scenario())
     assert catcher._connect_failures == {}
+
+
+def test_a_cancelled_disconnect_still_closes_the_bus_and_releases_claims(env):
+    """The path that leaks most reliably. A cancelled disconnect never
+    reaches bleak's own bus teardown, and if our cleanup sat behind an
+    await it would not run either: CancelledError is a BaseException, so
+    `except Exception` does not catch it and anything sequenced after the
+    await is skipped. Both our steps are synchronous for that reason.
+    (Raised by the sensors-py session, whose fix is synchronous too.)"""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        bus = client._backend._bus
+        assert len(os.listdir(env.dir)) == 2
+
+        async def cancelled_disconnect():
+            raise asyncio.CancelledError()
+
+        client._backend.disconnect = cancelled_disconnect
+        with pytest.raises(asyncio.CancelledError):
+            await client.disconnect()
+        return bus, client._backend
+
+    bus, backend = asyncio.run(scenario())
+    assert bus.connected is False   # socket released
+    assert backend._bus is None     # and bleak's guards see it closed
+    assert os.listdir(env.dir) == []  # claims released, not stranded
+
+
+def test_a_cancelled_retirement_still_closes_the_bus(env):
+    """Same hazard on the reconnect path."""
+    env.install(adapters=("hci5",))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        first, bus = client._backend, client._backend._bus
+
+        async def cancelled_disconnect():
+            raise asyncio.CancelledError()
+
+        first.disconnect = cancelled_disconnect
+        first.is_connected = False
+        # cancellation still aborts the reconnect - it just no longer
+        # takes a system-bus connection with it
+        with pytest.raises(asyncio.CancelledError):
+            await client.connect()
+        return bus, first
+
+    bus, first = asyncio.run(scenario())
+    assert bus.connected is False
+    assert first._bus is None

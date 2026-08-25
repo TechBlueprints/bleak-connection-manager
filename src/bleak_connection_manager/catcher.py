@@ -89,10 +89,6 @@ LINK_EVIDENCE_MAX = 300.0
 # reconnect the caller actually asked for.
 BACKEND_RETIRE_TIMEOUT = 10.0
 
-# Ceiling on waiting for an orphaned per-session D-Bus connection to finish
-# closing. The socket is already released by the synchronous disconnect();
-# this only waits for the acknowledgement, so it is bounded tightly.
-ORPHAN_BUS_TIMEOUT = 2.0
 
 # Ceiling on the courtesy disconnect of a link that failed validation: it is
 # already known bad, so waiting on BlueZ past this costs the caller's retry
@@ -1252,8 +1248,19 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             callback = self._make_notify_tap(callback)
         return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
 
-    async def _close_orphaned_bus(self):
+    def _close_orphaned_bus(self):
         """Close a per-session D-Bus connection bleak left attached.
+
+        DELIBERATELY SYNCHRONOUS. Every caller runs in a finally, and the
+        paths that matter most are the cancelled ones - a cancelled
+        disconnect is exactly when bleak leaves the bus attached. An await
+        in a finally under cancellation can re-raise at the suspension
+        point, and CancelledError is a BaseException, so `except Exception`
+        does not catch it: anything sequenced after such an await may never
+        run. Closing the socket and nulling the reference are both cheap
+        and neither needs to suspend, so neither is placed behind one.
+        (The point was made by the sensors-py session, whose own fix is
+        synchronous for the same reason.)
 
         bleak's disconnect() closes the bus in three statements that sit
         AFTER its try/finally, so anything raising inside skips them:
@@ -1296,10 +1303,6 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             return False
         try:
             bus.disconnect()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(bus.wait_for_disconnect(), timeout=ORPHAN_BUS_TIMEOUT)
         except Exception:
             pass
         try:
@@ -1347,11 +1350,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 f"BLE [{self._catcher_address}]: retiring the previous backend raised",
                 exc_info=True,
             )
-        # and whether it raised or not, bleak may have left the session's
-        # own bus attached - swallowing the exception above without this
-        # would tidy the reference away and leak the connection
-        await self._close_orphaned_bus()
-        self._backend = None
+        finally:
+            # finally, not just after the except: a CancelledError is a
+            # BaseException and passes straight through `except Exception`,
+            # so cleanup placed after that handler would be skipped on the
+            # one path most likely to have left a bus attached. Cancellation
+            # still propagates and aborts this connect - it simply does not
+            # take a system-bus connection with it.
+            self._close_orphaned_bus()
+            self._backend = None
 
     async def _gatt_traffic(self, coro):
         # A completed GATT exchange is the link's proof of life exactly as a
@@ -1392,8 +1399,10 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         finally:
             # the raising path through bleak's disconnect() skips its own
             # bus teardown; the exception still propagates to the caller,
-            # it just no longer takes a system-bus connection with it
-            await self._close_orphaned_bus()
+            # it just no longer takes a system-bus connection with it.
+            # Both calls are synchronous so a cancelled disconnect cannot
+            # skip them - which is the path that leaks most reliably.
+            self._close_orphaned_bus()
             self._release_claims()
 
 
