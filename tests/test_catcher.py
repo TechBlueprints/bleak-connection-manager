@@ -2542,3 +2542,49 @@ def test_a_cancelled_retirement_still_closes_the_bus(env):
     bus, first = asyncio.run(scenario())
     assert bus.connected is False
     assert first._bus is None
+
+
+def test_a_mac_entry_is_resolved_against_the_current_numbering(env, monkeypatch):
+    """Naming a card by MAC is a statement that its number may change, so
+    the lookup must not be served from a cache. Within one TTL a stale
+    mapping would place a pinned device on whatever card inherited the
+    number - the isolation failure pins exist to prevent."""
+    env.install(adapters=("AA:BB:CC:DD:EE:FF",))
+    # ONE live mapping, mutated in place: re-running _kernel_adapters would
+    # reset _mac_cache itself and the test would pass without the fix -
+    # the freshness has to come from the code, not from the fixture
+    live = {"hci3": "AA:BB:CC:DD:EE:FF", "hci4": "11:22:33:44:55:66"}
+    monkeypatch.setattr(catcher.claims, "_mac_cache", {})
+    monkeypatch.setattr(catcher.claims, "present_hci_names", lambda: sorted(live))
+    monkeypatch.setattr(catcher.claims, "_read_adapter_mac",
+                        lambda a: live.get(a, catcher.claims.UNKNOWN_MAC))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: set(live))
+    catcher._observed_identities.clear()
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] == "hci3"   # cache now holds hci3 -> our MAC
+
+    # the card renumbers WITHOUT the cache expiring - a USB reset by another
+    # process, a replug - and the very next placement must follow the card
+    live["hci3"], live["hci4"] = "11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"
+    client2 = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client2.connect())
+
+    assert RECORDED_INITS[-1]["adapter"] == "hci4"
+
+
+def test_hci_entries_pay_nothing_for_the_fresh_resolve(env, monkeypatch):
+    """An adapter written as hciN has nothing to resolve, so a config using
+    only numbers must not start paying for an hciconfig call per placement."""
+    env.install(adapters=("hci5", "hci6"))
+    _kernel_adapters(monkeypatch, {"hci5": "AA:BB:CC:DD:EE:FF", "hci6": "11:22:33:44:55:66"})
+    calls = []
+    real = catcher.claims.invalidate_adapter_mac
+    monkeypatch.setattr(catcher.claims, "invalidate_adapter_mac",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+
+    assert calls == []

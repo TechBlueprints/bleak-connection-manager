@@ -296,7 +296,22 @@ def _resolve_adapter_entry(entry):
 def _resolve_entries(entries):
     """Configured entries -> present hciN names, order preserved, dropping
     the ones no card answers to. Also records every hciN entry that turned
-    out to name a card with a readable MAC, for the config rewrite."""
+    out to name a card with a readable MAC, for the config rewrite.
+
+    A MAC entry is resolved AGAINST THE CURRENT NUMBERING, not against a
+    cached mapping. Naming a card by its MAC is a statement that its number
+    may change, so serving that lookup from a cache reintroduces exactly
+    the staleness the MAC was chosen to avoid: for up to a TTL, a pinned
+    device could be placed on whatever card has since inherited the number,
+    which is the isolation failure pins exist to prevent. The invalidation
+    is done once for the whole list rather than per entry, so the refill
+    costs ONE hciconfig call however many adapters are configured
+    (measured on a Cerbo: ~11ms fresh against ~19us cached), and entries
+    already written as hciN pay nothing because there is nothing to
+    resolve.
+    """
+    if any(claims.mac_key(str(entry).strip()) is not None for entry in entries):
+        claims.invalidate_adapter_mac()
     resolved = []
     for entry in entries:
         name = _resolve_adapter_entry(entry)
