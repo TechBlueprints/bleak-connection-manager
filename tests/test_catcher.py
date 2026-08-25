@@ -2415,3 +2415,55 @@ def test_the_helper_degrades_when_bleak_has_no_such_attribute(env):
         return True
 
     assert asyncio.run(scenario()) is True
+
+
+def test_a_dbus_ceiling_failure_is_not_charged_to_the_radio(env):
+    """Field 2026-08-24: at dbus's per-user ceiling every connect fails at
+    once, on every adapter, because bleak opens a connection per session and
+    the bus refuses it. Scoring those as adapter failures would rank every
+    card bad simultaneously and walk pinned devices off working radios, for
+    a cause no adapter can fix."""
+    env.install(adapters=("hci5", "hci6"))
+    CONNECT_RESULTS.append(
+        RuntimeError("org.freedesktop.DBus.Error.LimitsExceeded: maximum number of "
+                     "active connections for UID reached")
+    )
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(RuntimeError):
+            await client.connect()
+
+    asyncio.run(scenario())
+
+    assert catcher._connect_failures == {}      # no card blamed
+    assert catcher._rotation.index(ADDRESS) == 0  # no pin walked
+
+
+def test_an_ordinary_connect_failure_is_still_charged(env):
+    """The discrimination has to be narrow: a real radio failure must still
+    penalize its adapter and advance the walk."""
+    env.install(adapters=("hci5", "hci6"))
+    CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(RuntimeError):
+            await client.connect()
+
+    asyncio.run(scenario())
+
+    assert catcher._connect_failures != {}
+
+
+def test_fd_exhaustion_is_also_not_the_radios_fault(env):
+    env.install(adapters=("hci5",))
+    CONNECT_RESULTS.append(OSError(24, "Too many open files"))
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(OSError):
+            await client.connect()
+
+    asyncio.run(scenario())
+    assert catcher._connect_failures == {}

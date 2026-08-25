@@ -343,6 +343,31 @@ def _entry(snapshot, adapter):
     return snapshot.get(claims.adapter_key(adapter)) or {}
 
 
+# A connect can fail for reasons that say nothing about the radio. The one
+# seen in the field (2026-08-24, prod) is the system bus refusing a new
+# connection once a process reaches dbus's per-user ceiling: bleak opens
+# one D-Bus connection per connection session, so at the ceiling EVERY
+# connect fails at once, on every adapter, until something frees a slot.
+# Scoring those as adapter failures would rank every card as bad
+# simultaneously and walk pinned devices off cards that are working
+# perfectly, recording a fleet-wide radio problem that does not exist.
+_RESOURCE_EXHAUSTION_MARKERS = (
+    "limitsexceeded",                       # org.freedesktop.DBus.Error.LimitsExceeded
+    "maximum number of active connections",  # its message text
+    "too many open files",                   # EMFILE, the fd ceiling behind it
+    "no buffer space",
+)
+
+
+def _is_resource_exhaustion(exc):
+    """Whether a connect failure is a process/system resource limit rather
+    than anything an adapter could be responsible for."""
+    if isinstance(exc, OSError) and exc.errno in (23, 24):  # ENFILE, EMFILE
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _RESOURCE_EXHAUSTION_MARKERS)
+
+
 def _cap_for(config, adapter):
     """The configured link cap for an adapter, whichever way it was keyed.
 
@@ -1168,11 +1193,22 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 # failed connect, scored and rotated like any other
                 await self._run_validation(validate, adapter_used)
             connected = True
-        except Exception:
-            # a failed attempt: penalize this adapter in the score and, for
-            # pinned devices, walk to the next pin
-            _connect_finished(adapter_used, self._catcher_address, False)
-            _rotation.connect_failed(self._catcher_address)
+        except Exception as e:
+            if _is_resource_exhaustion(e):
+                # the radio did nothing wrong: the process could not obtain
+                # the D-Bus connection bleak opens per session, because the
+                # bus refused it. Charging this to the adapter would poison
+                # every score on the box at once and walk pinned devices off
+                # perfectly good cards, for a cause no adapter can fix.
+                logger.error(
+                    f"BLE [{self._catcher_address}]: connect failed on a D-Bus resource limit, "
+                    f"not a radio fault - not charged to {adapter_used or 'the default adapter'}: {e}"
+                )
+            else:
+                # a failed attempt: penalize this adapter in the score and,
+                # for pinned devices, walk to the next pin
+                _connect_finished(adapter_used, self._catcher_address, False)
+                _rotation.connect_failed(self._catcher_address)
             raise
         finally:
             # no longer in flight, whatever the outcome
