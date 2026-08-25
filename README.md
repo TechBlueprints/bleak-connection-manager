@@ -328,6 +328,43 @@ but `ls`, `touch` and `cat` — a shell script is a legitimate participant.
 Copies should record the commit they came from, so a convention bump can
 be traced.
 
+## Threads this package adds to your process
+
+Installing the catcher adds **one thread** to a consumer that may not have
+had one: the bt-claims heartbeat, which touches its claim files every
+`HEARTBEAT_INTERVAL` and runs the drain watcher. That matters on platforms
+where D-Bus bindings are thread-affine — `dbus-python` connections and the
+`SettingsDevice`/`VeDbusService` objects built on them are *transparent* to
+thread affinity, not safe for it: hand one a connection created on another
+thread and nothing raises, it simply misbehaves later, often as a crash
+inside libdbus far from the cause.
+
+The contract this package holds itself to, and the one a consumer should
+hold too:
+
+- The heartbeat thread **only reads cached state** — `is_connected` on
+  bleak's BlueZ backend is a plain attribute read, not a bus call — and
+  **never touches D-Bus**.
+- Every action it decides on is marshalled back to the owning loop with
+  `loop.call_soon_threadsafe(...)`. The drain watcher never calls
+  `disconnect()` or `start()`/`stop()` itself; it schedules them.
+
+Two consequences worth knowing as a consumer:
+
+1. **A drain can disconnect your client at a moment you did not choose**
+   (see the claims layer). Your `disconnected_callback` therefore fires on
+   bleak's thread in response to something *this package* initiated, not
+   only in response to your own calls. If that callback touches a
+   thread-affine binding, marshal it — `GLib.idle_add`, or your own loop —
+   exactly as you would for any other bleak callback.
+2. **Safety here is a property of what marshals a call, not of what the
+   call constructs.** A site that builds a bus at runtime is fine if
+   everything reaching it is marshalled onto the owning thread, and unsafe
+   the moment something is not. Auditing construction sites alone will miss
+   it; audit the call graphs that reach them. Consider making such sites
+   assert their thread rather than trusting the graph to stay that way —
+   a named error at the call site beats a segfault inside libdbus later.
+
 ## Deployment: the shared install (Venus OS)
 
 Vendoring this stack per consumer means every fix is N re-vendor passes,
