@@ -100,6 +100,22 @@ clones of one history at different points and asserts all four cases:
 behind warns with the distance, in-step and ahead stay silent, and a
 missing vendored tree is tolerated rather than an error.
 
+And build that fixture as a **submodule, not a `git clone`** — this is the
+sharper edge, found by the check being dead in production while its test
+passed (2026-08-25). In a submodule, `.git` is a *file* pointing into the
+superproject, not a directory, so a guard written as `[ -d "$dir/.git" ]`
+is false for every real deployment. A fixture made with `git clone`
+produces a `.git` directory, which production never has, so the fixture
+agrees with the guard for a reason unrelated to correctness and the check
+sits silently dead. Ask git whether a path is a checkout —
+`git -C "$dir" rev-parse --git-dir` — rather than inspecting its layout,
+and have the fixture assert it produced a `.git` *file* before testing
+anything, so it cannot drift back to the easier case.
+
+The same reasoning applies to any test you write for this migration: a
+test authored after a fix and never run against the bug is not evidence
+it would have caught it. Run it against the broken version first.
+
 If the repo must stay runnable standalone for third parties, keep a
 vendored set and defer to whatever the interpreter already provides. The
 reference pattern (contributed from dbus-easytouchrv's migration, the first

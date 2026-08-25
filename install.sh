@@ -57,7 +57,11 @@ _submodule_at_pin() {
     return 1
 }
 
-if [ -d "$ROOT/.git" ]; then
+# ask git whether this is a checkout rather than inspecting its layout: in
+# a SUBMODULE .git is a FILE pointing into the superproject, not a
+# directory, so `[ -d .git ]` is false for every vendored-as-submodule
+# deployment while being true in any fixture built with `git clone`
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     for sub in ext/upstream/bleak ext/upstream/bleak-retry-connector; do
         _submodule_at_pin "$sub" || { echo "bcm-install: could not fetch $sub at its pin - flaky link? re-run install.sh" >&2; exit 1; }
     done
