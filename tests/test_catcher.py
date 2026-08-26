@@ -235,6 +235,17 @@ def _make_stub_modules():
     exc = types.ModuleType("bleak.exc")
     exc.BleakError = type("BleakError", (Exception,), {})
     exc.BleakDeviceNotFoundError = type("BleakDeviceNotFoundError", (Exception,), {})
+
+    # mirrors the real class: .dbus_error is the first constructor arg
+    class BleakDBusError(exc.BleakError):
+        def __init__(self, dbus_error, error_body):
+            super().__init__(dbus_error, *error_body)
+
+        @property
+        def dbus_error(self):
+            return self.args[0]
+
+    exc.BleakDBusError = BleakDBusError
     bleak = types.ModuleType("bleak")
     bleak.BleakClient = RichBleakClient
     bleak.BleakScanner = RichBleakScanner
@@ -3056,3 +3067,99 @@ def test_a_completed_link_also_reopens_recovery(env, monkeypatch):
     catcher._recovery_attempts[key] = catcher.MAX_RECOVERY_ATTEMPTS
     catcher._connect_finished("hci5", "AA:BB:CC:DD:EE:FF", True)
     assert key not in catcher._recovery_attempts
+
+
+def _inprogress():
+    return catcher.BleakDBusError(
+        "org.bluez.Error.InProgress", ["Operation already in progress"]
+    )
+
+
+def test_inprogress_on_stop_is_swallowed_and_counted(env):
+    """Field 2026-08-26, prod: 22 of these across dbus-shyion-switch's
+    hourly polls, every one on the 15s scan-timeout teardown. BlueZ 5.72
+    answers a stop with InProgress when the kernel REJECTED it for not
+    scanning - the scan is already over and bluetoothd detached the
+    session before replying (its stop_discovery_complete removes the
+    client before checking status). The stop's intent is satisfied;
+    raising only destroyed the caller's find. Swallow it, count it."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+
+        async def rejected_by_kernel():
+            raise _inprogress()
+
+        scanner._backend.stop = rejected_by_kernel
+        await scanner.stop()          # must not raise
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []                     # claim released
+    assert scanner._catcher_scanning is False
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 1
+
+
+def test_a_third_inprogress_stop_queues_the_drain_and_cycle(env, monkeypatch):
+    """Swallow-and-COUNT: the swallow handles the proven-benign case, the
+    count is insurance for any path we have not proven - a card producing
+    these persistently walks into the same drain-and-cycle as any other
+    accumulated scan failure."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append((adapter, gone_silent))
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+
+    async def scenario():
+        for _ in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            scanner = sys.modules["bleak"].BleakScanner()
+            await scanner.start()
+
+            async def rejected_by_kernel():
+                raise _inprogress()
+
+            scanner._backend.stop = rejected_by_kernel
+            await scanner.stop()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert attempts == [("hci5", True)]      # drained and cycled, exactly once
+
+
+def test_other_dbus_errors_on_stop_still_raise(env):
+    """The swallow is for one error whose semantics we established at
+    source, not a policy of ignoring teardown failures."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+
+        async def refused():
+            raise catcher.BleakDBusError("org.bluez.Error.Failed", ["Failed"])
+
+        scanner._backend.stop = refused
+        with pytest.raises(catcher.BleakDBusError):
+            await scanner.stop()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []      # released regardless, via finally
+
+
+def test_a_successful_connection_clears_the_scan_strikes(env):
+    """Clint, 2026-08-26: "if we get a successful connection we should
+    still clear the 3 strikes." A completed link is proof the radio works;
+    strikes held against a demonstrably working card only rank it last."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    key = catcher.claims.adapter_key("hci5")
+    catcher._scan_failures[key] = catcher.SCAN_FAILURES_BEFORE_RESET - 1
+    catcher._connect_finished("hci5", "AA:BB:CC:DD:EE:FF", True)
+    assert key not in catcher._scan_failures

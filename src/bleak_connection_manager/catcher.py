@@ -34,7 +34,7 @@ import weakref
 
 from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
 from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
-from bleak.exc import BleakError
+from bleak.exc import BleakDBusError, BleakError
 
 from . import mgmt, recovery
 from . import claims as claims
@@ -375,8 +375,14 @@ def _connect_finished(adapter, address, connected):
     key = (claims.adapter_key(adapter), _address_key(address))
     if connected:
         _connect_failures.pop(key, None)
-        # a completed link is also proof the radio works
+        # a completed link is proof the radio works, so it clears the
+        # card's whole record - recovery attempts AND scan strikes (Clint,
+        # 2026-08-26: "if we get a successful connection we should still
+        # clear the 3 strikes"). A reset on a card carrying working links
+        # would be gated on those links anyway; charging strikes to it
+        # while it demonstrably works only ranks a good card last.
         _recovery_attempts.pop(key[0], None)
+        _scan_failures.pop(key[0], None)
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
 
@@ -1976,6 +1982,34 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 f"StopDiscovery within {SCAN_OP_TIMEOUT:.0f}s, abandoning the scan"
             )
             raise
+        except BleakDBusError as exc:
+            if exc.dbus_error != "org.bluez.Error.InProgress":
+                raise
+            # Swallowed, counted, logged (Clint, 2026-08-26). InProgress on
+            # a STOP is the kernel saying it REJECTED the stop because it
+            # was not scanning - the scan this stop was for is already
+            # over, and bluetoothd detached our session before replying
+            # (5.72 stop_discovery_complete runs discovery_remove before
+            # checking status; a stop refused mid-start is counter-stopped
+            # by bluetoothd's own no-clients-left branch within one MGMT
+            # round-trip). Every path ends with the radio not scanning, so
+            # the stop's INTENT is satisfied and raising would only destroy
+            # the caller's find/teardown - bleak#958 is this exact trace,
+            # closed "a BlueZ bug"; bleak already swallows NotReady here.
+            # Counted anyway: the strike is insurance, not blame - a card
+            # producing these persistently reaches the three-strike drain
+            # and cycle, and any completed link or advertisement wipes the
+            # record. Not retried: bleak's stop() nulls its _stop closure
+            # before invoking it, so a second call is a silent no-op.
+            adapter = self._catcher_adapter
+            logger.warning(
+                f"BLE scan: StopDiscovery on {adapter or 'the default adapter'} answered "
+                f"InProgress - the kernel had already stopped scanning and BlueZ had "
+                f"detached the session; treating the scan as stopped, counting a strike"
+            )
+            _scan_finished(adapter, False)
+            _schedule_recovery(adapter)
+            return None
         finally:
             # cleared HERE, not at entry: while bleak's stop is in flight
             # the scan claim is still deliberately held, and a flag cleared

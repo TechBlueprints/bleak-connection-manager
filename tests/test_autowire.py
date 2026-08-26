@@ -29,7 +29,15 @@ def _run(script, tmp_path, **extra_env):
             """
         )
     )
-    (stub / "exc.py").write_text("class BleakError(Exception):\n    pass\n")
+    (stub / "exc.py").write_text(
+        "class BleakError(Exception):\n    pass\n"
+        "class BleakDBusError(BleakError):\n"
+        "    def __init__(self, dbus_error, error_body):\n"
+        "        super().__init__(dbus_error, *error_body)\n"
+        "    @property\n"
+        "    def dbus_error(self):\n"
+        "        return self.args[0]\n"
+    )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(tmp_path / "stub"), os.path.join(REPO, "packaging"), os.path.join(REPO, "src")]
