@@ -1597,6 +1597,12 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 or getattr(advertisement_data, "service_data", None)
                 or getattr(advertisement_data, "service_uuids", None)
             ):
+                if self._catcher_last_detection == self._catcher_start_time:
+                    # first real advertisement of this scan session: the card
+                    # is demonstrably scanning, so forgive its history. Once
+                    # per session, not per advertisement - a busy floor
+                    # delivers thousands.
+                    _scan_finished(self._catcher_adapter, True)
                 self._catcher_last_detection = _monotonic()
             if raw_callback is None:
                 return
@@ -1651,6 +1657,14 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             logger.warning(
                 f"BLE scanner on {adapter or 'the default adapter'} has been quiet for {quiet:.0f}s, restarting"
             )
+            # Record the quiet AGAINST THIS CARD before restarting. The
+            # restart re-runs selection, but re-running it changes nothing
+            # unless something changed its inputs - and a card that cannot
+            # scan is otherwise the most attractive candidate there is,
+            # holding no claims and carrying no links. Without this the
+            # watchdog faithfully migrated discovery back onto the same
+            # broken radio, every time.
+            _scan_finished(adapter, False)
             await self.stop()
             if adapter and (never_saw or quiet > SCANNER_WATCHDOG_MULTIPLE):
                 config = _config
@@ -1721,7 +1735,15 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 # scan claim too, and drop the partially-initialised backend
                 self._release_scan_claim()
                 self._backend = None
-        _scan_finished(explicit or adapter, True)
+        # deliberately NOT clearing this adapter's failure memory here: a
+        # start that returns success answers "did the card accept the scan
+        # command", which is not "is this card scanning". A wedged card
+        # accepts it and then reports nothing, so clearing on start alone
+        # let a broken radio look freshly healthy at every selection. The
+        # first real advertisement clears it instead - traffic is the truth,
+        # exactly as it is for links (field 2026-08-26: two cards scan-
+        # wedged on prod, each rating BEST because a card that cannot scan
+        # holds no claims, carries no links and had its failures wiped).
         self._catcher_scanning = True
         self._catcher_adapter = explicit or adapter
         self._catcher_explicit = bool(explicit)

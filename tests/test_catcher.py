@@ -2720,3 +2720,72 @@ def test_a_failed_restart_does_not_leave_the_flag_claiming_a_scan(env):
     scanner = asyncio.run(scenario())
     assert scanner._catcher_scanning is False
     assert os.listdir(env.dir) == []
+
+
+def _advert(name="x"):
+    return types.SimpleNamespace(local_name=name, manufacturer_data=None,
+                                 service_data=None, service_uuids=None)
+
+
+def test_a_wedged_card_stops_looking_attractive_to_scan_selection(env, monkeypatch):
+    """Field 2026-08-26, prod: two cards scan-wedged. A card that cannot
+    scan holds no claims and carries no links, so the least-occupied ranker
+    rated it BEST and the watchdog kept migrating discovery back onto it.
+    The quiet must be recorded against the card before the restart re-runs
+    selection - re-running selection changes nothing if nothing changed its
+    inputs."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5", "hci6"})
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        first = scanner._catcher_adapter
+        # the card accepted the scan command and then reported nothing
+        scanner._catcher_last_detection = scanner._catcher_start_time
+        monkeypatch.setattr(scanner, "_quiet_seconds", lambda: 999.0)
+        await scanner._watchdog_restart()
+        return first, scanner._catcher_adapter
+
+    first, after = asyncio.run(scenario())
+    assert catcher._scan_failures.get(catcher.claims.adapter_key(first)) == 1
+    assert after != first          # discovery moved off the wedged card
+
+
+def test_a_scan_that_actually_sees_traffic_is_forgiven(env, monkeypatch):
+    """The other half: a card with history that demonstrably scans again
+    must be cleared - and by an advertisement, not by start() returning."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    catcher._scan_failures[catcher.claims.adapter_key("hci5")] = 3
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        # start alone must NOT forgive it
+        assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 3
+        cb = RECORDED_SCANNER_INITS[-1]["detection_callback"]
+        cb(types.SimpleNamespace(address=ADDRESS), _advert())
+        return scanner
+
+    asyncio.run(scenario())
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) is None
+
+
+def test_empty_advertisements_do_not_forgive_a_wedged_card(env, monkeypatch):
+    """A wedged adapter can keep emitting empty advertisements; they are not
+    evidence of scanning and must not clear the failure memory."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    catcher._scan_failures[catcher.claims.adapter_key("hci5")] = 2
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        cb = RECORDED_SCANNER_INITS[-1]["detection_callback"]
+        cb(types.SimpleNamespace(address=ADDRESS),
+           types.SimpleNamespace(local_name=None, manufacturer_data=None,
+                                 service_data=None, service_uuids=None))
+
+    asyncio.run(scenario())
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 2
