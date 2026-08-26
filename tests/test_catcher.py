@@ -1888,8 +1888,13 @@ def test_the_drain_watcher_moves_a_running_scanner(env):
         catcher.present_adapters = lambda: {"hci5", "hci6"}
         try:
             catcher._drain_watch()
-            for _ in range(6):
+            # await the migration itself rather than guessing how many loop
+            # turns it needs - wait_for wraps each backend call in a task,
+            # so a fixed yield count is a hostage to internal scheduling
+            for _ in range(3):
                 await asyncio.sleep(0)
+            if catcher._migration_tasks:
+                await asyncio.gather(*list(catcher._migration_tasks), return_exceptions=True)
         finally:
             catcher.present_adapters = lambda: set()
         moved = scanner._catcher_adapter
@@ -2789,3 +2794,63 @@ def test_empty_advertisements_do_not_forgive_a_wedged_card(env, monkeypatch):
 
     asyncio.run(scenario())
     assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 2
+
+
+def test_a_hung_start_discovery_does_not_hold_a_card_hostage(env, monkeypatch):
+    """Field 2026-08-26, prod: a consumer sat inside BlueZ StartDiscovery on
+    a wedged adapter for 2h45m - alive, doing nothing, both its devices dead
+    - while holding a HARD exclusive scan claim. The claim is taken before
+    that call and its validity armed after it, so the heartbeat had no check
+    to apply and refreshed it every beat for the whole 2h45m, denying the
+    card to every other process on the box."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "SCAN_OP_TIMEOUT", 0.05)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+
+        async def never_answers():
+            await asyncio.sleep(3600)
+
+        # patch the backend the wrapper is about to build
+        original_init = RichBleakScanner.__init__
+
+        def patched(self, *a, **k):
+            original_init(self, *a, **k)
+            self._backend.start = never_answers
+
+        RichBleakScanner.__init__ = patched
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await scanner.start()
+        finally:
+            RichBleakScanner.__init__ = original_init
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []                     # card released, not hostage
+    assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 1
+    assert scanner._catcher_scanning is False
+
+
+def test_a_hung_stop_discovery_cannot_wedge_the_watchdog(env, monkeypatch):
+    """The same hazard on the way out, and worse placed: the watchdog stops
+    before it restarts, so an unbounded stop would wedge the very machinery
+    meant to recover from a wedged card."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "SCAN_OP_TIMEOUT", 0.05)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+
+        async def never_answers():
+            await asyncio.sleep(3600)
+
+        scanner._backend.stop = never_answers
+        with pytest.raises(asyncio.TimeoutError):
+            await scanner.stop()
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert os.listdir(env.dir) == []      # released despite the hang

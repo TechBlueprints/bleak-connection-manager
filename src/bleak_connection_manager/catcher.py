@@ -84,6 +84,18 @@ LINK_EVIDENCE_SECONDS = CLAIM_TTL
 LINK_EVIDENCE_MULTIPLE = 3.0
 LINK_EVIDENCE_MAX = 300.0
 
+# Ceiling on BlueZ's StartDiscovery/StopDiscovery. Both are unbounded
+# D-Bus calls, and on a wedged adapter StartDiscovery simply never returns:
+# field 2026-08-26, a consumer sat inside one for 2h45m, alive but doing
+# nothing, with both its thermostats dead the whole time. The scan claim is
+# taken BEFORE that call and its validity is armed AFTER it, so a hang left
+# a HARD exclusive claim with no validity check attached - the heartbeat did
+# not merely fail to release it, it refreshed it every beat for the whole
+# 2h45m, denying that card to every other process on the box. A ceiling
+# turns "hung forever, holding a radio hostage" into "failed, scored, and
+# rotated off", which is a state the rest of this machinery can act on.
+SCAN_OP_TIMEOUT = 30.0
+
 # Ceiling on closing a previous connection's D-Bus connection before
 # reconnecting. Bounded because a wedged predecessor must not block the
 # reconnect the caller actually asked for.
@@ -1722,8 +1734,20 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             raise
         started = False
         try:
-            result = await _ORIGINAL_BLEAK_SCANNER.start(self)
+            result = await asyncio.wait_for(
+                _ORIGINAL_BLEAK_SCANNER.start(self), timeout=SCAN_OP_TIMEOUT
+            )
             started = True
+        except asyncio.TimeoutError:
+            # a card that accepts StartDiscovery and never answers is wedged,
+            # not busy; say so plainly, because the alternative reading -
+            # "the scan is still starting" - is what let this run for hours
+            logger.error(
+                f"BLE scan: {explicit or adapter or 'the default adapter'} did not answer "
+                f"StartDiscovery within {SCAN_OP_TIMEOUT:.0f}s, treating as a failed start"
+            )
+            _scan_finished(explicit or adapter, False)
+            raise
         except Exception:
             # a failed start counts against this adapter in scan placement
             # (cancellation does not - it says nothing about the radio)
@@ -1780,7 +1804,18 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             self._release_scan_claim()
             return
         try:
-            return await _ORIGINAL_BLEAK_SCANNER.stop(self)
+            return await asyncio.wait_for(
+                _ORIGINAL_BLEAK_SCANNER.stop(self), timeout=SCAN_OP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # the same hazard on the way out, and worse placed: the watchdog
+            # stops before it restarts, so an unbounded stop would wedge the
+            # very machinery meant to recover from a wedged card
+            logger.error(
+                f"BLE scan: {self._catcher_adapter or 'the default adapter'} did not answer "
+                f"StopDiscovery within {SCAN_OP_TIMEOUT:.0f}s, abandoning the scan"
+            )
+            raise
         finally:
             # cleared HERE, not at entry: while bleak's stop is in flight
             # the scan claim is still deliberately held, and a flag cleared
