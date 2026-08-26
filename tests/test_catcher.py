@@ -3384,3 +3384,69 @@ def test_a_failed_connect_also_restarts_a_dead_daemon(env, monkeypatch):
 
     asyncio.run(scenario())
     assert restarts == [1]
+
+
+def test_the_kill_switch_stops_the_card_being_cycled(env, monkeypatch, tmp_path):
+    """Field 2026-08-26: BCM's drain-and-cycle is the prime suspect for
+    amplifying a bluetoothd UAF from 2 crashes/day to 235. The operator
+    needs to take BCM's hands off the hardware WITHOUT restarting anything
+    - restarts re-register D-Bus clients and are themselves part of the
+    crash pattern, so a switch that needed one would confound the very
+    test it exists to enable."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    flag = tmp_path / "no-card-cycle"
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(flag))
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+    attempts = []
+
+    async def fake_reset(adapter, **kw):
+        attempts.append(adapter)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+
+    async def scenario():
+        flag.write_text("")                      # disarmed, no restart
+        assert await catcher._recover_adapter("hci5") is False
+        assert attempts == [], "cycled a card while disarmed"
+        flag.unlink()                            # re-armed, live
+        await catcher._recover_adapter("hci5")
+
+    asyncio.run(scenario())
+    assert attempts == ["hci5"], "did not resume cycling once re-armed"
+
+
+def test_the_kill_switch_charges_no_attempt(env, monkeypatch, tmp_path):
+    """A suppressed cycle is not a failed cycle. If disarming burned the
+    3-attempt budget, re-arming would find every card already written off
+    as beyond reach."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(tmp_path / "f"))
+    (tmp_path / "f").write_text("")
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+
+    async def scenario():
+        for _ in range(catcher.MAX_RECOVERY_ATTEMPTS + 2):
+            await catcher._recover_adapter("hci5")
+
+    asyncio.run(scenario())
+    assert catcher._recovery_attempts == {}
+
+
+def test_the_kill_switch_still_lets_a_dead_daemon_be_restarted(env, monkeypatch, tmp_path):
+    """The switch takes our hands off the CARDS, not off the box. A dead
+    bluetoothd takes all BLE down and restarting it touches no hardware."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(tmp_path / "f"))
+    (tmp_path / "f").write_text("")
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    called = []
+
+    async def fake_daemon(adapter):
+        called.append(adapter)
+        return True
+
+    monkeypatch.setattr(catcher, "_recover_daemon", fake_daemon)
+    asyncio.run(catcher._recover_adapter("hci5"))
+    assert called == ["hci5"]

@@ -132,6 +132,29 @@ SCAN_FAILURES_BEFORE_RESET = 3
 # is the signal a human should act on.
 MAX_RECOVERY_ATTEMPTS = 3
 
+# Operator kill-switch for the drain-and-cycle path. A FILE rather than an
+# env var or a config argument on purpose: it must be flippable fleet-wide,
+# on a running box, without editing any consumer and WITHOUT RESTARTING
+# ANYTHING - restarts re-register D-Bus clients and are themselves part of
+# the crash pattern this switch exists to test, so needing one to disarm
+# would confound the experiment it enables. Checked live on every attempt,
+# so touch/rm takes effect within seconds across every process. Under /data
+# so it survives a reboot: a switch thrown to stop hardware being cycled
+# must not quietly re-arm itself at 3am.
+CYCLE_DISABLE_FLAG = "/data/bcm/no-card-cycle"
+
+# one log line per adapter per armed/disarmed transition, not per attempt
+_cycle_suppressed = set()
+
+
+def card_cycling_disabled():
+    """Whether the operator has disarmed drain-and-cycle."""
+    try:
+        return os.path.exists(CYCLE_DISABLE_FLAG)
+    except OSError:
+        return False
+
+
 # adapter identity -> recovery attempts made; cleared by a successful reset
 _recovery_attempts = {}
 # adapter identities with a recovery in flight in THIS process (the drain
@@ -231,6 +254,22 @@ async def _recover_adapter(adapter):
     live - so this can only ever fire on a card nobody else is using, which
     is precisely the wedged case.
     """
+    key_early = claims.adapter_key(adapter)
+    if card_cycling_disabled():
+        # Absolute, and deliberately ahead of the daemon check: this switch
+        # exists to take BCM's hands off the hardware entirely, so it must
+        # not be reachable past by any branch below it. Daemon RESTART is
+        # left alive - that touches no card and a dark box helps nobody.
+        if key_early not in _cycle_suppressed:
+            _cycle_suppressed.add(key_early)
+            logger.warning(
+                f"BLE scan: card cycling is DISARMED ({CYCLE_DISABLE_FLAG} present) - "
+                f"not draining or cycling {adapter}; it will be steered around instead"
+            )
+        if not recovery.is_bluetoothd_alive():
+            return await _recover_daemon(adapter)
+        return False
+    _cycle_suppressed.discard(key_early)
     if not recovery.is_bluetoothd_alive():
         return await _recover_daemon(adapter)
     if _daemon_grace_active():
@@ -286,6 +325,10 @@ def _schedule_recovery(adapter):
     own finally has released its claim, so the drain sees a free card.
     """
     if not adapter:
+        return
+    if card_cycling_disabled():
+        # cheap early-out so a disarmed box does not even spawn the task;
+        # _recover_adapter re-checks, since the flag can appear mid-flight
         return
     key = claims.adapter_key(adapter)
     if key in _recovering:
