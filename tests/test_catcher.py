@@ -316,12 +316,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None):
+    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=catcher.GATT_OP_TIMEOUT):
         catcher.install_bleak_catcher(
             OWNER,
             adapters=adapters,
             link_caps=link_caps,
             adapter_config_path=adapter_config_path,
+            gatt_timeout=gatt_timeout,
             claim_dir=str(tmp_path),
             wrap_scanner=wrap_scanner,
             scan_to_score=scan_to_score,
@@ -2854,3 +2855,64 @@ def test_a_hung_stop_discovery_cannot_wedge_the_watchdog(env, monkeypatch):
 
     scanner = asyncio.run(scenario())
     assert os.listdir(env.dir) == []      # released despite the hang
+
+
+def test_a_hung_gatt_call_becomes_an_error_instead_of_silence(env):
+    """An unbounded wait does not just risk the caller, it destroys the
+    evidence: a call that hangs forever never becomes an observable
+    failure, so "this is stuck" never happens as an event and no retry
+    loop, score or recovery can act on it. Bounding it is what turns a
+    hang into a fact."""
+    env.install(adapters=("hci5",), gatt_timeout=0.05)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+
+        async def never_answers(*a, **k):
+            await asyncio.sleep(3600)
+
+        client._backend.read_gatt_char = never_answers
+        with pytest.raises(asyncio.TimeoutError):
+            await client.read_gatt_char("fff1")
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_connected is True      # the link is not condemned by one slow call
+
+
+def test_a_hung_disconnect_still_releases_its_claims(env):
+    """disconnect holds a link slot and a soft claim across an unbounded
+    D-Bus call - bleak bounds the event waits inside it but not the call
+    itself - so a hang strands a SHARED resource, not just this caller."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2}, gatt_timeout=0.05)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        assert len(os.listdir(env.dir)) == 2
+
+        async def never_answers():
+            await asyncio.sleep(3600)
+
+        client._backend.disconnect = never_answers
+        with pytest.raises(asyncio.TimeoutError):
+            await client.disconnect()
+
+    asyncio.run(scenario())
+    assert os.listdir(env.dir) == []        # released despite the hang
+
+
+def test_a_consumer_can_restore_unbounded_waits(env):
+    """The escape hatch: a default that trades cost for a guarantee needs
+    one, because the caller who does not want the guarantee is invisible
+    from where the default is chosen."""
+    env.install(adapters=("hci5",), gatt_timeout=None)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        assert client._op_timeout() is None
+        return await client.read_gatt_char("fff1")
+
+    assert asyncio.run(scenario()) == b"\x00"

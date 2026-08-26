@@ -96,6 +96,21 @@ LINK_EVIDENCE_MAX = 300.0
 # rotated off", which is a state the rest of this machinery can act on.
 SCAN_OP_TIMEOUT = 30.0
 
+# Default ceiling for GATT operations and disconnects that arrive with no
+# deadline of their own. This is NOT primarily about protecting the caller:
+# an unbounded wait destroys the EVIDENCE. A call that can hang forever
+# never becomes an observable failure, so "this adapter is stuck" never
+# happens as an event and nothing downstream - scoring, rotation, recovery -
+# can act on it. Bounding it is what converts a hang into a fact.
+#
+# So this wrapper does not pass "forever" through. Where a caller expresses
+# a deadline (bleak's connect(timeout=), which bleak already honours) that
+# deadline wins and nothing here interferes. Where the API offers no way to
+# express one - read_gatt_char, write_gatt_char, start_notify, disconnect -
+# a default applies, overridable per-process via install_bleak_catcher's
+# gatt_timeout for a consumer whose device is legitimately slower.
+GATT_OP_TIMEOUT = 30.0
+
 # Ceiling on closing a previous connection's D-Bus connection before
 # reconnecting. Bounded because a wedged predecessor must not block the
 # reconnect the caller actually asked for.
@@ -611,6 +626,7 @@ class _CatcherConfig:
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
+        self.gatt_timeout = GATT_OP_TIMEOUT
         self.validate_connection = validate_connection
         self.sweeper = None
 
@@ -1276,7 +1292,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
     async def start_notify(self, char_specifier, callback, **kwargs):
         if callable(callback):
             callback = self._make_notify_tap(callback)
-        return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
+        return await self._gatt_traffic(
+            _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
+        )
 
     def _close_orphaned_bus(self):
         """Close a per-session D-Bus connection bleak left attached.
@@ -1390,6 +1408,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             self._close_orphaned_bus()
             self._backend = None
 
+    def _op_timeout(self):
+        config = _config
+        value = getattr(config, "gatt_timeout", GATT_OP_TIMEOUT) if config else GATT_OP_TIMEOUT
+        return value if value and value > 0 else None
+
     async def _gatt_traffic(self, coro):
         # A completed GATT exchange is the link's proof of life exactly as a
         # notification is - and for a polling consumer it is the only proof
@@ -1398,7 +1421,22 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # is_connected false negative, and the notification tap could not
         # re-arm them because it never subscribes to anything). Noted after
         # the await, never before: an operation that raised proves nothing.
-        result = await coro
+        timeout = self._op_timeout()
+        try:
+            result = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+        except asyncio.TimeoutError:
+            # deliberately NOT scored against the adapter: a GATT call that
+            # never answers may be a wedged card OR a peripheral that has
+            # stopped talking, and this wrapper cannot tell them apart. A
+            # hung StartDiscovery has no peripheral in the path and IS
+            # attributable; this is not. Surfacing it as a failure is the
+            # whole point - the caller's retry loop can act on an exception
+            # and can do nothing at all with a coroutine that never returns.
+            logger.error(
+                f"BLE [{self._catcher_address}]: GATT operation did not answer within "
+                f"{timeout:.0f}s, abandoning it"
+            )
+            raise
         self._note_link_evidence()
         return result
 
@@ -1424,8 +1462,22 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_settled = True
         if self._backend is None:
             return
+        timeout = self._op_timeout()
         try:
-            return await _ORIGINAL_BLEAK_CLIENT.disconnect(self)
+            coro = _ORIGINAL_BLEAK_CLIENT.disconnect(self)
+            return await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+        except asyncio.TimeoutError:
+            # bleak bounds the event WAITS inside disconnect but not the
+            # D-Bus Disconnect call itself, and this wrapper holds a link
+            # slot and a soft claim across it - so a hang here strands a
+            # shared resource, not just this caller. The same call is
+            # already bounded in _retire_previous_backend; it was naked
+            # here only because nothing forced the question.
+            logger.error(
+                f"BLE [{self._catcher_address}]: disconnect did not answer within "
+                f"{timeout:.0f}s, releasing its claims anyway"
+            )
+            raise
         finally:
             # the raising path through bleak's disconnect() skips its own
             # bus teardown; the exception still propagates to the caller,
@@ -1838,7 +1890,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -1872,6 +1924,14 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     validate_connection is the process-wide post-connect validator, `async
     (client) -> bool`: a link it rejects is torn down and raised as a
     connect failure for the retry loop above (see the validators module).
+    gatt_timeout bounds operations whose API offers no way to express a
+    deadline - read/write_gatt_char, start_notify, disconnect - because
+    this wrapper does not pass "forever" through: an unbounded wait never
+    becomes an observable failure, so a stuck adapter never surfaces as an
+    event anything downstream can act on. Raise it for a device that is
+    legitimately slower, or pass None to restore unbounded waits. A
+    caller-supplied deadline is never overridden - connect(timeout=) is
+    bleak's own and is left alone.
     It is the fallback, applying to every routed connect that does not
     carry its own `validate_connection=` client kwarg - which is how a
     driver validates connections made deep inside a library it does not
@@ -1906,6 +1966,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     )
     _config.claims.on_beat = _drain_watch
     _config.adapter_config_path = adapter_config_path
+    _config.gatt_timeout = gatt_timeout
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
     bleak.BleakClient = BLEConnection
