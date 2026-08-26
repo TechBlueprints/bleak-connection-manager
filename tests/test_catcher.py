@@ -3323,3 +3323,36 @@ def test_scan_success_resets_the_streak_clock(env):
     assert key in catcher._scan_failure_since
     catcher._scan_finished("hci5", True)
     assert key not in catcher._scan_failure_since
+
+
+def test_a_dead_daemon_is_checked_before_every_card_gate(env, monkeypatch):
+    """2026-08-26 15:48, observed live: with the daemon dead no scan can
+    succeed, so no proof ever clears an attempt record, and a process whose
+    cards had burnt their attempts lost its only path to the daemon
+    restart - the box went dark a second time. The daemon check now
+    precedes the strike threshold, the span gate, and the attempt cap: one
+    failure on a burnt card must still restart a dead daemon."""
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    restarts = []
+
+    async def fake_restart(*a, **k):
+        restarts.append(1)
+        return True
+
+    async def fake_invalidate():
+        pass
+
+    monkeypatch.setattr(catcher.recovery, "restart_bluetoothd", fake_restart)
+    monkeypatch.setattr(catcher.recovery, "invalidate_dbus_state", fake_invalidate)
+    key = catcher.claims.adapter_key("hci5")
+    catcher._scan_failures[key] = 1                                   # below threshold
+    catcher._recovery_attempts[key] = catcher.MAX_RECOVERY_ATTEMPTS   # burnt
+
+    async def scenario():
+        catcher._schedule_recovery("hci5")
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert restarts == [1]

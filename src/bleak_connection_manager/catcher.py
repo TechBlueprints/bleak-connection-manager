@@ -253,6 +253,25 @@ def _schedule_recovery(adapter):
     key = claims.adapter_key(adapter)
     if key in _recovering:
         return
+    if not _scan_failures.get(key, 0):
+        return
+    # The daemon check comes BEFORE every per-card gate, deliberately. The
+    # card gates below reason about card evidence - and with bluetoothd
+    # dead, card evidence cannot exist: no scan can succeed, so no proof
+    # ever clears an attempt record, and a process whose cards have burnt
+    # their attempts would lose its only path to the daemon restart
+    # (observed live 2026-08-26 15:48: second crash, guard starved, box
+    # dark again). One failure is already enough to ask whether the daemon
+    # is alive; _recover_daemon's own 90s window bounds the cost.
+    if not recovery.is_bluetoothd_alive():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_recover_daemon(adapter))
+        _recovery_tasks.add(task)
+        task.add_done_callback(_recovery_tasks.discard)
+        return
     if _scan_failures.get(key, 0) < SCAN_FAILURES_BEFORE_RESET:
         return
     since = _scan_failure_since.get(key)
