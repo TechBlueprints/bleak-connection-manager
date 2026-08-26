@@ -3163,3 +3163,82 @@ def test_a_successful_connection_clears_the_scan_strikes(env):
     catcher._scan_failures[key] = catcher.SCAN_FAILURES_BEFORE_RESET - 1
     catcher._connect_finished("hci5", "AA:BB:CC:DD:EE:FF", True)
     assert key not in catcher._scan_failures
+
+
+def test_a_dead_daemon_restarts_bluetoothd_not_the_card(env, monkeypatch):
+    """2026-08-26 prod incident: bluetoothd crash-looped and the per-card
+    strike logic read every daemon-caused scan failure as a wedged radio,
+    power-cycling healthy cards 14 times. With the daemon down, recovery
+    must restart the daemon, wipe the outage's strikes, and charge no card
+    attempt."""
+    calls = []
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+
+    async def fake_restart(*a, **k):
+        calls.append("restart-daemon")
+        return True
+
+    async def fake_invalidate():
+        calls.append("invalidate-dbus")
+
+    async def fake_reset(*a, **k):
+        calls.append("card-cycle")
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "restart_bluetoothd", fake_restart)
+    monkeypatch.setattr(catcher.recovery, "invalidate_dbus_state", fake_invalidate)
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    catcher._scan_failures[catcher.claims.adapter_key("hci5")] = catcher.SCAN_FAILURES_BEFORE_RESET
+    assert asyncio.run(catcher._recover_adapter("hci5")) is True
+    assert calls == ["restart-daemon", "invalidate-dbus"]
+    assert catcher._scan_failures == {}
+    assert catcher._recovery_attempts == {}
+
+
+def test_daemon_restart_is_rate_limited_to_the_grace_window(env, monkeypatch):
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    calls = []
+
+    async def fake_restart(*a, **k):
+        calls.append("restart-daemon")
+        return True
+
+    async def fake_invalidate():
+        pass
+
+    monkeypatch.setattr(catcher.recovery, "restart_bluetoothd", fake_restart)
+    monkeypatch.setattr(catcher.recovery, "invalidate_dbus_state", fake_invalidate)
+    assert asyncio.run(catcher._recover_adapter("hci5")) is True
+    assert asyncio.run(catcher._recover_adapter("hci6")) is False
+    assert calls == ["restart-daemon"]
+
+
+def test_card_recovery_stands_down_inside_the_daemon_grace_window(env, monkeypatch):
+    """Strikes accumulated while the daemon was dead or re-registering are
+    outage residue, not card evidence - a card recovery queued on them must
+    not fire, and must not be charged as an attempt."""
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+
+    async def fake_reset(*a, **k):
+        raise AssertionError("card must not be cycled inside the grace window")
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    monkeypatch.setattr(catcher, "_daemon_dead_at", time.monotonic())
+    assert asyncio.run(catcher._recover_adapter("hci5")) is False
+    assert catcher._recovery_attempts == {}
+
+
+def test_no_prior_daemon_death_leaves_card_recovery_untouched(env, monkeypatch):
+    """The sentinel matters: a freshly booted box (small monotonic clock)
+    with no daemon death on record must run normal card recovery, not a
+    phantom grace window."""
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+
+    async def fake_reset(*a, **k):
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    assert asyncio.run(catcher._recover_adapter("hci5")) is True

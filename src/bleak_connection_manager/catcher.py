@@ -139,6 +139,51 @@ _recovery_attempts = {}
 _recovering = set()
 _recovery_tasks = set()
 
+# When bluetoothd itself is down, every scan on every card fails and the
+# per-card failure evidence is meaningless. Monotonic timestamp of the last
+# daemon-dead detection; while inside the grace window, card recovery stands
+# down so strikes charged to healthy radios during the outage cannot cycle
+# them. One daemon restart per window, uncapped across windows: a dead
+# daemon takes ALL BLE on the box down, so the alternative to retrying is a
+# permanently dark box (2026-08-26 prod: bluetoothd crash-looped, nothing
+# restarted it for 8+ minutes, and the misread strikes power-cycled healthy
+# cards 14 times).
+_daemon_dead_at = None
+DAEMON_RESTART_GRACE = 90.0
+
+
+def _daemon_grace_active():
+    return _daemon_dead_at is not None and time.monotonic() - _daemon_dead_at < DAEMON_RESTART_GRACE
+
+
+async def _recover_daemon(adapter):
+    """bluetoothd is gone: restart it instead of cycling the card.
+
+    The failures that queued this recovery were the daemon's, not the
+    card's, so no card attempt is charged and every card's scan strikes are
+    wiped - they are evidence about an outage, not about radios.
+    """
+    global _daemon_dead_at
+    if _daemon_grace_active():
+        return False
+    _daemon_dead_at = time.monotonic()
+    _scan_failures.clear()
+    logger.warning(
+        f"BLE scan: bluetoothd is not running - the failures charged to {adapter} "
+        "are the daemon's, not the card's; restarting bluetoothd instead of cycling the card"
+    )
+    try:
+        ok = bool(await recovery.restart_bluetoothd())
+    except Exception:
+        logger.exception("BLE scan: bluetoothd restart raised")
+        return False
+    if ok:
+        try:
+            await recovery.invalidate_dbus_state()
+        except Exception:
+            logger.debug("BLE scan: post-restart dbus-state invalidation failed", exc_info=True)
+    return ok
+
 
 async def _recover_adapter(adapter):
     """Drain the card and cycle it, with attempt accounting.
@@ -149,6 +194,16 @@ async def _recover_adapter(adapter):
     live - so this can only ever fire on a card nobody else is using, which
     is precisely the wedged case.
     """
+    if not recovery.is_bluetoothd_alive():
+        return await _recover_daemon(adapter)
+    if _daemon_grace_active():
+        # The daemon died within the window and may still be re-registering;
+        # any strikes that survive are outage residue. No attempt charged.
+        logger.info(
+            f"BLE scan: standing down recovery of {adapter} - bluetoothd "
+            f"restarted less than {DAEMON_RESTART_GRACE:.0f}s ago"
+        )
+        return False
     key = claims.adapter_key(adapter)
     attempt = _recovery_attempts.get(key, 0) + 1
     if attempt > MAX_RECOVERY_ATTEMPTS:
