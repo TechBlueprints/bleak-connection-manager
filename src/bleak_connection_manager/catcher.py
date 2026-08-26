@@ -375,6 +375,8 @@ def _connect_finished(adapter, address, connected):
     key = (claims.adapter_key(adapter), _address_key(address))
     if connected:
         _connect_failures.pop(key, None)
+        # a completed link is also proof the radio works
+        _recovery_attempts.pop(key[0], None)
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
 
@@ -559,6 +561,10 @@ def _scan_finished(adapter, started):
     key = claims.adapter_key(adapter)
     if started:
         _scan_failures.pop(key, None)
+        # traffic proves the radio works, whatever fixed it. Drop the
+        # recovery record too, or a card that exhausted its attempts stays
+        # locked out of recovery forever - see _recovery_attempts.
+        _recovery_attempts.pop(key, None)
     else:
         _scan_failures[key] = _scan_failures.get(key, 0) + 1
 
@@ -575,6 +581,7 @@ def forget_adapter_failures(adapter):
     """
     key = claims.adapter_key(adapter)
     _scan_failures.pop(key, None)
+    _recovery_attempts.pop(key, None)
     for pair in [k for k in _connect_failures if k[0] == key]:
         _connect_failures.pop(pair, None)
 

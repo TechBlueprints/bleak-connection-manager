@@ -3003,3 +3003,56 @@ def test_a_successful_recovery_clears_the_cards_record(env, monkeypatch):
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
     asyncio.run(catcher._recover_adapter("hci5"))
     assert catcher._recovery_attempts == {}
+
+
+def test_a_card_that_comes_back_on_its_own_is_eligible_for_recovery_again(
+    env, monkeypatch
+):
+    """Exhausting the recovery attempts is a verdict about a card's CURRENT
+    state, not a life sentence. A human replugs the dongle, or the kernel
+    re-enumerates it, and the card starts advertising again - that traffic
+    is proof the radio works, and it must reopen recovery. Otherwise the
+    first wedge a card ever suffers permanently disqualifies it from being
+    fixed automatically, and the self-reinforcing trap that
+    forget_adapter_failures exists to prevent for scan placement reappears
+    one level up: the card is not recovered, so it stays wedged, so it
+    accumulates failures, so it is never recovered."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+
+    async def dead(adapter, **kw):
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", dead)
+
+    async def scenario():
+        for _ in range(catcher.MAX_RECOVERY_ATTEMPTS):
+            await catcher._recover_adapter("hci5")
+
+    asyncio.run(scenario())
+    assert catcher._recovery_attempts[catcher.claims.adapter_key("hci5")] == (
+        catcher.MAX_RECOVERY_ATTEMPTS
+    )
+
+    # the card comes back and advertises - the same success path a live
+    # scanner's first real detection takes
+    catcher._scan_finished("hci5", True)
+
+    revived = []
+
+    async def alive(adapter, **kw):
+        revived.append(adapter)
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", alive)
+    assert asyncio.run(catcher._recover_adapter("hci5")) is True
+    assert revived == ["hci5"], "a card proven alive was never retried"
+
+
+def test_a_completed_link_also_reopens_recovery(env, monkeypatch):
+    """Connecting is proof the radio works just as advertising is."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    key = catcher.claims.adapter_key("hci5")
+    catcher._recovery_attempts[key] = catcher.MAX_RECOVERY_ATTEMPTS
+    catcher._connect_finished("hci5", "AA:BB:CC:DD:EE:FF", True)
+    assert key not in catcher._recovery_attempts
