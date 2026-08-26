@@ -2669,3 +2669,54 @@ def test_a_running_scan_keeps_its_claim(env):
         return held
 
     assert asyncio.run(scenario()) == ["hci5.scan"]
+
+
+def test_the_scan_flag_holds_through_bleaks_own_stop(env):
+    """Review find: clearing the flag at stop() ENTRY opened a window
+    during bleak's stop await where the heartbeat's validity check saw a
+    "finished" scan and sweep-released the claim stop() was about to
+    release anyway - same outcome, logged as a divergence when nothing
+    diverged. The claim is deliberately held until the scan is actually
+    stopped."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    observed = {}
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        real_stop = scanner._backend.stop
+
+        async def observing_stop():
+            observed["during"] = scanner._catcher_scanning
+            observed["claim_valid"] = scanner._catcher_claim.validity()
+            await real_stop()
+
+        scanner._backend.stop = observing_stop
+        await scanner.stop()
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert observed == {"during": True, "claim_valid": True}
+    assert scanner._catcher_scanning is False
+    assert os.listdir(env.dir) == []
+
+
+def test_a_failed_restart_does_not_leave_the_flag_claiming_a_scan(env):
+    """The documented invariant is "True only between a successful start()
+    and stop()". A successful start followed by a direct re-start() that
+    fails used to leave it stale-True - readable by nothing today, which is
+    exactly how adjacent predicates get built tomorrow."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        assert scanner._catcher_scanning is True
+        SCANNER_START_RESULTS.append(RuntimeError("start failed"))
+        with pytest.raises(RuntimeError):
+            await scanner.start()
+        return scanner
+
+    scanner = asyncio.run(scenario())
+    assert scanner._catcher_scanning is False
+    assert os.listdir(env.dir) == []

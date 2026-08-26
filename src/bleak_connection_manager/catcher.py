@@ -1665,7 +1665,11 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
     async def start(self):
         detection_callback, service_uuids, scanning_mode = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
-        # a restart on this instance must not leak the previous claim
+        # a restart on this instance must not leak the previous claim - and
+        # the flag resets WITH it, so the documented invariant ("True only
+        # between a successful start() and stop()") holds even when this
+        # start fails after a previous successful one
+        self._catcher_scanning = False
         self._release_scan_claim()
         config = _config
         self._catcher_manager = config.claims if config is not None else None
@@ -1747,15 +1751,23 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
 
     async def stop(self):
         self._cancel_watchdog()
-        self._catcher_scanning = False
         if self._backend is None:
             # nothing to stop, but a claim may still be held - releasing it
             # is the whole point of being asked to stop
+            self._catcher_scanning = False
             self._release_scan_claim()
             return
         try:
             return await _ORIGINAL_BLEAK_SCANNER.stop(self)
         finally:
+            # cleared HERE, not at entry: while bleak's stop is in flight
+            # the scan claim is still deliberately held, and a flag cleared
+            # before the await opens a window where the heartbeat's validity
+            # check sees a "finished" scan and sweep-releases a claim that
+            # stop() is about to release anyway - same outcome, but logged
+            # as a divergence ("what it accounted for is gone") when nothing
+            # diverged. finally, so cancellation clears it too.
+            self._catcher_scanning = False
             self._release_scan_claim()
 
     @property

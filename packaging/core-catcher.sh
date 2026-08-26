@@ -42,5 +42,15 @@ cat > "$OUT"
 # 2026-08-23: the first bluetoothd core (3.7MB, the C-only one that is by
 # far the easiest to analyse) was pruned by three python cores of 48MB
 # each within an hour of being captured.
-ls -t "$CORES"/core."$COMM".* 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do rm -f "$f"; done
+#
+# Within a name, keep the OLDEST plus the newest KEEP-1 - not simply the
+# newest KEEP. Field 2026-08-23 again: a six-crash burst evicted its own
+# beginning, and the FIRST crash of a burst is usually the informative one
+# (the rest are cascade). The oldest core of a name survives until someone
+# clears the directory deliberately.
+FILES=$(ls -t "$CORES"/core."$COMM".* 2>/dev/null)
+TOTAL=$(echo "$FILES" | grep -c .)
+if [ "$TOTAL" -gt "$KEEP" ]; then
+    echo "$FILES" | awk -v keep="$KEEP" -v total="$TOTAL" 'NR > keep - 1 && NR < total' | while read -r f; do rm -f "$f"; done
+fi
 echo "$(date) captured $OUT (sig$SIG) $(wc -c < "$OUT") bytes" >> "$CORES/capture.log"
