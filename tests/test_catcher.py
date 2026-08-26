@@ -311,6 +311,8 @@ def env(tmp_path, monkeypatch):
     RECORDED_SCANNER_INITS.clear()
     GATT_RESULTS.clear()
     catcher._warned_bare_connect_addresses.clear()
+    catcher._recovery_attempts.clear()
+    catcher._recovering.clear()
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
@@ -2916,3 +2918,88 @@ def test_a_consumer_can_restore_unbounded_waits(env):
         return await client.read_gatt_char("fff1")
 
     assert asyncio.run(scenario()) == b"\x00"
+
+
+def test_accumulated_scan_failures_trigger_a_drain_and_cycle(env, monkeypatch):
+    """Detecting a wedged card and rotating off it protects the fleet but
+    guarantees the card stays dead. Recovery was reachable only from the
+    scanner watchdog, which needs a scanner that STARTED - so a card that
+    hangs or refuses at StartDiscovery could never reach it. Accumulated
+    failure now triggers it."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append((adapter, gone_silent))
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+
+    async def scenario():
+        for _ in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            SCANNER_START_RESULTS.append(RuntimeError("Set scan parameters failed"))
+            scanner = sys.modules["bleak"].BleakScanner()
+            with pytest.raises(RuntimeError):
+                await scanner.start()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert attempts == [("hci5", True)]      # drained and cycled, exactly once
+
+
+def test_recovery_does_not_fire_before_the_threshold(env, monkeypatch):
+    """One bad scan is not evidence of a wedged card."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, **kw):
+        attempts.append(adapter)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+
+    async def scenario():
+        SCANNER_START_RESULTS.append(RuntimeError("transient"))
+        scanner = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(RuntimeError):
+            await scanner.start()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert attempts == []
+
+
+def test_a_card_that_will_not_come_back_is_not_cycled_forever(env, monkeypatch):
+    """A physically dead radio must not be power-cycled indefinitely -
+    giving up loudly is the signal a human should act on."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, **kw):
+        attempts.append(adapter)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+
+    async def scenario():
+        for _ in range(catcher.MAX_RECOVERY_ATTEMPTS + 4):
+            assert await catcher._recover_adapter("hci5") is False
+
+    asyncio.run(scenario())
+    assert len(attempts) == catcher.MAX_RECOVERY_ATTEMPTS
+
+
+def test_a_successful_recovery_clears_the_cards_record(env, monkeypatch):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+
+    async def fake_reset(adapter, **kw):
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    asyncio.run(catcher._recover_adapter("hci5"))
+    assert catcher._recovery_attempts == {}

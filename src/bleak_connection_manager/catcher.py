@@ -111,6 +111,105 @@ SCAN_OP_TIMEOUT = 30.0
 # gatt_timeout for a consumer whose device is legitimately slower.
 GATT_OP_TIMEOUT = 30.0
 
+# Recovery. Detecting a wedged card and rotating off it protects the fleet
+# but guarantees the card stays dead: the drain-and-cycle machinery in
+# recovery.reset_adapter was reachable only from the scanner watchdog, which
+# requires a scanner that STARTED and then went quiet - so a card that hangs
+# or refuses at StartDiscovery, or that the kernel has already taken DOWN,
+# could never reach it. Worse, scoring a card as bad steers selection away
+# from it, so the more evidence accumulated that a card is broken the less
+# likely it was ever to be recovered. Recovery was coupled to successful use
+# of the thing that was broken.
+#
+# So accumulated failure now triggers it. After this many scan failures on
+# one card, the next one attempts a drain-and-cycle instead of merely
+# rotating away - reset_adapter takes the exclusive drain claim, waits for
+# other processes' links to migrate off, then rfkill/HCI-bounce/USB-reset.
+SCAN_FAILURES_BEFORE_RESET = 3
+
+# ...and this many attempts before declaring the card beyond our reach. A
+# physically dead radio must not be power-cycled forever; giving up loudly
+# is the signal a human should act on.
+MAX_RECOVERY_ATTEMPTS = 3
+
+# adapter identity -> recovery attempts made; cleared by a successful reset
+_recovery_attempts = {}
+# adapter identities with a recovery in flight in THIS process (the drain
+# claim handles the cross-process case)
+_recovering = set()
+_recovery_tasks = set()
+
+
+async def _recover_adapter(adapter):
+    """Drain the card and cycle it, with attempt accounting.
+
+    Safe by construction rather than by care: reset_adapter takes the
+    exclusive hciN.drain claim, so only one process anywhere attempts a
+    given card, and it refuses outright while any FOREIGN claim is still
+    live - so this can only ever fire on a card nobody else is using, which
+    is precisely the wedged case.
+    """
+    key = claims.adapter_key(adapter)
+    attempt = _recovery_attempts.get(key, 0) + 1
+    if attempt > MAX_RECOVERY_ATTEMPTS:
+        return False
+    _recovery_attempts[key] = attempt
+    config = _config
+    manager = config.claims if config is not None else None
+    logger.warning(
+        f"BLE scan: attempting recovery of {adapter} "
+        f"(attempt {attempt}/{MAX_RECOVERY_ATTEMPTS}): draining, then cycling the card"
+    )
+    try:
+        recovered = bool(await recovery.reset_adapter(adapter, claims_manager=manager, gone_silent=True))
+    except Exception:
+        logger.exception(f"BLE scan: recovery of {adapter} raised")
+        recovered = False
+    if recovered:
+        _recovery_attempts.pop(key, None)
+        logger.warning(f"BLE scan: {adapter} recovered")
+    elif attempt >= MAX_RECOVERY_ATTEMPTS:
+        logger.error(
+            f"BLE scan: {adapter} did not recover after {attempt} attempts and will not be "
+            "retried - it needs physical attention (replug, or a port/power cycle)"
+        )
+    return recovered
+
+
+def _schedule_recovery(adapter):
+    """Queue a recovery if this card has failed enough to have earned one.
+
+    Fire-and-forget deliberately: the caller is a connect or scan that has
+    just failed and is about to raise, and draining a card can take up to a
+    minute. Blocking the caller on recovery would turn one failed scan into
+    a minute-long stall. By the time the task runs, the failing caller's
+    own finally has released its claim, so the drain sees a free card.
+    """
+    if not adapter:
+        return
+    key = claims.adapter_key(adapter)
+    if key in _recovering:
+        return
+    if _scan_failures.get(key, 0) < SCAN_FAILURES_BEFORE_RESET:
+        return
+    if _recovery_attempts.get(key, 0) >= MAX_RECOVERY_ATTEMPTS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _run():
+        try:
+            await _recover_adapter(adapter)
+        finally:
+            _recovering.discard(key)
+
+    _recovering.add(key)
+    task = loop.create_task(_run())
+    _recovery_tasks.add(task)
+    task.add_done_callback(_recovery_tasks.discard)
+
 # Ceiling on closing a previous connection's D-Bus connection before
 # reconnecting. Bounded because a wedged predecessor must not block the
 # reconnect the caller actually asked for.
@@ -1731,9 +1830,9 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             _scan_finished(adapter, False)
             await self.stop()
             if adapter and (never_saw or quiet > SCANNER_WATCHDOG_MULTIPLE):
-                config = _config
-                manager = config.claims if config is not None else None
-                await recovery.reset_adapter(adapter, claims_manager=manager, gone_silent=True)
+                # through the same accounting, so a card that will not come
+                # back is not power-cycled every 90s forever
+                await _recover_adapter(adapter)
             await self.start()
         except Exception:
             logger.exception("BLE scanner watchdog restart failed")
@@ -1799,11 +1898,13 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 f"StartDiscovery within {SCAN_OP_TIMEOUT:.0f}s, treating as a failed start"
             )
             _scan_finished(explicit or adapter, False)
+            _schedule_recovery(explicit or adapter)
             raise
         except Exception:
             # a failed start counts against this adapter in scan placement
             # (cancellation does not - it says nothing about the radio)
             _scan_finished(explicit or adapter, False)
+            _schedule_recovery(explicit or adapter)
             raise
         finally:
             if not started:
