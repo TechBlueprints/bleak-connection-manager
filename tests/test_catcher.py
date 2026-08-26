@@ -325,6 +325,7 @@ def env(tmp_path, monkeypatch):
     catcher._recovery_attempts.clear()
     catcher._recovering.clear()
     catcher._daemon_dead_at = None
+    catcher._last_daemon_check = None
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
@@ -3351,6 +3352,33 @@ def test_a_dead_daemon_is_checked_before_every_card_gate(env, monkeypatch):
 
     async def scenario():
         catcher._schedule_recovery("hci5")
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert restarts == [1]
+
+
+def test_a_failed_connect_also_restarts_a_dead_daemon(env, monkeypatch):
+    """A consumer that only ever connects (a battery driver with a pinned
+    address never scans) must still be able to restart a dead bluetoothd -
+    the daemon fails connects and scans alike."""
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    restarts = []
+
+    async def fake_restart(*a, **k):
+        restarts.append(1)
+        return True
+
+    async def fake_invalidate():
+        pass
+
+    monkeypatch.setattr(catcher.recovery, "restart_bluetoothd", fake_restart)
+    monkeypatch.setattr(catcher.recovery, "invalidate_dbus_state", fake_invalidate)
+
+    async def scenario():
+        catcher._connect_finished("hci5", "AA:BB:CC:DD:EE:FF", False)
         if catcher._recovery_tasks:
             await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
 

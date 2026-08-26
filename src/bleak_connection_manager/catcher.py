@@ -156,6 +156,43 @@ def _daemon_grace_active():
     return _daemon_dead_at is not None and time.monotonic() - _daemon_dead_at < DAEMON_RESTART_GRACE
 
 
+# is_bluetoothd_alive walks /proc; on every failed connect of a retry storm
+# that is hundreds of file opens a second across the fleet - its own load
+# bug. The liveness QUESTION is throttled; the answer's freshness only
+# matters at the 90s daemon-restart granularity anyway.
+_last_daemon_check = None
+DAEMON_CHECK_INTERVAL = 5.0
+
+
+def _maybe_recover_daemon(adapter):
+    """If bluetoothd is gone, schedule its restart and say so.
+
+    Callable from any failure path - scan or connect - because a dead
+    daemon fails BOTH, and a consumer that only ever connects (a battery
+    driver with a pinned address never scans) would otherwise have no way
+    to restart it. Returns whether the daemon was found dead, so callers
+    can skip card-blaming gates that reason about evidence a dead daemon
+    makes impossible.
+    """
+    global _last_daemon_check
+    now = time.monotonic()
+    if _last_daemon_check is not None and now - _last_daemon_check < DAEMON_CHECK_INTERVAL:
+        return _daemon_grace_active()
+    _last_daemon_check = now
+    if recovery.is_bluetoothd_alive():
+        return False
+    if _daemon_grace_active():
+        return True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+    task = loop.create_task(_recover_daemon(adapter))
+    _recovery_tasks.add(task)
+    task.add_done_callback(_recovery_tasks.discard)
+    return True
+
+
 async def _recover_daemon(adapter):
     """bluetoothd is gone: restart it instead of cycling the card.
 
@@ -263,14 +300,7 @@ def _schedule_recovery(adapter):
     # (observed live 2026-08-26 15:48: second crash, guard starved, box
     # dark again). One failure is already enough to ask whether the daemon
     # is alive; _recover_daemon's own 90s window bounds the cost.
-    if not recovery.is_bluetoothd_alive():
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        task = loop.create_task(_recover_daemon(adapter))
-        _recovery_tasks.add(task)
-        task.add_done_callback(_recovery_tasks.discard)
+    if _maybe_recover_daemon(adapter):
         return
     if _scan_failures.get(key, 0) < SCAN_FAILURES_BEFORE_RESET:
         return
@@ -474,6 +504,9 @@ def _connect_finished(adapter, address, connected):
         _scan_failures.pop(key[0], None)
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
+        # a failed connect is also the moment a connect-only consumer
+        # notices a dead daemon - see _maybe_recover_daemon
+        _maybe_recover_daemon(key[0])
 
 
 def _hci_sort_key(name):
