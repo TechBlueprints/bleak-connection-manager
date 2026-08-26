@@ -221,8 +221,16 @@ async def _recover_adapter(adapter):
         logger.exception(f"BLE scan: recovery of {adapter} raised")
         recovered = False
     if recovered:
-        _recovery_attempts.pop(key, None)
-        logger.warning(f"BLE scan: {adapter} recovered")
+        # Deliberately NOT clearing _recovery_attempts here: reset_adapter's
+        # success means the card re-enumerated with a readable MAC, which is
+        # cosmetic - a card can enumerate forever and still never scan. Only
+        # PROOF the radio works clears the record (_scan_finished /
+        # _connect_finished on success), and that also caps a
+        # cosmetically-recovering card at MAX_RECOVERY_ATTEMPTS resets
+        # instead of an unbounded USB-reset churn loop (each reset
+        # re-enumerates the bus and fails scans box-wide - 2026-08-26 prod
+        # load incident).
+        logger.warning(f"BLE scan: {adapter} recovered (attempt record kept until the radio proves itself)")
     elif attempt >= MAX_RECOVERY_ATTEMPTS:
         logger.error(
             f"BLE scan: {adapter} did not recover after {attempt} attempts and will not be "
@@ -246,6 +254,13 @@ def _schedule_recovery(adapter):
     if key in _recovering:
         return
     if _scan_failures.get(key, 0) < SCAN_FAILURES_BEFORE_RESET:
+        return
+    since = _scan_failure_since.get(key)
+    if since is None or time.monotonic() - since < RECOVERY_STRIKE_SPAN:
+        # Enough strikes, but not enough TIME: a streak this young is what
+        # transient churn (mass restart, a neighbour's USB reset) looks
+        # like. The failures keep counting; recovery waits until the streak
+        # has lasted RECOVERY_STRIKE_SPAN.
         return
     if _recovery_attempts.get(key, 0) >= MAX_RECOVERY_ATTEMPTS:
         return
@@ -615,6 +630,16 @@ def _undrained_adapters(candidates, snapshot):
 # number, for the reason above.
 _scan_failures = {}
 
+# adapter identity -> monotonic time of the FIRST failure in the current
+# streak. Recovery requires the streak to span RECOVERY_STRIKE_SPAN: three
+# failures in ten seconds is what a mass service restart looks like (every
+# scan contending at once), and a process ten seconds old USB-resetting
+# shared hardware on that evidence amplified the 2026-08-26 restart into a
+# box-wide load cascade - each reset re-enumerates the bus, fails scans in
+# every OTHER process, and feeds their strike counters in turn.
+_scan_failure_since = {}
+RECOVERY_STRIKE_SPAN = 60.0
+
 
 def _scan_finished(adapter, started):
     if not adapter:
@@ -622,16 +647,18 @@ def _scan_finished(adapter, started):
     key = claims.adapter_key(adapter)
     if started:
         _scan_failures.pop(key, None)
+        _scan_failure_since.pop(key, None)
         # traffic proves the radio works, whatever fixed it. Drop the
         # recovery record too, or a card that exhausted its attempts stays
         # locked out of recovery forever - see _recovery_attempts.
         _recovery_attempts.pop(key, None)
     else:
         _scan_failures[key] = _scan_failures.get(key, 0) + 1
+        _scan_failure_since.setdefault(key, time.monotonic())
 
 
 def forget_adapter_failures(adapter):
-    """Drop an adapter's accumulated failure record.
+    """Drop an adapter's accumulated RANKING penalties.
 
     Called after a successful hardware reset: every penalty in there was
     charged to a card that has since been power-cycled, so it is stale
@@ -639,10 +666,18 @@ def forget_adapter_failures(adapter):
     is not merely unfair, it is self-reinforcing for scans - the scan
     penalty ranks a card last, and a card ranked last is never selected to
     have the success that would clear it.
+
+    The RECOVERY ATTEMPT record deliberately survives: a reset's "success"
+    only proves the card re-enumerated with a readable MAC, and a card can
+    enumerate forever without ever scanning again. Clearing attempts here
+    made the reset loop unbounded (strike, reset, "success", strike...) -
+    each USB reset re-enumerates the bus and fails scans box-wide, which
+    is a load cascade during churn (2026-08-26 prod). Attempts clear only
+    on proof the radio works: _scan_finished/_connect_finished success.
     """
     key = claims.adapter_key(adapter)
     _scan_failures.pop(key, None)
-    _recovery_attempts.pop(key, None)
+    _scan_failure_since.pop(key, None)
     for pair in [k for k in _connect_failures if k[0] == key]:
         _connect_failures.pop(pair, None)
 

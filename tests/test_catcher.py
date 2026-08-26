@@ -324,9 +324,11 @@ def env(tmp_path, monkeypatch):
     catcher._warned_bare_connect_addresses.clear()
     catcher._recovery_attempts.clear()
     catcher._recovering.clear()
+    catcher._daemon_dead_at = None
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
+    monkeypatch.setattr(catcher, "_scan_failure_since", {})
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
     def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=catcher.GATT_OP_TIMEOUT):
@@ -2948,7 +2950,12 @@ def test_accumulated_scan_failures_trigger_a_drain_and_cycle(env, monkeypatch):
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
 
     async def scenario():
-        for _ in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+        for i in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            if i == catcher.SCAN_FAILURES_BEFORE_RESET - 1:
+                # age the streak past the churn guard: strikes alone are not
+                # enough, they must also SPAN time (RECOVERY_STRIKE_SPAN)
+                key = catcher.claims.adapter_key("hci5")
+                catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
             SCANNER_START_RESULTS.append(RuntimeError("Set scan parameters failed"))
             scanner = sys.modules["bleak"].BleakScanner()
             with pytest.raises(RuntimeError):
@@ -3005,15 +3012,10 @@ def test_a_card_that_will_not_come_back_is_not_cycled_forever(env, monkeypatch):
     assert len(attempts) == catcher.MAX_RECOVERY_ATTEMPTS
 
 
-def test_a_successful_recovery_clears_the_cards_record(env, monkeypatch):
-    env.install(adapters=("hci5",), wrap_scanner=True)
-
-    async def fake_reset(adapter, **kw):
-        return True
-
-    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
-    asyncio.run(catcher._recover_adapter("hci5"))
-    assert catcher._recovery_attempts == {}
+# (test_a_successful_recovery_clears_the_cards_record removed 2026-08-26:
+# it pinned the contract that let a cosmetically-recovering card be reset
+# forever. Superseded by test_reset_success_alone_does_not_clear_the_attempt_record
+# and test_three_resets_without_proof_end_recovery.)
 
 
 def test_a_card_that_comes_back_on_its_own_is_eligible_for_recovery_again(
@@ -3118,7 +3120,12 @@ def test_a_third_inprogress_stop_queues_the_drain_and_cycle(env, monkeypatch):
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
 
     async def scenario():
-        for _ in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+        for i in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            if i == catcher.SCAN_FAILURES_BEFORE_RESET - 1:
+                # age the streak past the churn guard (see
+                # RECOVERY_STRIKE_SPAN): count AND span are both required
+                key = catcher.claims.adapter_key("hci5")
+                catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
             scanner = sys.modules["bleak"].BleakScanner()
             await scanner.start()
 
@@ -3242,3 +3249,77 @@ def test_no_prior_daemon_death_leaves_card_recovery_untouched(env, monkeypatch):
 
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
     assert asyncio.run(catcher._recover_adapter("hci5")) is True
+
+
+def test_reset_success_alone_does_not_clear_the_attempt_record(env, monkeypatch):
+    """A reset's "success" is cosmetic - the card re-enumerated with a
+    readable MAC - and clearing attempts on it made the reset loop
+    unbounded (2026-08-26 prod load cascade). Only proof the radio works
+    clears the record."""
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+
+    async def fake_reset(*a, **k):
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    key = catcher.claims.adapter_key("hci5")
+    assert asyncio.run(catcher._recover_adapter("hci5")) is True
+    assert catcher._recovery_attempts[key] == 1
+    # proof: a scanner starts on the card - NOW the record clears
+    catcher._scan_finished("hci5", True)
+    assert key not in catcher._recovery_attempts
+
+
+def test_three_resets_without_proof_end_recovery(env, monkeypatch):
+    """The cosmetic-success loop is bounded: reset "succeeds" every time,
+    the radio never proves itself, and the fourth round refuses."""
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+    resets = []
+
+    async def fake_reset(*a, **k):
+        resets.append(1)
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    for _ in range(catcher.MAX_RECOVERY_ATTEMPTS):
+        assert asyncio.run(catcher._recover_adapter("hci5")) is True
+    assert asyncio.run(catcher._recover_adapter("hci5")) is False
+    assert len(resets) == catcher.MAX_RECOVERY_ATTEMPTS
+
+
+def test_a_young_strike_streak_does_not_schedule_recovery(env, monkeypatch):
+    """Three failures in ten seconds is what a mass restart looks like;
+    recovery waits until the streak spans RECOVERY_STRIKE_SPAN."""
+    key = catcher.claims.adapter_key("hci5")
+    monkeypatch.setattr(catcher, "_scan_failure_since", {})
+    for _ in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+        catcher._scan_finished("hci5", False)
+    assert catcher._scan_failures[key] == catcher.SCAN_FAILURES_BEFORE_RESET
+
+    async def scenario():
+        catcher._schedule_recovery("hci5")
+        assert key not in catcher._recovering          # young streak: refused
+        catcher._scan_failure_since[key] = time.monotonic() - catcher.RECOVERY_STRIKE_SPAN - 1
+        monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+        monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+
+        async def fake_reset(*a, **k):
+            return True
+
+        monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+        catcher._schedule_recovery("hci5")
+        assert key in catcher._recovering              # aged streak: queued
+        while key in catcher._recovering:
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_scan_success_resets_the_streak_clock(env):
+    key = catcher.claims.adapter_key("hci5")
+    catcher._scan_finished("hci5", False)
+    assert key in catcher._scan_failure_since
+    catcher._scan_finished("hci5", True)
+    assert key not in catcher._scan_failure_since
