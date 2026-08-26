@@ -33,7 +33,7 @@ case "$1" in
         ;;
     --persist)
         touch "$RC"; chmod 755 "$RC"
-        grep -q "$TAG" "$RC" || echo "[ -x $SELF ] && $SELF > /data/cores/arm.log 2>&1 $TAG" >> "$RC"
+        grep -q "$TAG" "$RC" || echo "mkdir -p /data/cores; [ -x $SELF ] && $SELF > /data/cores/arm.log 2>&1 $TAG" >> "$RC"
         echo "registered in $RC (re-arms at every boot; disarm with: $SELF --disarm)"
         ;;
 esac
