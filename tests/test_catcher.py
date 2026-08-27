@@ -310,6 +310,13 @@ def _soft_name(adapter, mac=ADDRESS):
     return f"{adapter}.use.{OWNER}-{os.getpid()}.{mac.replace(':', '')}"
 
 
+def _locks(claim_dir):
+    """Claim names with the 0.5 bookkeeping files hidden: a hardlinked
+    exclusive claim is a lock plus a holder file sharing one inode, and every
+    assertion here is about the lock."""
+    return sorted(n for n in os.listdir(claim_dir) if ".holder." not in n)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Stubs in sys.modules, fresh rotation and warning state, a tmp claim
@@ -2648,7 +2655,7 @@ def test_a_finished_scan_stops_holding_its_hard_claim(env):
     async def scenario():
         scanner = sys.modules["bleak"].BleakScanner()
         await scanner.start()
-        assert os.listdir(env.dir) == ["hci5.scan"]
+        assert _locks(env.dir) == ["hci5.scan"]
         await scanner.stop()
         return scanner
 
@@ -2700,7 +2707,7 @@ def test_a_running_scan_keeps_its_claim(env):
         scanner = sys.modules["bleak"].BleakScanner()
         await scanner.start()
         catcher._config.claims._beat_once()
-        held = os.listdir(env.dir)
+        held = _locks(env.dir)
         await scanner.stop()
         return held
 
