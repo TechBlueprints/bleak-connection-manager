@@ -343,13 +343,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "_scan_failure_since", {})
-    # Card cycling now defaults to DISARMED in the field (it detonates the
-    # bluez 5.72 UAF). Tests that exercise cycling opt in here; the switch's
-    # own tests point the flag elsewhere and override this.
-    # Any existing path enables. Point at a directory OUTSIDE the claim dir
-    # (which is tmp_path itself) so the many "claims released, dir empty"
-    # assertions still see an empty directory.
-    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path.parent))
+    # Card cycling defaults to ENABLED again (0.5: R2 and R3 make a reset
+    # fire only on a card that emptied voluntarily). Point the disable flag
+    # at a path that does not exist, and OUTSIDE the claim dir (which is
+    # tmp_path itself) so the many "claims released, dir empty" assertions
+    # still see an empty directory. The switch's own tests override this.
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(tmp_path.parent / f"no-card-cycle-{tmp_path.name}"))
     catcher._cycle_suppressed.clear()
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
@@ -3558,17 +3557,22 @@ def test_a_failed_connect_also_restarts_a_dead_daemon(env, monkeypatch):
     assert restarts == [1]
 
 
-def test_the_kill_switch_stops_the_card_being_cycled(env, monkeypatch, tmp_path):
-    """Field 2026-08-26: BCM's drain-and-cycle is the prime suspect for
-    amplifying a bluetoothd UAF from 2 crashes/day to 235. The operator
-    needs to take BCM's hands off the hardware WITHOUT restarting anything
-    - restarts re-register D-Bus clients and are themselves part of the
-    crash pattern, so a switch that needed one would confound the very
-    test it exists to enable."""
+def test_cycling_is_armed_by_default_and_the_kill_switch_disarms_it_live(env, monkeypatch, tmp_path):
+    """R4: cycling returns as the last rung of recovery, default ON, because
+    R2 and R3 make it safe by construction - a reset can only fire on a card
+    that emptied voluntarily. A card that is genuinely wedged is also a card
+    nobody is using, and steering around it forever guarantees it stays dead;
+    recovery that can never fire is not caution, it is a fleet quietly losing
+    radios one at a time.
+
+    The switch stays for the operator, and it must work WITHOUT restarting
+    anything - restarts re-register D-Bus clients and are themselves part of
+    the crash pattern this switch exists around, so a switch that needed one
+    would confound the very test it enables (field 2026-08-26)."""
     env.install(adapters=("hci5",), wrap_scanner=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
-    flag = tmp_path / "allow-card-cycle"
-    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(flag))
+    flag = tmp_path.parent / f"no-card-cycle-{tmp_path.name}"
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(flag))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
     attempts = []
 
@@ -3579,14 +3583,17 @@ def test_the_kill_switch_stops_the_card_being_cycled(env, monkeypatch, tmp_path)
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
 
     async def scenario():
-        assert not flag.exists()                 # default: disarmed
-        assert await catcher._recover_adapter("hci5") is False
-        assert attempts == [], "cycled a card while disarmed"
-        flag.write_text("")                      # opt in, live, no restart
+        assert not flag.exists()                 # default: ARMED (0.5)
         await catcher._recover_adapter("hci5")
+        assert attempts == ["hci5"], "cycling did not fire by default"
+        flag.write_text("")                      # opt out, live, no restart
+        try:
+            assert await catcher._recover_adapter("hci5") is False
+        finally:
+            flag.unlink()
 
     asyncio.run(scenario())
-    assert attempts == ["hci5"], "did not resume cycling once re-armed"
+    assert attempts == ["hci5"], "cycled a card while disarmed"
 
 
 def test_the_kill_switch_charges_no_attempt(env, monkeypatch, tmp_path):
@@ -3594,7 +3601,9 @@ def test_the_kill_switch_charges_no_attempt(env, monkeypatch, tmp_path):
     3-attempt budget, re-arming would find every card already written off
     as beyond reach."""
     env.install(adapters=("hci5",), wrap_scanner=True)
-    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path / "f"))
+    flag = tmp_path.parent / f"no-card-cycle-{tmp_path.name}"
+    flag.write_text("")
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(flag))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
 
     async def scenario():
@@ -3609,7 +3618,9 @@ def test_the_kill_switch_still_lets_a_dead_daemon_be_restarted(env, monkeypatch,
     """The switch takes our hands off the CARDS, not off the box. A dead
     bluetoothd takes all BLE down and restarting it touches no hardware."""
     env.install(adapters=("hci5",), wrap_scanner=True)
-    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path / "f"))
+    flag = tmp_path.parent / f"no-card-cycle-{tmp_path.name}"
+    flag.write_text("")
+    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(flag))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
     called = []
 
@@ -3930,3 +3941,33 @@ def test_a_stolen_hard_claim_stops_the_scan_and_rejoins_the_queue(env):
 
     asyncio.run(scenario())
     assert restarted == [True]
+
+
+def test_a_cycle_only_proceeds_from_a_card_that_emptied_voluntarily(env, monkeypatch):
+    """R4 rests entirely on R2, so the two are worth asserting together and
+    end to end: with a live foreign claim on the card, the whole
+    strike-drain-cycle ladder runs to the drain and stops there. This is what
+    makes default-ON defensible - not that cycling became harmless, but that
+    it can no longer reach a card anybody is on."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+    monkeypatch.setattr(catcher.recovery, "_DRAIN_POLL", 0.02)
+    _foreign_file(env.dir, "hci5.link.0")          # somebody is connected here
+    native = []
+    monkeypatch.setattr(catcher.recovery, "HAS_AUTO_RECOVERY", False)
+
+    async def fake_native(dev_id, adapter, gone_silent):
+        native.append(adapter)
+        return True
+
+    monkeypatch.setattr(catcher.recovery, "_native_recover", fake_native)
+
+    async def scenario():
+        return await catcher.recovery.reset_adapter(
+            "hci5", claims_manager=catcher._config.claims, gone_silent=True, drain_timeout=0.1
+        )
+
+    assert asyncio.run(scenario()) is False
+    assert native == [], "cycled a card with a live foreign link claim"
+    assert "hci5.drain" not in os.listdir(env.dir)

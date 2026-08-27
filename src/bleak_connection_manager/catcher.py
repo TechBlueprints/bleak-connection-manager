@@ -165,47 +165,62 @@ MAX_RECOVERY_ATTEMPTS = 3
 # env var or a config argument on purpose: it must be flippable fleet-wide,
 # on a running box, without editing any consumer and WITHOUT RESTARTING
 # ANYTHING - restarts re-register D-Bus clients and are themselves part of
-# the crash pattern this switch exists to test, so needing one to disarm
+# the crash pattern this switch exists around, so needing one to throw it
 # would confound the experiment it enables. Checked live on every attempt,
 # so touch/rm takes effect within seconds across every process. Under /data
 # so it survives a reboot: a switch thrown to stop hardware being cycled
 # must not quietly re-arm itself at 3am.
-CYCLE_ENABLE_FLAG = "/data/bcm/allow-card-cycle"
+CYCLE_DISABLE_FLAG = "/data/bcm/no-card-cycle"
 
-# DEFAULT IS OFF, and the flag ENABLES rather than disables. Inverted
-# 2026-08-27 after the mechanism was established rather than suspected:
-# cycling a card - USB port reset, or even the HCI down/up rung below it -
-# makes every device on that adapter disappear at once, and
-# device_disappeared -> device_free is precisely the detonation path of
-# the bluez 5.72 gatt-client use-after-free (see the crash write-up).
-# One cycle detonates every landmine planted on that card. Measured on
-# prod: 235 bluetoothd SIGSEGVs on the day drain-and-cycle deployed,
-# against 0 on each of the two preceding days with the same BlueZ binary
-# and the same consumers. Clint, seeing the same shape from the other
-# end: "causing the usb on a bluetooth adapter to turn will kill
-# bluetooth."
+# DEFAULT IS ON: the flag DISABLES. This reverts the 2026-08-27 inversion,
+# and the honest version of why is not "we decided it was fine after all".
 #
-# A default-armed switch would re-arm that detonator silently on any box
-# with a fresh or wiped /data - which is exactly how a fix becomes a
-# recurrence. Turning it back on must be a deliberate act by someone who
-# knows this box's BlueZ carries 476ae809a27e and a94f994201a6 (5.84 /
-# 5.86), or has otherwise established that mass device removal is safe
-# here. Checked live on every attempt, so touch/rm takes effect within
-# seconds across every process without restarting ANYTHING - restarts
-# re-register D-Bus clients and are themselves part of the crash pattern,
-# so needing one to change this setting would confound the experiment it
-# enables. Under /data so it survives a reboot.
+# What was measured then stands: cycling a card - the USB port reset, or
+# even the HCI down/up rung below it - makes every device on that adapter
+# disappear at once, and device_disappeared -> device_free is the detonation
+# path of the BlueZ 5.72 gatt-client use-after-free. Prod recorded 235
+# bluetoothd SIGSEGVs on the day drain-and-cycle deployed, against 0 on each
+# of the two preceding days with the same binary and the same consumers.
+# Turning cycling off was the right emergency action, and if this box's
+# BlueZ still lacks 476ae809a27e and a94f994201a6 (5.84 / 5.86), the flag
+# below is how an operator keeps it off.
+#
+# What changed is not the blast radius, it is WHO CAN BE IN IT. Cycling was
+# dangerous because a reset could fire on a card that was still carrying
+# other people's links: scans started unclaimed on busy cards, InProgress
+# was misread as radio failure, and strikes accumulated against healthy
+# adapters until one was power-cycled with live devices on it. Convention
+# 0.5 removes each of those in turn. Nothing scans without the card's hard
+# claim (R1), so InProgress-as-evidence cannot happen. Nothing NEW starts on
+# a draining card, with no carve-out for pins or explicit adapters (R3), so
+# a drain actually converges. And the reset refuses outright while ANY claim
+# is live, foreign or our own (R2), so a cycle can only ever fire on a card
+# that emptied voluntarily - which means the devices that would be
+# mass-removed have already gone somewhere else, under their own power.
+#
+# That is a property of the code, not of anyone's care, and it is the whole
+# argument for defaulting on. Against it: a card that is genuinely wedged is
+# also a card nobody is using, and steering around it forever guarantees it
+# stays dead. Recovery that can never fire is not caution, it is a fleet
+# quietly losing radios one at a time.
+#
+# The evidence gates in front of this are unchanged and still do the work:
+# bluetoothd alive first, three strikes SPANNING RECOVERY_STRIKE_SPAN,
+# MAX_RECOVERY_ATTEMPTS with proof-clears-attempts, daemon grace stand-down.
 
 # one log line per adapter per armed/disarmed transition, not per attempt
 _cycle_suppressed = set()
 
 
 def card_cycling_disabled():
-    """Whether drain-and-cycle is disarmed. True unless explicitly enabled."""
+    """Whether drain-and-cycle is disarmed. False unless the flag exists."""
     try:
-        return not os.path.exists(CYCLE_ENABLE_FLAG)
+        return os.path.exists(CYCLE_DISABLE_FLAG)
     except OSError:
-        return True
+        # os.path.exists swallows its own errors, so this is close to
+        # unreachable; if it ever is reached, an unreadable /data must not
+        # silently take the fleet's only recovery path away
+        return False
 
 
 # adapter identity -> recovery attempts made; cleared by a successful reset
@@ -301,11 +316,13 @@ async def _recover_daemon(adapter):
 async def _recover_adapter(adapter):
     """Drain the card and cycle it, with attempt accounting.
 
-    Safe by construction rather than by care: reset_adapter takes the
-    exclusive hciN.drain claim, so only one process anywhere attempts a
-    given card, and it refuses outright while any FOREIGN claim is still
-    live - so this can only ever fire on a card nobody else is using, which
-    is precisely the wedged case.
+    Safe by construction rather than by care, and each word of that is load
+    bearing. reset_adapter takes the exclusive drain claim, so only one
+    process anywhere attempts a given card. New work cannot land on a
+    draining card, from any path, so the drain converges instead of being
+    topped up. And the reset refuses outright while ANY claim is live -
+    foreign or our own - so a cycle can only ever fire on a card that emptied
+    voluntarily, which is precisely the wedged case and never the busy one.
     """
     key_early = claims.adapter_key(adapter)
     if card_cycling_disabled():
@@ -316,7 +333,7 @@ async def _recover_adapter(adapter):
         if key_early not in _cycle_suppressed:
             _cycle_suppressed.add(key_early)
             logger.warning(
-                f"BLE scan: card cycling is DISARMED (no {CYCLE_ENABLE_FLAG}) - "
+                f"BLE scan: card cycling is DISARMED ({CYCLE_DISABLE_FLAG} exists) - "
                 f"not draining or cycling {adapter}; it will be steered around instead"
             )
         if not recovery.is_bluetoothd_alive():
