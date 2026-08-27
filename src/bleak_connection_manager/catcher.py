@@ -2475,10 +2475,19 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         # claim. An explicit adapter waits on that ONE card - the caller's
         # choice is never overridden, and "wait for the card you asked for"
         # is the only honest reading of it - and raises the same timeout.
-        if explicit:
-            _bound, self._catcher_claim = await _acquire_scan_adapter(explicit=explicit)
-        else:
-            adapter, self._catcher_claim = await _acquire_scan_adapter()
+        try:
+            if explicit:
+                _bound, self._catcher_claim = await _acquire_scan_adapter(explicit=explicit)
+            else:
+                adapter, self._catcher_claim = await _acquire_scan_adapter()
+        except BaseException:
+            # A scanner that never got a card has no backend either. This
+            # instance may be mid-restart and still carrying the previous
+            # start's backend, and leaving it attached would let
+            # discovered_devices and the watchdog read a scan that is not
+            # running. BaseException, so a cancelled wait clears it too.
+            self._backend = None
+            raise
         try:
             if adapter:
                 # Both spellings, deliberately. Older bleak 3.x BlueZ
