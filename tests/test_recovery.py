@@ -43,28 +43,78 @@ def test_reset_refuses_while_other_processes_hold_claims(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_reset_proceeds_when_the_card_is_unused_by_others(tmp_path, monkeypatch):
-    """Our own claims do not veto - we are the one asking - and a stale
-    foreign file does not either."""
+def test_reset_proceeds_only_from_a_completely_empty_card(tmp_path, monkeypatch):
+    """Zero foreign AND zero own. A stale foreign file is not use - it names
+    no live process - so it does not veto either."""
     calls = _fake_recovery(monkeypatch)
     manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
-    own = manager.claim_soft("hci1")
     stale = _foreign_file(tmp_path, "hci1.link.0", pid=99999999)
     old = time.time() - 3600
     os.utime(stale, (old, old))
 
     assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0)) is True
     assert calls == [(1, recovery.UNKNOWN_MAC, True)]
-    manager.release(own)
 
 
-def test_force_overrides_the_foreign_claims_gate(tmp_path, monkeypatch):
+def test_our_own_claim_vetoes_the_reset_exactly_like_a_foreign_one(tmp_path, monkeypatch):
+    """R2, and the reversal of the rule this replaces. "Our own links are
+    ours to kill" reads reasonably right up until you notice that a straggler
+    is by definition a claim that COULD NOT MOVE - a device's only working
+    card, an operator pin - and that cycling the card makes every device on
+    it disappear in every process at once, which on BlueZ 5.72 is the
+    gatt-client use-after-free going off. Blowing up the one link a device
+    still had, to fix a card that link proves is working, was never a trade
+    worth making."""
     calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+    own = manager.claim_soft("hci1")
+    try:
+        assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0)) is False
+        assert calls == []
+        assert not os.path.exists(os.path.join(str(tmp_path), "hci1.drain"))
+    finally:
+        manager.release(own)
+
+
+def test_force_still_respects_the_in_use_veto(tmp_path, monkeypatch):
+    """force bypasses the EVIDENCE gates (which live in the catcher), never
+    the empty-card veto. An override that could cycle a card carrying live
+    links would make the path an operator reaches for in a crisis the one
+    path that can detonate the fleet."""
+    calls = _fake_recovery(monkeypatch)
+    monkeypatch.setattr(recovery, "_DRAIN_POLL", 0.03)
     manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
     _foreign_file(tmp_path, "hci1.scan")
 
-    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, force=True)) is True
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, force=True, drain_timeout=0.15)) is False
+    assert calls == []
+
+
+def test_force_takes_the_drain_claim_like_any_other_reset(tmp_path, monkeypatch):
+    """It still coordinates: the drain is what keeps other processes from
+    placing new work onto the card mid-reset, and it is released after."""
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+    seen = []
+    manager.on_release = lambda claim: seen.append(os.path.basename(claim.path))
+
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, force=True, drain_timeout=0)) is True
     assert len(calls) == 1
+    assert "hci1.drain" in seen
+    assert not os.path.exists(os.path.join(str(tmp_path), "hci1.drain"))
+
+
+def test_an_uncoordinated_reset_says_so(tmp_path, monkeypatch, caplog):
+    """With no manager this reset cannot see, drain or honour another
+    process's links. It still runs - some callers genuinely have no
+    coordination available - but the mass device removal it causes elsewhere
+    must not be unattributable."""
+    import logging
+
+    _fake_recovery(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(recovery.reset_adapter("hci1")) is True
+    assert "UNCOORDINATED" in caplog.text
 
 
 def test_reset_rejects_non_hci_adapter_names(monkeypatch):
@@ -212,17 +262,44 @@ def test_a_second_resetter_backs_off_a_foreign_drain(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_drain_proceeds_past_our_own_unmigratable_claims(tmp_path, monkeypatch):
-    """Own claims are waited on, not vetoed: we are the one asking, so at
-    the deadline the reset proceeds - the old uncoordinated behavior."""
+def test_drain_refuses_at_the_deadline_for_our_own_unmigratable_claims(tmp_path, monkeypatch):
+    """Own claims are waited on AND vetoed. The wait gives them a chance to
+    migrate; the veto is what happens when they could not, and it is the
+    same answer a foreign holder gets. Existing work always beats
+    maintenance, and the drain file is released so placement stops steering
+    away from a card nobody is going to reset."""
     calls = _fake_recovery(monkeypatch)
     monkeypatch.setattr(recovery, "_DRAIN_POLL", 0.03)
     manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
     manager.claim_soft("hci1")
     try:
-        assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0.15)) is True
+        assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0.15)) is False
     finally:
         manager.release_all()
+    assert calls == []
+    assert not os.path.exists(os.path.join(str(tmp_path), "hci1.drain"))
+
+
+def test_a_drain_that_our_own_work_leaves_in_time_still_resets(tmp_path, monkeypatch):
+    """The veto is a veto on work that CANNOT move, not on our own work as
+    such: a claim released inside the window lets the reset through."""
+    calls = _fake_recovery(monkeypatch)
+    monkeypatch.setattr(recovery, "_DRAIN_POLL", 0.03)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+    own = manager.claim_soft("hci1")
+
+    async def scenario():
+        async def migrate():
+            await asyncio.sleep(0.08)
+            manager.release(own)
+
+        results = await asyncio.gather(
+            recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=2.0),
+            migrate(),
+        )
+        return results[0]
+
+    assert asyncio.run(scenario()) is True
     assert len(calls) == 1
 
 
