@@ -330,6 +330,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
     monkeypatch.setattr(catcher, "_scan_failure_since", {})
+    # Card cycling now defaults to DISARMED in the field (it detonates the
+    # bluez 5.72 UAF). Tests that exercise cycling opt in here; the switch's
+    # own tests point the flag elsewhere and override this.
+    # Any existing path enables. Point at a directory OUTSIDE the claim dir
+    # (which is tmp_path itself) so the many "claims released, dir empty"
+    # assertions still see an empty directory.
+    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path.parent))
+    catcher._cycle_suppressed.clear()
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
     def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=catcher.GATT_OP_TIMEOUT):
@@ -3395,8 +3403,8 @@ def test_the_kill_switch_stops_the_card_being_cycled(env, monkeypatch, tmp_path)
     test it exists to enable."""
     env.install(adapters=("hci5",), wrap_scanner=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
-    flag = tmp_path / "no-card-cycle"
-    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(flag))
+    flag = tmp_path / "allow-card-cycle"
+    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(flag))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
     attempts = []
 
@@ -3407,10 +3415,10 @@ def test_the_kill_switch_stops_the_card_being_cycled(env, monkeypatch, tmp_path)
     monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
 
     async def scenario():
-        flag.write_text("")                      # disarmed, no restart
+        assert not flag.exists()                 # default: disarmed
         assert await catcher._recover_adapter("hci5") is False
         assert attempts == [], "cycled a card while disarmed"
-        flag.unlink()                            # re-armed, live
+        flag.write_text("")                      # opt in, live, no restart
         await catcher._recover_adapter("hci5")
 
     asyncio.run(scenario())
@@ -3422,8 +3430,7 @@ def test_the_kill_switch_charges_no_attempt(env, monkeypatch, tmp_path):
     3-attempt budget, re-arming would find every card already written off
     as beyond reach."""
     env.install(adapters=("hci5",), wrap_scanner=True)
-    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(tmp_path / "f"))
-    (tmp_path / "f").write_text("")
+    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path / "f"))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
 
     async def scenario():
@@ -3438,8 +3445,7 @@ def test_the_kill_switch_still_lets_a_dead_daemon_be_restarted(env, monkeypatch,
     """The switch takes our hands off the CARDS, not off the box. A dead
     bluetoothd takes all BLE down and restarting it touches no hardware."""
     env.install(adapters=("hci5",), wrap_scanner=True)
-    monkeypatch.setattr(catcher, "CYCLE_DISABLE_FLAG", str(tmp_path / "f"))
-    (tmp_path / "f").write_text("")
+    monkeypatch.setattr(catcher, "CYCLE_ENABLE_FLAG", str(tmp_path / "f"))
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
     called = []
 

@@ -141,18 +141,42 @@ MAX_RECOVERY_ATTEMPTS = 3
 # so touch/rm takes effect within seconds across every process. Under /data
 # so it survives a reboot: a switch thrown to stop hardware being cycled
 # must not quietly re-arm itself at 3am.
-CYCLE_DISABLE_FLAG = "/data/bcm/no-card-cycle"
+CYCLE_ENABLE_FLAG = "/data/bcm/allow-card-cycle"
+
+# DEFAULT IS OFF, and the flag ENABLES rather than disables. Inverted
+# 2026-08-27 after the mechanism was established rather than suspected:
+# cycling a card - USB port reset, or even the HCI down/up rung below it -
+# makes every device on that adapter disappear at once, and
+# device_disappeared -> device_free is precisely the detonation path of
+# the bluez 5.72 gatt-client use-after-free (see the crash write-up).
+# One cycle detonates every landmine planted on that card. Measured on
+# prod: 235 bluetoothd SIGSEGVs on the day drain-and-cycle deployed,
+# against 0 on each of the two preceding days with the same BlueZ binary
+# and the same consumers. Clint, seeing the same shape from the other
+# end: "causing the usb on a bluetooth adapter to turn will kill
+# bluetooth."
+#
+# A default-armed switch would re-arm that detonator silently on any box
+# with a fresh or wiped /data - which is exactly how a fix becomes a
+# recurrence. Turning it back on must be a deliberate act by someone who
+# knows this box's BlueZ carries 476ae809a27e and a94f994201a6 (5.84 /
+# 5.86), or has otherwise established that mass device removal is safe
+# here. Checked live on every attempt, so touch/rm takes effect within
+# seconds across every process without restarting ANYTHING - restarts
+# re-register D-Bus clients and are themselves part of the crash pattern,
+# so needing one to change this setting would confound the experiment it
+# enables. Under /data so it survives a reboot.
 
 # one log line per adapter per armed/disarmed transition, not per attempt
 _cycle_suppressed = set()
 
 
 def card_cycling_disabled():
-    """Whether the operator has disarmed drain-and-cycle."""
+    """Whether drain-and-cycle is disarmed. True unless explicitly enabled."""
     try:
-        return os.path.exists(CYCLE_DISABLE_FLAG)
+        return not os.path.exists(CYCLE_ENABLE_FLAG)
     except OSError:
-        return False
+        return True
 
 
 # adapter identity -> recovery attempts made; cleared by a successful reset
@@ -263,7 +287,7 @@ async def _recover_adapter(adapter):
         if key_early not in _cycle_suppressed:
             _cycle_suppressed.add(key_early)
             logger.warning(
-                f"BLE scan: card cycling is DISARMED ({CYCLE_DISABLE_FLAG} present) - "
+                f"BLE scan: card cycling is DISARMED (no {CYCLE_ENABLE_FLAG}) - "
                 f"not draining or cycling {adapter}; it will be steered around instead"
             )
         if not recovery.is_bluetoothd_alive():
