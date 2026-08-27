@@ -819,6 +819,55 @@ def _spawn_migration(coro_fn, label):
     task.add_done_callback(_migration_tasks.discard)
 
 
+# The most recent event loop any wrapper ran on. The heartbeat thread has
+# no loop of its own, and an idle process may hold no live client or
+# scanner to borrow one from - which is exactly the process that needs the
+# check below.
+_last_loop = None
+
+
+def _remember_loop(loop):
+    global _last_loop
+    _last_loop = loop
+
+
+def _heartbeat_loop():
+    for obj in list(_live_clients) + list(_live_scanners):
+        loop = getattr(obj, "_catcher_loop", None)
+        if loop is not None and not loop.is_closed():
+            return loop
+    loop = _last_loop
+    return loop if loop is not None and not loop.is_closed() else None
+
+
+def _heartbeat_daemon_check():
+    """Notice a dead bluetoothd even when nothing is asking for BLE.
+
+    Every other daemon check hangs off a FAILURE - a scan that would not
+    start, a connect that would not complete. That makes the guard blind
+    on an idle box: with no consumer attempting anything, nothing fails,
+    so nothing looks, and the daemon stays dead until someone happens to
+    want Bluetooth. Found on dev 2026-08-27 by the sensors-py session,
+    whose service was stopped for an experiment: bluetoothd died and
+    stayed down with no one to notice.
+
+    The claim heartbeat ticks on a timer whether or not any BLE work is
+    happening, which makes it the one place a purely idle process still
+    looks at the world. _maybe_recover_daemon is itself throttled, so
+    this costs one /proc walk per DAEMON_CHECK_INTERVAL at most.
+
+    A box running NO BCM consumer still has no watchdog - that is
+    Victron's supervision gap, not one we can close from here.
+    """
+    loop = _heartbeat_loop()
+    if loop is None:
+        return
+    try:
+        loop.call_soon_threadsafe(_maybe_recover_daemon, None)
+    except Exception:
+        logger.debug("BLE: heartbeat daemon check raised", exc_info=True)
+
+
 def _drain_watch():
     """Honor foreign drain claims: migrate our work off a draining card.
 
@@ -837,6 +886,7 @@ def _drain_watch():
     config = _config
     if config is None:
         return
+    _heartbeat_daemon_check()
     snapshot = config.claims.claims()
     draining = {a for a, entry in snapshot.items() if entry.get("drain")}
     if not draining:
@@ -1593,6 +1643,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_explicit = bool(explicit)
         self._catcher_drain_kicked = None
         self._catcher_loop = asyncio.get_running_loop()
+        _remember_loop(self._catcher_loop)
         _live_clients.add(self)
         self._arm_claim_validity()
         return result
@@ -2148,6 +2199,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_explicit = bool(explicit)
         self._catcher_drain_kicked = None
         self._catcher_loop = asyncio.get_running_loop()
+        _remember_loop(self._catcher_loop)
         _live_scanners.add(self)
         now = _monotonic()
         self._catcher_start_time = now

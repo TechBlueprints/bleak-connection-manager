@@ -326,6 +326,12 @@ def env(tmp_path, monkeypatch):
     catcher._recovering.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
+    # wrappers from earlier tests linger in the weaksets until GC and carry
+    # their (closed) loops with them; the heartbeat check borrows a loop
+    # from exactly these, so a stale one makes it silently target a dead loop
+    catcher._live_clients.clear()
+    catcher._live_scanners.clear()
+    catcher._last_loop = None
     monkeypatch.setattr(catcher, "_rotation", catcher.BleAdapterRotation())
     monkeypatch.setattr(catcher, "_connect_failures", {})
     monkeypatch.setattr(catcher, "_scan_failures", {})
@@ -3456,3 +3462,50 @@ def test_the_kill_switch_still_lets_a_dead_daemon_be_restarted(env, monkeypatch,
     monkeypatch.setattr(catcher, "_recover_daemon", fake_daemon)
     asyncio.run(catcher._recover_adapter("hci5"))
     assert called == ["hci5"]
+
+
+def test_the_heartbeat_notices_a_dead_daemon_with_nothing_failing(env, monkeypatch):
+    """Found on dev 2026-08-27: every other daemon check hangs off a
+    FAILURE, so an idle process (a consumer in a long reconnect backoff,
+    or one whose devices are all disconnected) never looks, and bluetoothd
+    stays dead until someone happens to want Bluetooth. The claim
+    heartbeat ticks on a timer, so it is the one place an idle process
+    still looks at the world."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "_daemon_dead_at", None)
+    monkeypatch.setattr(catcher, "_last_daemon_check", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    restarts = []
+
+    async def fake_restart(*a, **k):
+        restarts.append(1)
+        return True
+
+    async def fake_invalidate():
+        pass
+
+    monkeypatch.setattr(catcher.recovery, "restart_bluetoothd", fake_restart)
+    monkeypatch.setattr(catcher.recovery, "invalidate_dbus_state", fake_invalidate)
+
+    async def scenario():
+        # a live loop exists, but NOTHING is failing and no client or
+        # scanner is alive to borrow it from - the idle-box shape
+        catcher._remember_loop(asyncio.get_running_loop())
+        assert not catcher._live_clients and not catcher._live_scanners
+        catcher._drain_watch()                       # runs on the heartbeat thread
+        await asyncio.sleep(0)                       # let the scheduled check run
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert restarts == [1], "an idle process never noticed the daemon was gone"
+
+
+def test_the_heartbeat_check_is_silent_with_no_loop_to_use(env, monkeypatch):
+    """Before any wrapper has run there is no loop to schedule onto. The
+    check must not raise on the heartbeat thread - a hook that throws
+    would take the drain watch down with it."""
+    env.install(adapters=("hci5",))
+    monkeypatch.setattr(catcher, "_last_loop", None)
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
+    catcher._drain_watch()          # must not raise
