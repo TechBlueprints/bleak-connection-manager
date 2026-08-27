@@ -96,6 +96,35 @@ LINK_EVIDENCE_MAX = 300.0
 # rotated off", which is a state the rest of this machinery can act on.
 SCAN_OP_TIMEOUT = 30.0
 
+# How long a scan waits for an adapter's hard claim before giving up, and how
+# often it re-evaluates while it waits.
+#
+# There used to be no wait, because there was no gate: with every card
+# claimed, a scan simply started on the best-ranked one anyway, on the
+# reasoning that coordination is an optimization and must never keep a
+# service off the air. On 2026-08-26 that reasoning cost the fleet a day.
+# Two scans on one card means BlueZ answers the second StartDiscovery with
+# InProgress; the wrapper had no way to tell that apart from a radio that
+# would not start, so it scored a strike against a HEALTHY adapter; three
+# strikes drained and power-cycled it; and every cycle mass-disappeared the
+# devices on that card, which is the detonation path of the BlueZ 5.72
+# gatt-client use-after-free. The unclaimed scan was not a graceful
+# degradation, it was the input that made the evidence lie.
+#
+# So the claim is a GATE and the fallthrough is gone. A scan that cannot have
+# a card queues for one and is told, in the error, exactly who is holding
+# what. 30s is chosen against the things a waiter is actually waiting for: an
+# RSSI sweep window is 10s, a drain deadline is 60s but frees the card the
+# moment its reset finishes, and bleak-retry-connector's own retry budget sits
+# well above this - so a wait long enough to ride out a sweep, and short
+# enough that a stuck holder surfaces as a named failure rather than a hang.
+SCAN_CLAIM_WAIT = 30.0
+# The poll is the floor and the correctness guarantee. The in-process release
+# event below is an optimization on top of it: a claim released by another
+# PROCESS fires no event here, and neither does one released by a thread the
+# event plumbing has not reached, so nothing may depend on an event arriving.
+SCAN_CLAIM_POLL = 1.0
+
 # Default ceiling for GATT operations and disconnects that arrive with no
 # deadline of their own. This is NOT primarily about protecting the caller:
 # an unbounded wait destroys the EVIDENCE. A call that can hang forever
@@ -432,6 +461,19 @@ class OutOfConnectionSlotsError(BleakError):
     """
 
 
+class ScanSlotWaitTimeout(BleakError):
+    """No scan-eligible adapter's hard claim came free within SCAN_CLAIM_WAIT.
+
+    Deliberately NOT an out-of-slots error: the message must not start with
+    "connection slot", because this is not a connect and brc's out-of-slots
+    backoff is not the right pacing for it. The message names every candidate
+    and its holder (service, pid, how long it has held) plus this waiter's
+    queue position, because a scan that gave up after 30s is only actionable
+    if it says who it was waiting on - and a holder that never lets go is a
+    bug in that holder, which nobody can find from "scan failed".
+    """
+
+
 class ConnectionValidationError(BleakError):
     """A connect succeeded but the caller's validator rejected the link.
 
@@ -736,12 +778,26 @@ def _responsive_adapters(candidates):
 
 
 def _undrained_adapters(candidates, snapshot):
-    """Drop adapters with a live drain claim - some process is emptying the
-    card to reset it, and new work placed there would land in the blast
-    radius (or hold the reset off forever). Never gates: when everything is
-    draining, the unfiltered list is used - a drain steers, never refuses."""
-    clear = [a for a in candidates if not _entry(snapshot, a).get("drain")]
-    return clear or candidates
+    """Drop adapters with a live drain claim. NO fallback: when every
+    candidate is draining, this returns an empty list and the caller waits.
+
+    The "or candidates" fallback that used to be here made a drain a ranking
+    penalty rather than a gate, and a ranking penalty is not a thing a reset
+    can be built on. Work placed onto a draining card tops the drain back up,
+    so either the resetter never sees the card empty (and gives up at its
+    deadline, having steered every other process off a card it then did not
+    fix) or - worse - it proceeds against claims that arrived after it
+    started counting. The reset in this package is only safe because it can
+    ONLY fire on a card that emptied voluntarily, and that property is this
+    filter having no exceptions: not for pins, not for caller-explicit
+    adapters, not for the last card standing.
+
+    A drain window is bounded - the resetter's own deadline, 60s - so the
+    cost of waiting it out is bounded too. A scan queues (see
+    _acquire_scan_adapter); a connect raises the typed out-of-slots error and
+    bleak-retry-connector's 4s backoff paces the retries across the window.
+    """
+    return [a for a in candidates if not _entry(snapshot, a).get("drain")]
 
 
 # adapter identity -> consecutive failed scanner starts, feeding scan
@@ -868,6 +924,35 @@ def _heartbeat_daemon_check():
         logger.debug("BLE: heartbeat daemon check raised", exc_info=True)
 
 
+def _lost_claim_watch():
+    """Stop any scanner whose hard claim was proved to be somebody else's.
+
+    The other half of the 0.5 ownership check (claims.Claim.owns). A claim
+    marked lost means the well-known name now points at another process's
+    file, so this scanner is scanning a card it does not hold - the exact
+    state the gate exists to make impossible. It cannot simply carry on: the
+    holder is entitled to that radio. Restarting rejoins the queue through
+    the normal gate, which is where a scanner that lost a card belongs.
+
+    Runs on the claim heartbeat thread, so the restart is marshalled onto the
+    scanner's own loop like every other migration here.
+    """
+    for scanner in list(_live_scanners):
+        claim = scanner._catcher_claim
+        if claim is None or not getattr(claim, "lost", False):
+            continue
+        if scanner._catcher_restarting:
+            continue
+        loop = scanner._catcher_loop
+        if loop is None or loop.is_closed():
+            continue
+        logger.warning(
+            f"BLE scan: the hard claim on {scanner._catcher_adapter} is no longer ours - "
+            "stopping this scan and rejoining the queue"
+        )
+        loop.call_soon_threadsafe(_spawn_migration, scanner._drain_restart, "reclaim")
+
+
 def _drain_watch():
     """Honor foreign drain claims: migrate our work off a draining card.
 
@@ -887,6 +972,7 @@ def _drain_watch():
     if config is None:
         return
     _heartbeat_daemon_check()
+    _lost_claim_watch()
     snapshot = config.claims.claims()
     draining = {a for a, entry in snapshot.items() if entry.get("drain")}
     if not draining:
@@ -1100,6 +1186,29 @@ def _out_of_slots_error(address, exhausted, config):
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
+def _all_draining_error(address, adapters, config):
+    """The typed error for "every candidate is being emptied for a reset".
+
+    Same class and the same leading "connection slot" substring as real slot
+    exhaustion, because it wants exactly the same treatment from the layer
+    above: bleak-retry-connector string-matches that substring
+    (OUT_OF_SLOTS_ERRORS) and applies its 4s out-of-slots backoff on any
+    version. A drain window is bounded by the resetter's own deadline - 60s -
+    and brc's paced retries ride that out, so the honest thing to tell it is
+    "not now, pace yourself", which is precisely what this error means to it.
+
+    There is no fallback onto a draining card for ANY connect - scored,
+    pinned or caller-explicit. A pin is an operator's preference about which
+    radio a device should prefer; it is not an instruction to walk into a
+    reset in progress, and a carve-out for it would be a carve-out in the one
+    property that makes the reset safe (see _undrained_adapters).
+    """
+    return OutOfConnectionSlotsError(
+        f"connection slot unavailable for {address}: every candidate adapter is draining for a "
+        f"reset ({', '.join(adapters) or 'none'}) - new work waits rather than joining one"
+    )
+
+
 def _score_order(eligible, address_key, snapshot, config, rssi=None):
     """Candidates best-first, by habluetooth-parity connect scoring.
 
@@ -1190,7 +1299,10 @@ def _acquire_adapter(address):
     if not eligible:
         logger.info(f"BLE [{address}]: every usable adapter is scan-claimed by another process, using them anyway")
         eligible = usable
-    eligible = _undrained_adapters(eligible, snapshot)
+    drain_free = _undrained_adapters(eligible, snapshot)
+    if not drain_free:
+        raise _all_draining_error(address, eligible, config)
+    eligible = drain_free
     if pins:
         start = _rotation.index(address) % len(eligible)
         ordered = eligible[start:] + eligible[:start]
@@ -1233,6 +1345,12 @@ def _claim_explicit(adapter, address):
     config = _config
     if config is None:
         return []
+    # ...but a drain still gates, and this is the one place it must, because
+    # an explicit adapter is the last path that could still put new work onto
+    # a card being emptied. The caller's choice is honoured about WHICH card,
+    # never about whether a reset in progress may be walked into.
+    if _entry(config.claims.claims(), adapter).get("drain"):
+        raise _all_draining_error(address, [adapter], config)
     cap = _cap_for(config, adapter)
     if cap:
         slot = config.claims.claim_slot(adapter, cap)
@@ -1903,48 +2021,258 @@ def _scan_candidates(config, present):
     return []
 
 
-def _acquire_scan_adapter():
-    """Choose an adapter for a scan and take its hard claim.
+def _scan_placement(config, snapshot, explicit=None):
+    """(every candidate, drain-free candidates best-first) for a scan.
 
-    Returns (adapter-or-None, Claim-or-None). Candidates are filtered by
-    kernel presence (falling back to the unfiltered list), ranked by live
-    occupancy - fewest soft claims plus held link slots first, configuration
-    order breaking ties - and the best claimable card wins; claim_hard
-    itself skips cards another live process is scanning on. When every card
-    is claimed, the best-ranked one is scanned anyway, unclaimed:
-    coordination is an optimization, never a gate.
+    Candidates are filtered by kernel presence (falling back to the
+    unfiltered list - a card the kernel is not admitting to right now is
+    still worth attempting) and by responsiveness, then ranked by live
+    occupancy plus this card's scan-failure memory, configuration order
+    breaking ties. Scan selection has no failure-driven walk, so without the
+    failure term a dead-but-listed adapter would win every tie forever; a
+    successful start clears the count.
+
+    Draining cards are removed from the ranked list and NOT from the first
+    one, because the two answer different questions: what could this scan
+    ever use, and what may it start on right now.
     """
-    config = _config
-    if config is None:
-        return None, None
+    if explicit:
+        adapter = str(explicit)
+        return [adapter], ([] if _entry(snapshot, adapter).get("drain") else [adapter])
     present = present_adapters()
     candidates = _scan_candidates(config, present)
     if not candidates:
-        return None, None
+        return [], []
     usable = [a for a in candidates if a in present] if present else candidates
     if not usable:
-        # refusing to scan is worse than scanning an adapter that may be gone
         usable = candidates
     usable = _responsive_adapters(usable)
-    snapshot = config.claims.claims()
-    usable = _undrained_adapters(usable, snapshot)
 
     def rank(adapter):
-        # occupancy first, like connect scoring - but scans also carry
-        # start-failure memory: scan selection has no failure-driven walk,
-        # so without it a dead-but-listed adapter would win every tie
-        # forever (a successful start clears the count)
         entry = _entry(snapshot, adapter)
         occupancy = entry.get("soft", 0) + entry.get("links", 0)
         return (occupancy + _scan_failures.get(claims.adapter_key(adapter), 0), usable.index(adapter))
 
-    ranked = sorted(usable, key=rank)
-    for adapter in ranked:
-        claim = config.claims.claim_hard(adapter)
-        if claim is not None:
-            return adapter, claim
-    logger.info(f"bt-claims: every adapter is scan-claimed, scanning on {ranked[0]} unclaimed")
-    return ranked[0], None
+    return usable, sorted(_undrained_adapters(usable, snapshot), key=rank)
+
+
+# One asyncio.Event per event loop, set whenever an exclusive claim is
+# released anywhere in this process, so a queued scanner wakes on the
+# handover instead of on its next poll tick. Per loop because an Event
+# belongs to the loop that awaits it, and a process may run several (a test
+# suite runs one per asyncio.run). Keyed by the loop object itself, which is
+# hashable and lets closed loops be dropped on sight.
+_scan_wake_events = {}
+
+
+def _scan_wake_event():
+    for closed in [loop for loop in _scan_wake_events if loop.is_closed()]:
+        _scan_wake_events.pop(closed, None)
+    loop = asyncio.get_running_loop()
+    event = _scan_wake_events.get(loop)
+    if event is None:
+        event = asyncio.Event()
+        _scan_wake_events[loop] = event
+    return event
+
+
+def _wake_scan_waiters(claim):
+    """ClaimManager.on_release hook: an exclusive name just freed.
+
+    May run on the heartbeat thread (the validity sweep releases from there),
+    so every event is set through call_soon_threadsafe. Drain releases count:
+    a card coming out of a drain is exactly the moment waiters excluded from
+    it become able to use it again.
+    """
+    if not str(getattr(claim, "path", "")).endswith((".scan", ".drain")):
+        return
+    for loop, event in list(_scan_wake_events.items()):
+        if loop.is_closed():
+            _scan_wake_events.pop(loop, None)
+            continue
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            _scan_wake_events.pop(loop, None)
+
+
+def _waiters(snapshot, adapter):
+    return _entry(snapshot, adapter).get("waiters") or []
+
+
+def _is_our_ticket(waiter, ticket):
+    return ticket is not None and waiter[3] == os.path.basename(ticket.path)
+
+
+def _queue_position(waiters, ticket):
+    """How many tickets sit ahead of ours in one adapter's queue, or None if
+    ours is not in it (a snapshot older than our write, or a ticket reaped
+    from under us) - which callers read as "unknown, assume the back"."""
+    if ticket is None:
+        return None
+    name = os.path.basename(ticket.path)
+    for index, waiter in enumerate(waiters):
+        if waiter[3] == name:
+            return index
+    return None
+
+
+def _queue_target(snapshot, ranked, ticket, queued_on, migrating):
+    """Where this waiter should be queued, or None to stay put.
+
+    Unqueued: the candidate with the FEWEST waiters, ties broken by occupancy
+    and then configuration order (which is the order `ranked` already
+    carries).
+
+    Queued: move only when another candidate's TOTAL waiter count is strictly
+    LESS than the number of waiters AHEAD of us here. Strict, and evaluated
+    on the poll tick only - never on a wake event - and that pair is the
+    whole anti-thrash mechanism. Non-strict would let two waiters swap queues
+    forever, each seeing the other's queue as equally good; evaluating it on
+    events would let one release trigger a stampede of simultaneous
+    migrations, each computed from the same instant's snapshot. With the
+    strict form, every move reduces this waiter's own position and no move
+    can be reciprocated, so the queues settle.
+
+    A card that has started draining is not in `ranked` at all, which makes
+    its queue infinitely expensive: every other candidate becomes a
+    migration target, and a waiter whose card is the only one simply stays
+    where it is and wakes when the drain releases.
+    """
+    if not ranked:
+        return None
+    if ticket is None or queued_on not in ranked:
+        if ticket is not None and not migrating:
+            # the card we are on started draining, but this is an event
+            # wake - migration is tick-only, so leave it for the tick
+            return None
+        best = min(ranked, key=lambda a: (len(_waiters(snapshot, a)), ranked.index(a)))
+        return best if best != queued_on else None
+    if not migrating:
+        return None
+    ahead = _queue_position(_waiters(snapshot, queued_on), ticket)
+    if ahead is None:
+        ahead = len(_waiters(snapshot, queued_on))
+    better = [a for a in ranked if a != queued_on and len(_waiters(snapshot, a)) < ahead]
+    if not better:
+        return None
+    return min(better, key=lambda a: (len(_waiters(snapshot, a)), ranked.index(a)))
+
+
+def _scan_wait_detail(manager, snapshot, candidates, ticket, queued_on):
+    """Who every candidate is held by, for the wait warning and the timeout."""
+    parts = []
+    for adapter in candidates:
+        entry = _entry(snapshot, adapter)
+        info = manager.holder_info(adapter)
+        if info is not None:
+            age = f"{info['age']:.0f}s" if info.get("age") is not None else "unknown age"
+            parts.append(f"{adapter} scanned by {info['service']} (pid {info['pid']}, held {age})")
+        elif entry.get("drain"):
+            parts.append(f"{adapter} draining (pid {entry.get('drain_pid')})")
+        else:
+            parts.append(f"{adapter} claimed by someone this process cannot name")
+    detail = "; ".join(parts) or "no eligible adapter"
+    if queued_on is not None:
+        waiters = _waiters(snapshot, queued_on)
+        ahead = _queue_position(waiters, ticket)
+        place = (ahead + 1) if ahead is not None else len(waiters)
+        detail += f" - queued {place} of {len(waiters)} on {queued_on}"
+    return detail
+
+
+async def _acquire_scan_adapter(explicit=None):
+    """Take a scan-eligible adapter's hard claim, waiting for one if need be.
+
+    Returns (adapter-or-None, Claim-or-None) and raises ScanSlotWaitTimeout
+    if no candidate frees within SCAN_CLAIM_WAIT. (None, None) means there is
+    nothing to claim at all - no config, and no card the kernel admits to -
+    which is the unconfigured passthrough the wrapper has always had: no
+    adapter is chosen, so there is no adapter's claim to hold.
+
+    A claim is a gate: this function never returns an adapter without its
+    claim. The queue it maintains while waiting (see _queue_target) exists so
+    that N waiting scanners spread themselves across M free-ing cards instead
+    of all watching the same best-ranked one.
+    """
+    config = _config
+    if config is None:
+        return None, None
+    manager = config.claims
+    event = _scan_wake_event()
+    deadline = _monotonic() + SCAN_CLAIM_WAIT
+    ticket = None
+    queued_on = None
+    announced = False
+    migrating = False  # the first pass places; only poll ticks may migrate
+    try:
+        while True:
+            snapshot = manager.claims()
+            candidates, ranked = _scan_placement(config, snapshot, explicit)
+            if not candidates:
+                return None, None
+            for adapter in ranked:
+                entry = _entry(snapshot, adapter)
+                if entry.get("hard"):
+                    continue
+                # free, and either unqueued or queued by nobody but us: a
+                # waiter that jumped an existing queue here would make the
+                # queue meaningless, and one that refused to take a card
+                # holding only its own ticket would deadlock on itself
+                if any(not _is_our_ticket(w, ticket) for w in _waiters(snapshot, adapter)):
+                    continue
+                claim = manager.claim_hard(adapter)
+                if claim is not None:
+                    return adapter, claim
+            if ticket is not None and queued_on in ranked and not _entry(snapshot, queued_on).get("hard"):
+                # oldest ticket on a card that just freed: our turn
+                if _queue_position(_waiters(snapshot, queued_on), ticket) == 0:
+                    claim = manager.claim_hard(queued_on)
+                    if claim is not None:
+                        return queued_on, claim
+            target = _queue_target(snapshot, ranked, ticket, queued_on, migrating)
+            if target is not None:
+                fresh = manager.claim_scanwait(target)
+                if fresh is not None:
+                    if ticket is not None:
+                        manager.release(ticket)
+                    ticket, queued_on = fresh, target
+            if not announced:
+                announced = True
+                logger.warning(
+                    f"BLE scan: all {len(candidates)} scan-eligible adapter(s) are held, waiting up to "
+                    f"{SCAN_CLAIM_WAIT:.0f}s for one - "
+                    f"{_scan_wait_detail(manager, snapshot, candidates, ticket, queued_on)}"
+                )
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise ScanSlotWaitTimeout(
+                    f"no scan-eligible adapter came free within {SCAN_CLAIM_WAIT:.0f}s: "
+                    f"{_scan_wait_detail(manager, snapshot, candidates, ticket, queued_on)}"
+                )
+            # per-tick evaluation is silent: one warning at the top, one
+            # error at the bottom, nothing in between - a 30s wait polled
+            # every second is 30 log lines per scanner otherwise
+            migrating = not await _wait_for_release(event, min(SCAN_CLAIM_POLL, remaining))
+    finally:
+        # every exit path: acquired, timed out, cancelled. A ticket left
+        # behind would lengthen a queue on behalf of a scanner that is no
+        # longer waiting, and every other waiter would place around a
+        # phantom until the TTL reaped it.
+        if ticket is not None:
+            manager.release(ticket)
+
+
+async def _wait_for_release(event, timeout):
+    """Wait for an in-process claim release, or the poll tick. True if the
+    event fired - which is the signal NOT to migrate: migration is a
+    poll-tick decision, so that one release cannot start a stampede."""
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+    except asyncio.TimeoutError:
+        return False
+    event.clear()
+    return True
 
 
 class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
@@ -2125,11 +2453,15 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_manager = config.claims if config is not None else None
         adapter = None
         explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
+        # The gate, and it is ahead of everything: no backend is built and no
+        # StartDiscovery is issued until this process holds the card's hard
+        # claim. An explicit adapter waits on that ONE card - the caller's
+        # choice is never overridden, and "wait for the card you asked for"
+        # is the only honest reading of it - and raises the same timeout.
         if explicit:
-            if config is not None:
-                self._catcher_claim = config.claims.claim_hard(explicit)
+            _bound, self._catcher_claim = await _acquire_scan_adapter(explicit=explicit)
         else:
-            adapter, self._catcher_claim = _acquire_scan_adapter()
+            adapter, self._catcher_claim = await _acquire_scan_adapter()
         try:
             if adapter:
                 # Both spellings, deliberately. Older bleak 3.x BlueZ
@@ -2257,19 +2589,31 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             # the stop's INTENT is satisfied and raising would only destroy
             # the caller's find/teardown - bleak#958 is this exact trace,
             # closed "a BlueZ bug"; bleak already swallows NotReady here.
-            # Counted anyway: the strike is insurance, not blame - a card
-            # producing these persistently reaches the three-strike drain
-            # and cycle, and any completed link or advertisement wipes the
-            # record. Not retried: bleak's stop() nulls its _stop closure
-            # before invoking it, so a second call is a silent no-op.
+            # Counted for RANKING, and no longer as evidence for recovery.
+            # With the 0.5 gate in place an InProgress here should be
+            # impossible: it means two discovery sessions overlapped on one
+            # card, and nothing reaches StartDiscovery now without holding
+            # that card's exclusive claim. So seeing one is a report that a
+            # scan escaped the claim convention - a bug in this package, or a
+            # participant not following it - and the one thing it is NOT is
+            # evidence that the radio is broken. Reading it that way is what
+            # power-cycled healthy adapters through 2026-08-26.
+            #
+            # The strike stays because ranking off a card that keeps doing
+            # this costs nothing and helps; the _schedule_recovery call is
+            # gone, because charging a card for someone else's protocol
+            # violation is how the fleet melted. Not retried: bleak's stop()
+            # nulls its _stop closure before invoking it, so a second call is
+            # a silent no-op.
             adapter = self._catcher_adapter
             logger.warning(
                 f"BLE scan: StopDiscovery on {adapter or 'the default adapter'} answered "
-                f"InProgress - the kernel had already stopped scanning and BlueZ had "
-                f"detached the session; treating the scan as stopped, counting a strike"
+                f"InProgress - the kernel had already stopped scanning and BlueZ had detached "
+                f"the session. With the scan claim gating every start this should be "
+                f"unreachable: a scan escaped the claim convention. Treating the scan as "
+                f"stopped and ranking this card down, but NOT counting it as radio evidence"
             )
             _scan_finished(adapter, False)
-            _schedule_recovery(adapter)
             return None
         finally:
             # cleared HERE, not at entry: while bleak's stop is in flight
@@ -2368,6 +2712,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         validate_connection=validate_connection,
     )
     _config.claims.on_beat = _drain_watch
+    _config.claims.on_release = _wake_scan_waiters
     _config.adapter_config_path = adapter_config_path
     _config.gatt_timeout = gatt_timeout
     if scan_to_score:

@@ -822,22 +822,132 @@ def test_a_scan_avoids_a_foreign_scan_claim(env):
     assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci6"
 
 
-def test_every_card_scan_claimed_scans_anyway_unclaimed(env):
-    """Coordination never gates: with every card claimed by live foreign
-    scanners, the scan proceeds on the best-ranked card without a claim."""
+def test_every_card_scan_claimed_waits_and_never_scans_unclaimed(env, monkeypatch):
+    """R1: the hard claim is a GATE. The fallthrough that used to live here -
+    "every card is claimed, scan the best one anyway" - is what made
+    2026-08-26 an outage: a second discovery on a busy card draws InProgress,
+    InProgress was read as a radio failure, and three of those power-cycled a
+    healthy adapter. The scan waits, and while it waits it must not have
+    touched the backend at all."""
     env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
     _foreign_file(env.dir, "hci5.scan")
     _foreign_file(env.dir, "hci6.scan")
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_WAIT", 0.25)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_POLL", 0.02)
 
     async def scenario():
         scanner = sys.modules["bleak"].BleakScanner()
-        await scanner.start()
-        assert scanner._backend.scanning is True
-        await scanner.stop()
+        with pytest.raises(catcher.ScanSlotWaitTimeout):
+            await scanner.start()
+        return scanner
 
-    asyncio.run(scenario())
-    assert RECORDED_SCANNER_INITS[-1]["adapter"] == "hci5"
-    assert set(os.listdir(env.dir)) == {"hci5.scan", "hci6.scan"}  # both still foreign
+    scanner = asyncio.run(scenario())
+    assert RECORDED_SCANNER_INITS == [], "built a backend for a scan it never got a card for"
+    assert SCANNER_START_RESULTS == []
+    assert scanner._backend is None
+    assert scanner._catcher_scanning is False
+    # the foreign claims are untouched and no queue ticket was left behind
+    assert set(os.listdir(env.dir)) == {"hci5.scan", "hci6.scan"}
+
+
+def test_the_wait_timeout_names_every_holder_and_our_queue_position(env, monkeypatch):
+    """A scan that gave up after 30s is only actionable if it says who it was
+    waiting on: a holder that never lets go is a bug in that holder, and
+    nobody can find it from "scan failed"."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+    _foreign_file(env.dir, "hci6.scan")
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_WAIT", 0.25)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_POLL", 0.02)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        with pytest.raises(catcher.ScanSlotWaitTimeout) as caught:
+            await scanner.start()
+        return str(caught.value)
+
+    message = asyncio.run(scenario())
+    assert "hci5" in message and "hci6" in message
+    assert "foreign-svc" in message                 # the holder, by name
+    assert "pid 1" in message
+    assert "queued 1 of 1" in message               # and where we stood
+    # NOT the out-of-slots substring: this is not a connect, and brc's
+    # out-of-slots backoff is not the right pacing for it
+    assert not message.startswith("connection slot")
+
+
+def test_a_release_in_this_process_wakes_a_waiting_scanner(env, monkeypatch):
+    """The poll is the correctness floor; the release event is what makes a
+    handover take milliseconds. Polled at 5s here so only the event can
+    explain a fast acquire."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_WAIT", 5.0)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_POLL", 5.0)
+
+    async def scenario():
+        holder = catcher._config.claims.claim_hard("hci5")
+        scanner = sys.modules["bleak"].BleakScanner()
+        started = asyncio.get_running_loop().create_task(scanner.start())
+        await asyncio.sleep(0.05)
+        assert not started.done(), "scanned while another claim was live"
+        began = time.monotonic()
+        catcher._config.claims.release(holder)
+        await asyncio.wait_for(started, timeout=2.0)
+        elapsed = time.monotonic() - began
+        adapter = scanner._catcher_adapter
+        await scanner.stop()
+        return adapter, elapsed
+
+    adapter, elapsed = asyncio.run(scenario())
+    assert adapter == "hci5"
+    assert elapsed < 1.0, "woke on the poll tick, not on the release"
+
+
+def test_a_constructed_scanner_holds_nothing_until_it_is_started(env):
+    """Construction is free of side effects on shared hardware: callers build
+    placeholder scanners long before (and often without) starting them."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    scanner = sys.modules["bleak"].BleakScanner()
+    assert scanner._catcher_claim is None
+    assert scanner._catcher_adapter is None
+    assert os.listdir(env.dir) == []
+
+
+def test_an_explicit_adapter_waits_on_that_card_alone(env, monkeypatch):
+    """The caller's choice is never overridden, so "wait" means wait for the
+    card they named - not quietly move to a free one."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")            # hci6 is free
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_WAIT", 0.25)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_POLL", 0.02)
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner(adapter="hci5")
+        with pytest.raises(catcher.ScanSlotWaitTimeout) as caught:
+            await scanner.start()
+        return str(caught.value)
+
+    message = asyncio.run(scenario())
+    assert "hci5" in message
+    assert "hci6" not in message, "wandered off the caller's explicit adapter"
+    assert RECORDED_SCANNER_INITS == []
+
+
+def test_the_rssi_sweeper_still_skips_rather_than_queues(env, monkeypatch):
+    """Opportunistic work must never queue. A sweep exists to improve a
+    score; making it wait 30s for a card would have it holding a scan claim
+    for a window it did not need, on behalf of nobody."""
+    env.install(adapters=("hci5",), scan_to_score=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    _foreign_file(env.dir, "hci5.scan")
+
+    async def scenario():
+        began = time.monotonic()
+        await catcher._config.sweeper._sweep_adapter("hci5")
+        return time.monotonic() - began
+
+    assert asyncio.run(scenario()) < 1.0
+    assert RECORDED_SCANNER_INITS == []
 
 
 def test_a_failed_scan_start_releases_the_claim(env):
@@ -1801,15 +1911,48 @@ def test_a_live_drain_steers_connects_away(env):
     assert RECORDED_INITS[-1]["adapter"] == "hci6"
 
 
-def test_every_adapter_draining_never_gates_a_connect(env):
+def test_every_adapter_draining_refuses_the_connect_with_the_typed_error(env):
+    """R3: nothing NEW starts on a card someone is emptying, with no
+    fallback. Work placed onto a draining card tops the drain back up, and
+    the reset that follows is only safe because the card emptied
+    voluntarily. The error carries brc's out-of-slots substring so its 4s
+    backoff paces the retries across the (bounded, <=60s) drain window."""
     env.install(adapters=("hci5", "hci6"))
     _foreign_file(env.dir, "hci5.drain")
     _foreign_file(env.dir, "hci6.drain")
     client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
 
-    asyncio.run(client.connect())
+    with pytest.raises(catcher.OutOfConnectionSlotsError) as caught:
+        asyncio.run(client.connect())
 
-    assert RECORDED_INITS[-1]["adapter"] == "hci5"  # steers, never refuses
+    assert str(caught.value).startswith("connection slot")
+    assert RECORDED_INITS == []
+    assert sorted(os.listdir(env.dir)) == ["hci5.drain", "hci6.drain"]
+
+
+def test_a_pinned_device_gets_no_carve_out_from_a_drain(env):
+    """A pin says which radio a device should PREFER. It is not an
+    instruction to walk into a reset in progress."""
+    env.install(adapters=(f"{ADDRESS}@hci5",))
+    _foreign_file(env.dir, "hci5.drain")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    with pytest.raises(catcher.OutOfConnectionSlotsError):
+        asyncio.run(client.connect())
+
+    assert RECORDED_INITS == []
+
+
+def test_an_explicit_adapter_gets_no_carve_out_from_a_drain(env):
+    """The last path that could still put new work on a draining card."""
+    env.install(adapters=("hci5", "hci6"))
+    _foreign_file(env.dir, "hci5.drain")
+    client = sys.modules["bleak"].BleakClient(ADDRESS, adapter="hci5", _is_retry_client=True)
+
+    with pytest.raises(catcher.OutOfConnectionSlotsError):
+        asyncio.run(client.connect())
+
+    assert RECORDED_INITS == []
 
 
 def test_a_live_drain_steers_scans_away(env):
@@ -3126,11 +3269,17 @@ def test_inprogress_on_stop_is_swallowed_and_counted(env):
     assert catcher._scan_failures.get(catcher.claims.adapter_key("hci5")) == 1
 
 
-def test_a_third_inprogress_stop_queues_the_drain_and_cycle(env, monkeypatch):
-    """Swallow-and-COUNT: the swallow handles the proven-benign case, the
-    count is insurance for any path we have not proven - a card producing
-    these persistently walks into the same drain-and-cycle as any other
-    accumulated scan failure."""
+def test_inprogress_stops_never_reach_the_drain_and_cycle(env, monkeypatch):
+    """The 0.5 correction, and the single most expensive misreading in this
+    package's history. InProgress on a stop means two discovery sessions
+    overlapped on one card. With the hard claim gating every start that is
+    unreachable, so an instance of it is a report that something escaped the
+    claim convention - a bug in this package or in a participant - and the
+    one thing it is NOT is evidence that the radio is broken. Reading it as
+    radio evidence is what power-cycled healthy adapters on 2026-08-26, and
+    each cycle mass-disappeared that card's devices into the BlueZ 5.72
+    gatt-client use-after-free. The card is still ranked down; it is never
+    charged for somebody else's protocol violation."""
     env.install(adapters=("hci5",), wrap_scanner=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
     attempts = []
@@ -3160,7 +3309,9 @@ def test_a_third_inprogress_stop_queues_the_drain_and_cycle(env, monkeypatch):
             await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
 
     asyncio.run(scenario())
-    assert attempts == [("hci5", True)]      # drained and cycled, exactly once
+    assert attempts == [], "an InProgress stop was charged to the radio"
+    # ranked down, though: a card producing these keeps losing ties
+    assert catcher._scan_failures[catcher.claims.adapter_key("hci5")] == catcher.SCAN_FAILURES_BEFORE_RESET
 
 
 def test_other_dbus_errors_on_stop_still_raise(env):
@@ -3516,3 +3667,266 @@ def test_the_heartbeat_check_is_silent_with_no_loop_to_use(env, monkeypatch):
     monkeypatch.setattr(catcher, "_last_loop", None)
     monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: False)
     catcher._drain_watch()          # must not raise
+
+
+# -- the scanwait queue (convention 0.5) ----------------------------------
+#
+# The queue exists because a gate without one turns N blocked scanners into
+# N pollers all watching the same best-ranked card: the first release wakes
+# every one of them, one wins, and the rest have burned a wake for nothing
+# while other cards sat idle. Its two failure modes are starvation (a
+# newcomer stealing a card the queue was waiting for) and thrash (waiters
+# swapping queues forever), and each rule below exists for one of them.
+
+
+def _foreign_wait(claim_dir, adapter, seq, service="foreign-svc", pid=1):
+    return _foreign_file(claim_dir, f"{adapter}.scanwait.{service}-{pid}-{seq}", pid=pid)
+
+
+def _our_waits(claim_dir):
+    return sorted(n for n in os.listdir(claim_dir) if ".scanwait." in n and OWNER in n)
+
+
+def _snapshot(**queues):
+    """A claims() snapshot carrying only the fields the queue rules read."""
+    return {
+        catcher.claims.adapter_key(adapter): {
+            "hard": None, "hard_pid": None, "soft": 0, "soft_owners": [],
+            "links": 0, "drain": False, "drain_pid": None, "waiters": waiters,
+        }
+        for adapter, waiters in queues.items()
+    }
+
+
+def _queue(*names):
+    return [(index, "svc", 1, name) for index, name in enumerate(names)]
+
+
+def _ticket(name):
+    return types.SimpleNamespace(path=os.path.join("/run/bt-claims", name))
+
+
+@contextlib.contextmanager
+def _short_wait(monkeypatch, wait=5.0, poll=0.02):
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_WAIT", wait)
+    monkeypatch.setattr(catcher, "SCAN_CLAIM_POLL", poll)
+    yield
+
+
+async def _start_waiting():
+    """A scan placement in flight, parked in its wait loop."""
+    task = asyncio.get_running_loop().create_task(catcher._acquire_scan_adapter())
+    await asyncio.sleep(0.05)
+    return task
+
+
+async def _abandon(task):
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_an_unqueued_waiter_joins_the_shortest_queue(env):
+    snapshot = _snapshot(hci5=_queue("a", "b"), hci6=_queue("x"))
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], None, None, False) == "hci6"
+
+
+def test_queue_ties_break_by_rank_then_configuration_order(env):
+    """`ranked` already carries occupancy-then-config order, so an equal-length
+    queue is decided by the same ordering everything else here uses."""
+    snapshot = _snapshot(hci5=_queue("a"), hci6=_queue("x"))
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], None, None, False) == "hci5"
+    assert catcher._queue_target(snapshot, ["hci6", "hci5"], None, None, False) == "hci6"
+
+
+def test_migration_needs_a_strictly_shorter_queue(env):
+    """The worked example from the design. Third of four on hci5 has two
+    waiters ahead of it; hci6's entire queue is one, and 1 < 2, so it moves.
+    Then nothing moves again: the waiter that inherited third place on hci5
+    also has two ahead, hci6 now totals two, and 2 < 2 is false. The
+    strictness is the whole anti-thrash argument - under <= that pair would
+    swap queues forever, each seeing the other's as equally good."""
+    snapshot = _snapshot(hci5=_queue("a", "b", "me", "d"), hci6=_queue("x"))
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], _ticket("me"), "hci5", True) == "hci6"
+    settled = _snapshot(hci5=_queue("a", "b", "d"), hci6=_queue("x", "me"))
+    assert catcher._queue_target(settled, ["hci5", "hci6"], _ticket("me"), "hci6", True) is None
+    assert catcher._queue_target(settled, ["hci5", "hci6"], _ticket("d"), "hci5", True) is None
+
+
+def test_migration_is_a_poll_tick_decision_never_an_event(env):
+    """The other half of the anti-thrash pair. One release wakes every waiter
+    at once; if each of them could migrate on that wake, they would all
+    recompute from the same instant's snapshot and stampede the same queue."""
+    snapshot = _snapshot(hci5=_queue("a", "b", "me", "d"), hci6=_queue("x"))
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], _ticket("me"), "hci5", False) is None
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], _ticket("me"), "hci5", True) == "hci6"
+
+
+def test_two_waiters_on_two_queues_settle_where_they_are(env):
+    snapshot = _snapshot(hci5=_queue("me"), hci6=_queue("you"))
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], _ticket("me"), "hci5", True) is None
+    assert catcher._queue_target(snapshot, ["hci5", "hci6"], _ticket("you"), "hci6", True) is None
+
+
+def test_a_waiter_whose_card_starts_draining_finds_every_other_better(env):
+    """A draining card is not in `ranked` at all, which makes its queue
+    infinitely expensive: a longer queue elsewhere still beats it. With no
+    elsewhere, the waiter stays put and wakes when the drain releases."""
+    snapshot = _snapshot(hci5=_queue("me"), hci6=_queue("x", "y", "z"))
+    assert catcher._queue_target(snapshot, ["hci6"], _ticket("me"), "hci5", True) == "hci6"
+    assert catcher._queue_target(snapshot, [], _ticket("me"), "hci5", True) is None
+
+
+def test_a_waiting_scan_queues_on_the_shortest_queue(env, monkeypatch):
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+    _foreign_file(env.dir, "hci6.scan")
+    _foreign_wait(env.dir, "hci5", 1)
+    _foreign_wait(env.dir, "hci5", 2)
+    _foreign_wait(env.dir, "hci6", 3)
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            ours = _our_waits(env.dir)
+            await _abandon(task)
+            return ours
+
+    assert [n.partition(".")[0] for n in asyncio.run(scenario())] == ["hci6"]
+    assert _our_waits(env.dir) == [], "a ticket outlived the scanner waiting on it"
+
+
+def test_a_younger_waiter_does_not_steal_the_card_it_frees(env, monkeypatch):
+    """Starvation, the queue's first failure mode: without FIFO the ticket
+    is decorative and whoever waited longest waits forever."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    holder = _foreign_file(env.dir, "hci5.scan")
+    _foreign_wait(env.dir, "hci5", 0)          # older than anything we can mint
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            os.unlink(holder)                  # the card frees...
+            await asyncio.sleep(0.15)          # ...several poll ticks pass
+            took_it = task.done()
+            await _abandon(task)
+            return took_it
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_the_oldest_ticket_takes_the_card_when_it_frees(env, monkeypatch):
+    """The same setup with the other waiter YOUNGER than ours: now it is our
+    turn, and the queue must not make us wait for a ticket behind us."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    holder = _foreign_file(env.dir, "hci5.scan")
+    _foreign_wait(env.dir, "hci5", 10 ** 9)    # queued after us
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            os.unlink(holder)
+            adapter, claim = await asyncio.wait_for(task, timeout=2.0)
+            catcher._config.claims.release(claim)
+            return adapter
+
+    assert asyncio.run(scenario()) == "hci5"
+    assert _our_waits(env.dir) == []
+
+
+def test_a_free_card_with_no_queue_is_taken_from_wherever_we_are_queued(env, monkeypatch):
+    """A waiter that queued politely while a card sat idle and unwanted would
+    be obeying the queue at the cost of the thing the queue is for."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+    free_me = _foreign_file(env.dir, "hci6.scan")
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            queued_on = [n.partition(".")[0] for n in _our_waits(env.dir)]
+            os.unlink(free_me)                 # hci6 frees, with no queue
+            adapter, claim = await asyncio.wait_for(task, timeout=2.0)
+            catcher._config.claims.release(claim)
+            return queued_on, adapter
+
+    queued_on, adapter = asyncio.run(scenario())
+    assert queued_on == ["hci5"]               # we were queued elsewhere
+    assert adapter == "hci6"
+    assert _our_waits(env.dir) == []
+
+
+def test_a_scan_never_queues_on_a_draining_card_and_wakes_on_its_release(env, monkeypatch):
+    """R3 for scans: the sole candidate is draining, so no ticket is written
+    at all - a queue on a card being emptied is work waiting to land in the
+    blast radius. The wait rides out the drain and takes the card the moment
+    the resetter lets go."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    drain = _foreign_file(env.dir, "hci5.drain")
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            assert not task.done(), "started on a draining card"
+            assert _our_waits(env.dir) == [], "queued on a draining card"
+            os.unlink(drain)
+            adapter, claim = await asyncio.wait_for(task, timeout=2.0)
+            catcher._config.claims.release(claim)
+            return adapter
+
+    assert asyncio.run(scenario()) == "hci5"
+
+
+def test_a_waiter_migrates_off_a_card_that_starts_draining(env, monkeypatch):
+    """Already queued when the drain appears: hci6's queue is longer, and it
+    still wins, because the draining card's queue can never advance."""
+    env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
+    _foreign_file(env.dir, "hci5.scan")
+    _foreign_file(env.dir, "hci6.scan")
+    _foreign_wait(env.dir, "hci6", 1)
+    _foreign_wait(env.dir, "hci6", 2)
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            before = [n.partition(".")[0] for n in _our_waits(env.dir)]
+            _foreign_file(env.dir, "hci5.drain")
+            await asyncio.sleep(0.15)          # poll ticks: migration is one
+            after = [n.partition(".")[0] for n in _our_waits(env.dir)]
+            await _abandon(task)
+            return before, after
+
+    before, after = asyncio.run(scenario())
+    assert before == ["hci5"]                  # the shorter queue, at first
+    assert after == ["hci6"]                   # then anywhere but the drain
+
+
+def test_a_stolen_hard_claim_stops_the_scan_and_rejoins_the_queue(env):
+    """The catcher half of the 0.5 ownership check: a claim proved lost means
+    this scanner is scanning a card it does not hold, which is the state the
+    gate exists to make impossible. It cannot carry on - the holder is
+    entitled to that radio - so it restarts through the normal gate."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    restarted = []
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        claim = scanner._catcher_claim
+        os.unlink(claim.path)                  # somebody takes the name
+        other = catcher.claims.ClaimManager(owner="rival", claim_dir=env.dir)
+        stolen = other.claim_hard("hci5")
+        catcher._config.claims._beat_once()    # the beat notices
+        assert claim.lost is True
+        scanner._drain_restart = lambda: restarted.append(True) or _noop()
+        catcher._lost_claim_watch()
+        await asyncio.sleep(0)                 # let call_soon_threadsafe run
+        await asyncio.sleep(0)
+        other.release(stolen)
+        await scanner.stop()
+
+    async def _noop():
+        return None
+
+    asyncio.run(scenario())
+    assert restarted == [True]
