@@ -36,7 +36,7 @@ from bleak import BleakClient as _ORIGINAL_BLEAK_CLIENT
 from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakDBusError, BleakError
 
-from . import mgmt, recovery
+from . import mgmt, recovery, validators
 from . import claims as claims
 from .claims import CLAIM_DIR, CLAIM_TTL, HEARTBEAT_INTERVAL, ClaimManager
 
@@ -581,9 +581,14 @@ def _mac_qualifier(address):
 class BleAdapterRotation:
     """Failure-driven adapter walk state for clients the catcher builds.
 
-    The per-address index advances only when a connect attempt fails - a
-    disconnect is not a failure, so a dropped link reconnects on the adapter
-    it was using - and never resets on success: once a device is talking
+    The per-address index advances only when a connect attempt fails or a
+    link dies young - a STABLE link's later drop is not a failure, so it
+    reconnects on the adapter it was using, but a link that dies within
+    QUICK_REDROP_WINDOW of establishing never really connected (field
+    2026-08-30, prod RS pack: connected :24/dropped :28, connected :04/
+    dropped :06, ping-ponging through an RF storm because each 4-second
+    link wiped the record and re-armed the same path). The index never
+    resets on success: once a device is talking
     over an adapter there is no reason to re-probe a preferred one that may
     be gone, and the modulo brings the list round to it again if this one
     later fails. State is per address and process wide, because one device's
@@ -606,12 +611,31 @@ class BleAdapterRotation:
 _rotation = BleAdapterRotation()
 
 # (adapter-identity, address) -> consecutive failed connect attempts,
-# feeding the placement score; a success there clears it (habluetooth's
-# model). Keyed by the card's identity rather than its number for the same
-# reason claims are: after a renumber, penalties keyed by hciN would follow
-# the NUMBER - a healthy card inheriting a bad one's number would inherit
-# its record, and the bad card would shed it by moving.
+# feeding the placement score; a STABLE link there clears it. Not a bare
+# success: habluetooth's clear-on-success model let a 4-second link wipe
+# the record during an RF storm and re-arm the same path (field
+# 2026-08-30) - so the clear moved from the moment of establish to the
+# moment a link proves it can live (_link_ended). Keyed by the card's
+# identity rather than its number for the same reason claims are: after a
+# renumber, penalties keyed by hciN would follow the NUMBER - a healthy
+# card inheriting a bad one's number would inherit its record, and the bad
+# card would shed it by moving.
 _connect_failures = {}
+
+# A link that dies this soon after establishing never really connected.
+# 267/284 of the storm's disconnects were 0x08 supervision timeouts with
+# the packs muted by shared external RF - rotation almost never helps
+# reachability there, so the PRIMARY lever is the backoff below (damping
+# churn); the ledger charge and rotation advance are side effects, kept
+# because a card that only ever produces doomed links should still score
+# below one that holds them.
+QUICK_REDROP_WINDOW = 10.0
+# per-address, escalating, capped: 2s, 4s, 8s, 16s, 30s. Applied BEFORE
+# claim acquisition, so a backoff never holds a claim while sleeping.
+QUICK_REDROP_BACKOFF_BASE = 2.0
+QUICK_REDROP_BACKOFF_MAX = 30.0
+# address -> consecutive quick drops; cleared by a link surviving the window
+_quick_drop_streaks = {}
 
 
 def _connect_finished(adapter, address, connected):
@@ -619,13 +643,14 @@ def _connect_finished(adapter, address, connected):
         return
     key = (claims.adapter_key(adapter), _address_key(address))
     if connected:
-        _connect_failures.pop(key, None)
-        # a completed link is proof the radio works, so it clears the
-        # card's whole record - recovery attempts AND scan strikes (Clint,
-        # 2026-08-26: "if we get a successful connection we should still
-        # clear the 3 strikes"). A reset on a card carrying working links
-        # would be gated on those links anyway; charging strikes to it
-        # while it demonstrably works only ranks a good card last.
+        # a completed link is proof the RADIO works, so the card-level
+        # record clears at establish - recovery attempts AND scan strikes
+        # (Clint, 2026-08-26: "if we get a successful connection we should
+        # still clear the 3 strikes"). The (adapter, address) connect
+        # record does NOT clear here any more: that verdict now waits for
+        # the link to survive QUICK_REDROP_WINDOW (_link_ended), because a
+        # 4-second link is proof the radio works and NO proof the path to
+        # this device does.
         _recovery_attempts.pop(key[0], None)
         _scan_failures.pop(key[0], None)
     else:
@@ -633,6 +658,38 @@ def _connect_finished(adapter, address, connected):
         # a failed connect is also the moment a connect-only consumer
         # notices a dead daemon - see _maybe_recover_daemon
         _maybe_recover_daemon(key[0])
+
+
+def _link_ended(adapter, address, lived, ours):
+    """Judge a link by how it died, not that it died.
+
+    A link that survived the window proves the path and clears the record,
+    whoever ended it. A short link WE ended says nothing about the radio -
+    shyion's whole duty cycle is 3-8s connect/read/disconnect polls, and
+    charging those would poison a healthy card's placement on every poll
+    (`ours` also covers the cache-fault teardown after a failed
+    StartNotify re-resolve: that is BlueZ's table, not the radio). Only a
+    short link that died on its own charges: ledger, rotation, and the
+    streak that prices the next attempt's backoff.
+    """
+    if not adapter:
+        return
+    akey = _address_key(address)
+    key = (claims.adapter_key(adapter), akey)
+    if lived >= QUICK_REDROP_WINDOW:
+        _connect_failures.pop(key, None)
+        _quick_drop_streaks.pop(akey, None)
+    elif ours:
+        return
+    else:
+        _connect_failures[key] = _connect_failures.get(key, 0) + 1
+        _rotation.connect_failed(address)
+        streak = _quick_drop_streaks.get(akey, 0) + 1
+        _quick_drop_streaks[akey] = streak
+        logger.info(
+            f"BLE [{address}]: link on {adapter} dropped after {lived:.1f}s "
+            f"(quick drop {streak} in a row) - charged as a connect failure"
+        )
 
 
 def _hci_sort_key(name):
@@ -1419,6 +1476,13 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # connected, or disconnect() ran): data arriving then must not
         # re-arm claims
         self._catcher_settled = True
+        # monotonic stamp of the current link's establish; None when no link
+        # has been up this generation. _link_ended consumes and clears it, so
+        # a duplicate disconnect event cannot charge the same death twice.
+        self._catcher_established_at = None
+        # set when the StartNotify cache-recovery path gave up: the teardown
+        # that follows is charged to BlueZ's GATT table, not the radio
+        self._catcher_cache_fault = False
         self._catcher_last_evidence = None
         # smoothed interval between this client's traffic events, sizing the
         # evidence window to the cadence it actually shows
@@ -1494,6 +1558,19 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                     raw_callback(client)
                 return
             if generation == self._catcher_generation and not self.is_connected:
+                established = self._catcher_established_at
+                if established is not None:
+                    self._catcher_established_at = None
+                    # settled means the teardown came through this wrapper
+                    # (disconnect(), or the failed-validation teardown) -
+                    # ours, not the radio's. Cache faults are ours too: the
+                    # StartNotify re-resolve path failed on BlueZ's table.
+                    _link_ended(
+                        self._catcher_adapter_used,
+                        self._catcher_address,
+                        _monotonic() - established,
+                        self._catcher_settled or self._catcher_cache_fault,
+                    )
                 if any(not c.released for c in self._catcher_claims):
                     # the release reason, on the record: if the next line is
                     # followed by traffic-based re-arm, the property lied
@@ -1669,6 +1746,20 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             self._warn_bare_connect()
         address_or_ble_device, raw_callback, services = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
+        streak = _quick_drop_streaks.get(_address_key(self._catcher_address), 0)
+        if streak:
+            # Damping, the primary lever for RF storms: the packs mute in
+            # correlated bursts, the peer is usually advertising again by
+            # reconnect time, and rotation rarely changes reachability - so
+            # price the retry, do not race it. BEFORE claim acquisition, so
+            # the sleep never holds a claim; cancellation lands here first
+            # and cancels a sleep, not a half-taken claim set.
+            delay = min(QUICK_REDROP_BACKOFF_BASE * (2 ** (streak - 1)), QUICK_REDROP_BACKOFF_MAX)
+            logger.info(
+                f"BLE [{self._catcher_address}]: {streak} quick drop(s) in a row, "
+                f"backing off {delay:.0f}s before reconnecting"
+            )
+            await asyncio.sleep(delay)
         # a reconnect on this instance must not leak the previous claims,
         # and opens a new generation: stale disconnect events from the
         # backend being replaced lose their power to release
@@ -1774,6 +1865,8 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             mgmt.load_medium(adapter_used, self._catcher_address)
         self._catcher_adapter_used = adapter_used
         self._catcher_settled = False
+        self._catcher_established_at = _monotonic()
+        self._catcher_cache_fault = False
         _warn_duplicate_claimant(self._catcher_address)
         self._catcher_explicit = bool(explicit)
         self._catcher_drain_kicked = None
@@ -1799,9 +1892,42 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
     async def start_notify(self, char_specifier, callback, **kwargs):
         if callable(callback):
             callback = self._make_notify_tap(callback)
-        return await self._gatt_traffic(
-            _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
-        )
+        try:
+            return await self._gatt_traffic(
+                _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
+            )
+        except BleakDBusError as exc:
+            if exc.dbus_error != "org.freedesktop.DBus.Error.UnknownObject":
+                raise
+            # Stale GATT object path after a reconnect - BlueZ re-resolved
+            # the device but bleak's cached characteristic still points at
+            # the old D-Bus path (the known ServicesResolved-lies trait,
+            # ~8x/day on prod). This is a CACHE artifact local to this
+            # box, so the remedy is re-resolve and retry once on the SAME
+            # adapter - migrating the device to another card over it is
+            # exactly the churn the field trace showed. Retry by handle
+            # when the caller passed a characteristic object: the object
+            # is bound to the stale path, but its ATT handle names the
+            # same characteristic in the re-read table.
+            logger.warning(
+                f"BLE [{self._catcher_address}]: StartNotify hit a stale GATT object path "
+                f"({exc.dbus_error}) - re-reading the service table and retrying once"
+            )
+            await validators.refresh_services(self)
+            retry_spec = char_specifier
+            handle = getattr(char_specifier, "handle", None)
+            if handle is not None:
+                retry_spec = handle
+            try:
+                return await self._gatt_traffic(
+                    _ORIGINAL_BLEAK_CLIENT.start_notify(self, retry_spec, callback, **kwargs)
+                )
+            except Exception:
+                # a real failure now - but a cache-shaped one. The flag
+                # keeps the teardown that follows from being charged to
+                # the adapter as a quick redrop (_link_ended).
+                self._catcher_cache_fault = True
+                raise
 
     def _close_orphaned_bus(self):
         """Close a per-session D-Bus connection bleak left attached.

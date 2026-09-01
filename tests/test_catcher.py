@@ -331,6 +331,8 @@ def env(tmp_path, monkeypatch):
     catcher._warned_bare_connect_addresses.clear()
     catcher._recovery_attempts.clear()
     catcher._recovering.clear()
+    catcher._quick_drop_streaks.clear()
+    catcher._connect_failures.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
     # wrappers from earlier tests linger in the weaksets until GC and carry
@@ -3971,3 +3973,168 @@ def test_a_cycle_only_proceeds_from_a_card_that_emptied_voluntarily(env, monkeyp
     assert asyncio.run(scenario()) is False
     assert native == [], "cycled a card with a live foreign link claim"
     assert "hci5.drain" not in os.listdir(env.dir)
+
+
+def _drop_link(client):
+    """A spontaneous drop: the backend notices, then bleak fires the raw
+    disconnected callback - the ordering the release path keys on."""
+    client._backend.is_connected = False
+    RECORDED_INITS[-1]["disconnected_callback"](client)
+
+
+def test_a_quick_redrop_is_a_failure_not_a_success(env):
+    """Field 2026-08-30, prod RS pack 53:20:B7:D7:F9:E7: connected :24,
+    dropped :28, connected :04, dropped :06 - ping-pong through an RF
+    storm, because only a FAILED establish advanced rotation/backoff and
+    each 4-second "success" wiped the adapter's record and re-armed the
+    same path. A link that dies within QUICK_REDROP_WINDOW of establish
+    never really connected."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    before = catcher._rotation.index(ADDRESS)
+
+    _drop_link(client)          # lived ~0s: spontaneous, young
+
+    akey = catcher._address_key(ADDRESS)
+    key = (catcher.claims.adapter_key("hci5"), akey)
+    assert catcher._connect_failures.get(key) == 1
+    assert catcher._quick_drop_streaks.get(akey) == 1
+    assert catcher._rotation.index(ADDRESS) == before + 1
+
+
+def test_a_stable_links_drop_clears_the_record(env):
+    """The other half of the verdict: a link that survived the window
+    proves the path, whoever ends it - its drop clears ledger and streak."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    akey = catcher._address_key(ADDRESS)
+    key = (catcher.claims.adapter_key("hci5"), akey)
+    catcher._connect_failures[key] = 2
+    catcher._quick_drop_streaks[akey] = 2
+    before = catcher._rotation.index(ADDRESS)
+
+    client._catcher_established_at -= catcher.QUICK_REDROP_WINDOW + 50
+    _drop_link(client)
+
+    assert key not in catcher._connect_failures
+    assert akey not in catcher._quick_drop_streaks
+    assert catcher._rotation.index(ADDRESS) == before
+
+
+def test_a_requested_disconnect_is_never_a_quick_redrop(env):
+    """shyion's whole duty cycle is 3-8s connect/read/disconnect polls.
+    Charging a short link WE chose to end would poison a healthy card's
+    placement on every poll - the discriminator is who ended it, and
+    disconnect() already marks that (settled)."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    async def poll():
+        await client.connect()
+        await client.disconnect()          # 0s link, ended by us
+
+    asyncio.run(poll())
+    # a late disconnect event after our own teardown changes nothing
+    RECORDED_INITS[-1]["disconnected_callback"](client)
+
+    akey = catcher._address_key(ADDRESS)
+    assert catcher._connect_failures == {}
+    assert akey not in catcher._quick_drop_streaks
+
+
+def test_quick_drops_price_the_next_reconnect(env, monkeypatch):
+    """The monitor's RF analysis: 267/284 disconnects were supervision
+    timeouts in correlated storms - rotation almost never helps, so the
+    PRIMARY effect must be backoff, or storms just ping-pong across both
+    cards. Escalating, capped, and priced BEFORE claim acquisition."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(d, *a, **k):
+        delays.append(d)
+        await real_sleep(0)
+
+    monkeypatch.setattr(catcher.asyncio, "sleep", recording_sleep)
+
+    async def storm():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        for _ in range(6):
+            await client.connect()
+            _drop_link(client)
+
+    asyncio.run(storm())
+    assert delays == [2.0, 4.0, 8.0, 16.0, 30.0]      # first connect free, then 2^n capped
+
+
+def test_unknownobject_start_notify_retries_in_place(env, monkeypatch):
+    """~8x/day on prod: StartNotify hits a stale BlueZ GATT object path
+    after a reconnect and the pack migrated adapters over a local cache
+    artifact. The remedy is re-resolve and retry once on the SAME adapter -
+    if the retry lands, no failure ever surfaces to the driver."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    refreshed = []
+
+    async def fake_refresh(client):
+        refreshed.append(client)
+        return True
+
+    monkeypatch.setattr(catcher.validators, "refresh_services", fake_refresh)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = []
+        fails = [catcher.BleakDBusError("org.freedesktop.DBus.Error.UnknownObject", ["stale path"])]
+
+        async def flaky(char_specifier, callback, **kwargs):
+            seen.append(char_specifier)
+            if fails:
+                raise fails.pop(0)
+
+        client._backend.start_notify = flaky
+
+        class FakeChar:
+            handle = 17
+
+        await client.start_notify(FakeChar(), lambda *_: None)
+        return client, seen
+
+    client, seen = asyncio.run(scenario())
+    assert len(refreshed) == 1, "service table was not re-read"
+    assert len(seen) == 2 and seen[1] == 17, "retry must go by handle, not the stale object"
+    assert client._catcher_cache_fault is False
+
+
+def test_a_failed_cache_retry_is_charged_to_the_cache_not_the_card(env, monkeypatch):
+    """If the retry fails too it is a real failure - but a cache-shaped
+    one. The teardown that follows must not read as a quick redrop, or
+    fix 2's retry gets eaten by fix 1's damping (the interaction the
+    integration chat flagged)."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def fake_refresh(client):
+        return True
+
+    monkeypatch.setattr(catcher.validators, "refresh_services", fake_refresh)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+
+        async def always_stale(char_specifier, callback, **kwargs):
+            raise catcher.BleakDBusError("org.freedesktop.DBus.Error.UnknownObject", ["stale path"])
+
+        client._backend.start_notify = always_stale
+        with pytest.raises(catcher.BleakDBusError):
+            await client.start_notify("fff4", lambda *_: None)
+        return client
+
+    client = asyncio.run(scenario())
+    assert client._catcher_cache_fault is True
+
+    _drop_link(client)          # driver tears down moments later
+    assert catcher._connect_failures == {}, "cache fault charged to the adapter"
+    assert catcher._quick_drop_streaks == {}
