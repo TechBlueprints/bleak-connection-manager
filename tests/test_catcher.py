@@ -4138,3 +4138,35 @@ def test_a_failed_cache_retry_is_charged_to_the_cache_not_the_card(env, monkeypa
     _drop_link(client)          # driver tears down moments later
     assert catcher._connect_failures == {}, "cache fault charged to the adapter"
     assert catcher._quick_drop_streaks == {}
+
+
+def test_an_int_handle_specifier_passes_through_the_cache_retry_unchanged(env, monkeypatch):
+    """jkbms_brn ships CHAR_HANDLE_FAILOVER = 4 - a bare int handle as
+    char_specifier. An int has no .handle attribute, so the retry-by-handle
+    branch must leave it alone: pinned here at the integration chat's ask,
+    because a specifier-type surprise in the retry path would only surface
+    on the one driver that uses ints, on hardware nobody runs day-to-day."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def fake_refresh(client):
+        return True
+
+    monkeypatch.setattr(catcher.validators, "refresh_services", fake_refresh)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = []
+        fails = [catcher.BleakDBusError("org.freedesktop.DBus.Error.UnknownObject", ["stale path"])]
+
+        async def flaky(char_specifier, callback, **kwargs):
+            seen.append(char_specifier)
+            if fails:
+                raise fails.pop(0)
+
+        client._backend.start_notify = flaky
+        await client.start_notify(4, lambda *_: None)
+        return seen
+
+    seen = asyncio.run(scenario())
+    assert seen == [4, 4], "an int handle must be retried as itself"
