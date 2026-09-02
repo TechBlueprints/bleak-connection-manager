@@ -433,6 +433,7 @@ async def _probe_adapter(adapter):
     logger.warning(f"BLE scan: {adapter} scans but could not link to {address} after draining - cycling it")
     return False
 
+
 async def _recover_adapter(adapter):
     """Drain the card and cycle it, with attempt accounting.
 
