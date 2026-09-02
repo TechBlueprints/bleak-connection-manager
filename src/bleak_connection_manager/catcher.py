@@ -1331,6 +1331,9 @@ class _CatcherConfig:
         # frozenset of canonical MAC keys this process may connect to, or
         # None for no gate - see _parse_allowed_devices
         self.allowed_devices = None
+        # ensure every start_notify in this process uses StartNotify - see
+        # install_bleak_catcher(force_start_notify=)
+        self.force_start_notify = False
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
@@ -2073,23 +2076,28 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         return self._backend.address
 
     async def start_notify(self, char_specifier, callback, **kwargs):
-        bluez = kwargs.get("bluez")
-        if isinstance(bluez, dict) and bluez.get("use_start_notify") is False:
-            # Fleet policy (Clint, 2026-09-02): nobody opts out of
-            # StartNotify. bleak already defaults to it; AcquireNotify is
-            # reachable only through this explicit opt-out, and it is the
-            # ONLY path that creates the notify_io BlueZ 5.72 double-frees
-            # (the fleet root cause: ~63 uninvited connections' worth of
-            # them). Copied, not mutated - the caller's dict is theirs.
-            kwargs = dict(kwargs)
-            kwargs["bluez"] = {**bluez, "use_start_notify": True}
-            akey = _address_key(self._catcher_address)
-            if akey not in _warned_acquire_notify_addresses:
-                _warned_acquire_notify_addresses.add(akey)
-                logger.warning(
-                    f"BLE [{self._catcher_address}]: caller asked for AcquireNotify "
-                    "(use_start_notify=False) - overridden to StartNotify, fleet policy"
-                )
+        config = _config
+        if config is not None and config.force_start_notify:
+            # Fleet policy, decided at install (force_start_notify) rather
+            # than hard-wired: when on, this process uses StartNotify for
+            # every subscription - supplied when the caller is silent, so a
+            # library default flip cannot reach us; overriding an explicit
+            # opt-out, because AcquireNotify is the only path that creates
+            # the notify_io BlueZ 5.72 double-frees. Copied, not mutated -
+            # the caller's dict is theirs. When off, nothing here runs.
+            bluez = kwargs.get("bluez")
+            given = bluez if isinstance(bluez, dict) else {}
+            if given.get("use_start_notify") is not True:
+                if given.get("use_start_notify") is False:
+                    akey = _address_key(self._catcher_address)
+                    if akey not in _warned_acquire_notify_addresses:
+                        _warned_acquire_notify_addresses.add(akey)
+                        logger.warning(
+                            f"BLE [{self._catcher_address}]: caller asked for AcquireNotify "
+                            "(use_start_notify=False) - overridden to StartNotify, fleet policy"
+                        )
+                kwargs = dict(kwargs)
+                kwargs["bluez"] = {**given, "use_start_notify": True}
         if callable(callback):
             callback = self._make_notify_tap(callback)
         try:
@@ -2997,7 +3005,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -3046,6 +3054,16 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     MACs this process may connect to (any spelling, comma-separated string
     or iterable); a connect to anything else raises DeviceNotPermitted
     before a claim is taken or a backend built. Omit it for no gate.
+    force_start_notify makes every start_notify in this process use BlueZ
+    StartNotify: supplied when the caller is silent, overriding an explicit
+    opt-out (with a warning). AcquireNotify is the only path that creates
+    the notify_io BlueZ 5.72 double-frees, and bleak's own default is
+    changing to AcquireNotify, so this is the fleet's guard against both a
+    library flip and a call site in code nobody here controls. None (the
+    default) reads BCM_FORCE_START_NOTIFY from the environment - the shim
+    sets it, so the deploy decides fleet-wide without touching any
+    consumer; pass True or False here to decide for this process alone.
+    False changes nothing: bleak's default and every caller's choice stand.
     Idempotent.
     """
     global _config
@@ -3078,6 +3096,14 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     _config.claims.on_beat = _drain_watch
     _config.claims.on_release = _wake_scan_waiters
     _config.adapter_config_path = adapter_config_path
+    if force_start_notify is None:
+        # fleet-wide from the environment: the /data/bcm/python3 shim exports
+        # BCM_FORCE_START_NOTIFY, so the deploy decides for every consumer it
+        # launches and no consumer's source has to know
+        force_start_notify = os.environ.get("BCM_FORCE_START_NOTIFY", "").strip().lower() in ("1", "true", "yes", "on")
+    _config.force_start_notify = bool(force_start_notify)
+    if _config.force_start_notify:
+        logger.info("bleak catcher: StartNotify is forced for every start_notify in this process")
     _config.allowed_devices = _parse_allowed_devices(allowed_devices)
     if _config.allowed_devices is not None:
         logger.info(

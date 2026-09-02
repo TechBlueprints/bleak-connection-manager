@@ -4220,7 +4220,8 @@ def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):
     AcquireNotify is reachable only via bluez={"use_start_notify": False},
     and it is the only path that creates the notify_io BlueZ 5.72
     double-frees - the fleet root cause."""
-    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  force_start_notify=True)
 
     async def scenario():
         client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
@@ -4241,8 +4242,12 @@ def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):
     assert theirs["use_start_notify"] is False         # their dict was copied, not mutated
 
 
-def test_no_bluez_args_means_none_are_invented(env):
+def test_when_not_forcing_nothing_is_invented(env, monkeypatch):
+    """force_start_notify off (the default with no environment): bleak's own
+    default stands, nothing is injected."""
+    monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
     env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    assert catcher._config.force_start_notify is False
 
     async def scenario():
         client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
@@ -4467,3 +4472,61 @@ def test_our_own_drain_does_not_refuse_our_probe_link(env):
     with pytest.raises(Exception) as info:
         asyncio.run(other.connect())
     assert "drain" in str(info.value).lower()
+
+
+
+def test_when_forcing_start_notify_is_supplied_to_a_silent_caller(env):
+    """The library-flip guard: bleak's next default is AcquireNotify, so a
+    caller that says nothing would land there. Forced, it gets StartNotify."""
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  force_start_notify=True)
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = {}
+
+        async def capture(char_specifier, callback, **kwargs):
+            seen.update(kwargs)
+
+        client._backend.start_notify = capture
+        await client.start_notify("fff4", lambda *_: None)
+        return seen
+
+    assert asyncio.run(scenario())["bluez"]["use_start_notify"] is True
+
+
+def test_when_not_forcing_an_explicit_opt_out_is_honoured(env, monkeypatch):
+    """Clint, 2026-09-02: an option to not change the default behaviour.
+    Off means off - a caller's explicit AcquireNotify request passes through."""
+    monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = {}
+
+        async def capture(char_specifier, callback, **kwargs):
+            seen.update(kwargs)
+
+        client._backend.start_notify = capture
+        await client.start_notify("fff4", lambda *_: None, bluez={"use_start_notify": False})
+        return seen
+
+    assert asyncio.run(scenario())["bluez"]["use_start_notify"] is False
+
+
+def test_force_start_notify_resolves_from_the_environment(env, monkeypatch):
+    """The shim exports BCM_FORCE_START_NOTIFY, so the deploy decides for
+    every consumer it launches without touching any consumer's source."""
+    monkeypatch.setenv("BCM_FORCE_START_NOTIFY", "1")
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
+    assert catcher._config.force_start_notify is True
+    monkeypatch.setenv("BCM_FORCE_START_NOTIFY", "0")
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
+    assert catcher._config.force_start_notify is False
+    # an explicit argument beats the environment either way
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  force_start_notify=True)
+    assert catcher._config.force_start_notify is True
