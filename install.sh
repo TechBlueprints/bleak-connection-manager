@@ -101,6 +101,11 @@ chmod 755 "$ROOT/python3.tmp"
 mv "$ROOT/python3.tmp" "$ROOT/python3"
 
 VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# on-box deploy record, for whoever is attributing pid changes: every install
+# and every consumer restart made through packaging/restart-consumers.sh
+# appends a UTC line here (the night watch could not see BCM's restarts and
+# filed them as unexplained, 2026-09-02)
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') install $VERSION by ${SUDO_USER:-${USER:-?}}@${SSH_CLIENT%% *}" >> "$ROOT/deploy.log" 2>/dev/null || true
 echo "bcm-install: shim ready at $ROOT/python3 ($VERSION)"
 
 # --autowire: sitewide hook. A .pth runs in EVERY python process on the

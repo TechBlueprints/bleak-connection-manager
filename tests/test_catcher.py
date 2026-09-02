@@ -4528,3 +4528,50 @@ def test_force_start_notify_resolves_from_the_environment(env, monkeypatch):
     catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
                                   force_start_notify=True)
     assert catcher._config.force_start_notify is True
+
+
+
+def test_a_requested_teardown_logs_its_release_at_debug(env, caplog):
+    """The catcher's release line was the loudest line on prod once the
+    consumers went quiet (~2/h, 2026-09-02). A teardown the consumer asked
+    for is routine and its own session-end line already says why: DEBUG.
+    The claims still release exactly as before."""
+    import logging
+    caplog.set_level(logging.DEBUG, logger="bleak_connection_manager.catcher")
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    async def poll():
+        await client.connect()
+        backend = client._backend
+
+        async def bleak_like_disconnect():
+            # real bleak fires the disconnected callback DURING Disconnect,
+            # before the wrapper's own release runs - which is why the line
+            # appears on prod at every session end; the stub does not
+            backend.is_connected = False
+            RECORDED_INITS[-1]["disconnected_callback"](client)
+
+        backend.disconnect = bleak_like_disconnect
+        await client.disconnect()
+
+    asyncio.run(poll())
+    releases = [r for r in caplog.records if "releasing claims" in r.getMessage()]
+    assert releases and all(r.levelno == logging.DEBUG for r in releases)
+    assert "teardown requested" in releases[-1].getMessage()
+    assert os.listdir(env.dir) == []
+
+
+def test_a_spontaneous_drop_still_logs_its_release_at_info(env, caplog):
+    """The diagnostic pair stays: a drop the radio produced logs at INFO,
+    because if the next line is a traffic-based re-arm the property lied
+    (2026-08-22, prod lost a claim invisibly below the deployed level)."""
+    import logging
+    caplog.set_level(logging.DEBUG, logger="bleak_connection_manager.catcher")
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    _drop_link(client)
+    releases = [r for r in caplog.records if "releasing claims" in r.getMessage()]
+    assert releases and all(r.levelno == logging.INFO for r in releases)
+    assert "teardown requested" not in releases[-1].getMessage()

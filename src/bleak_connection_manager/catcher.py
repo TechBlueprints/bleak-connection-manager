@@ -1752,13 +1752,21 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                         self._catcher_settled or self._catcher_cache_fault,
                     )
                 if any(not c.released for c in self._catcher_claims):
-                    # the release reason, on the record: if the next line is
-                    # followed by traffic-based re-arm, the property lied
+                    # The release reason, on the record: if this line is
+                    # followed by a traffic-based re-arm, the property lied
+                    # (2026-08-22: prod lost a claim invisibly because this
+                    # sat below the deployed level). INFO only for a drop
+                    # the radio produced; a teardown the consumer requested
+                    # (settled) is routine, its own session-end line already
+                    # says why, and at ~2/h it was the loudest line on the
+                    # box once the consumers went quiet (2026-09-02).
                     stamp = self._catcher_last_evidence
                     age = "never" if stamp is None else f"{_monotonic() - stamp:.0f}s ago"
-                    logger.info(
+                    emit = logger.debug if self._catcher_settled else logger.info
+                    emit(
                         f"BLE [{self._catcher_address}]: disconnect event, is_connected False, "
-                        f"releasing claims (last link traffic: {age})"
+                        f"releasing claims (last link traffic: {age}"
+                        f"{', teardown requested' if self._catcher_settled else ''})"
                     )
                 self._release_claims()
             if raw_callback is not None:
