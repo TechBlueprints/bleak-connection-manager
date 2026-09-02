@@ -4358,3 +4358,112 @@ def test_our_own_drain_does_not_block_our_probe_scan(env):
         f.write(f"1 other-svc {int(time.time())}\n")                # pid 1: alive, foreign
     snapshot = catcher._config.claims.claims()
     assert catcher._scan_placement(catcher._config, snapshot, "hci5")[1] == []
+
+
+
+def _seen_device(address):
+    return types.SimpleNamespace(address=address)
+
+
+def test_the_probe_accepts_a_scan_when_no_configured_device_is_free_to_test(env, monkeypatch):
+    """A scan proves the radio hears; a link proves the card can talk. With
+    nothing configured to test a link on, the scan verdict stands - a card
+    that scans is not cycled for want of a test subject."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+    before = len(RECORDED_INITS)
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"](_seen_device("11:22:33:44:55:66"), _adv(local_name="stranger"))
+        return await task
+
+    assert asyncio.run(scenario()) is True
+    assert len(RECORDED_INITS) == before          # no link attempted, least of all to a stranger
+
+
+def test_the_probe_links_to_a_pinned_device_it_just_saw(env, monkeypatch):
+    env.install(adapters=(f"{ADDRESS}@hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+    before = len(RECORDED_INITS)
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"](_seen_device(ADDRESS), _adv(local_name="pack"))
+        return await task
+
+    assert asyncio.run(scenario()) is True
+    assert len(RECORDED_INITS) == before + 1      # exactly one link, to the pinned device
+    assert os.listdir(env.dir) == []             # and it was dropped again, claims released
+
+
+def test_the_probe_cycles_when_the_pinned_device_will_not_link(env, monkeypatch):
+    """Clint: "if that one connection attempt fails we cycle the card"."""
+    env.install(adapters=(f"{ADDRESS}@hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+    CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"](_seen_device(ADDRESS), _adv(local_name="pack"))
+        return await task
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_the_probe_never_links_to_a_device_someone_else_holds(env, monkeypatch):
+    """A pinned device with a live link anywhere - another card, another
+    process - is not a test subject: the probe must not become the next
+    two-processes-one-pack collision."""
+    env.install(adapters=(f"{ADDRESS}@hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5", "hci6"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+    _live_claim_file(env.dir, f"{catcher.claims.adapter_key('hci6')}.use.other-svc.{catcher._mac_qualifier(ADDRESS)}")
+    before = len(RECORDED_INITS)
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"](_seen_device(ADDRESS), _adv(local_name="pack"))
+        return await task
+
+    assert asyncio.run(scenario()) is True
+    assert len(RECORDED_INITS) == before
+
+
+def test_the_probe_only_links_to_a_device_it_actually_heard(env, monkeypatch):
+    env.install(adapters=(f"{ADDRESS}@hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+    before = len(RECORDED_INITS)
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"](_seen_device("11:22:33:44:55:66"), _adv(local_name="other"))
+        return await task
+
+    assert asyncio.run(scenario()) is True       # scan passed on the other device
+    assert len(RECORDED_INITS) == before         # but ours was not heard, so no link attempt
+
+
+def test_our_own_drain_does_not_refuse_our_probe_link(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    key = catcher.claims.adapter_key("hci5")
+    _live_claim_file(env.dir, f"{key}.drain")                                  # our pid
+    client = sys.modules["bleak"].BleakClient(ADDRESS, bluez={"adapter": "hci5"}, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert client.is_connected is True
+    asyncio.run(client.disconnect())
+    with open(os.path.join(env.dir, f"{key}.drain"), "w") as f:
+        f.write(f"1 other-svc {int(time.time())}\n")                            # pid 1: foreign
+    other = sys.modules["bleak"].BleakClient(ADDRESS, bluez={"adapter": "hci5"}, _is_retry_client=True)
+    with pytest.raises(Exception) as info:
+        asyncio.run(other.connect())
+    assert "drain" in str(info.value).lower()

@@ -166,6 +166,11 @@ MAX_RECOVERY_ATTEMPTS = 3
 # advertisers in range, so a card that reports nothing for this long while
 # accepting the scan is the wedge the strikes were about, not a quiet room.
 PROBE_SECONDS = 10.0
+# ...and how long the one verifying link attempt gets. A scan proves the
+# radio hears; only a link proves the card can talk (Clint, 2026-09-02:
+# "after the scan don't we need a device to actually connect to verify
+# it's healed"). One attempt: it fails, the card is cycled.
+PROBE_CONNECT_SECONDS = 15.0
 
 # Operator kill-switch for the drain-and-cycle path. A FILE rather than an
 # env var or a config argument on purpose: it must be flippable fleet-wide,
@@ -319,44 +324,114 @@ async def _recover_daemon(adapter):
     return ok
 
 
+def _probe_candidates(adapter, seen):
+    """Devices the connect phase may try, best first: configured for THIS
+    process (pinned to this card, and inside the allow-set when there is
+    one), not currently linked by anyone anywhere, and seen advertising
+    during the probe scan. Never a stranger: advertisement-seen is not
+    consent to connect, and the probe is bound by THE RULE like any other
+    connect."""
+    config = _config
+    if config is None:
+        return []
+    card = claims.adapter_key(adapter)
+    snapshot = config.claims.claims()
+    out = []
+    for mac, adapters in config.pins.items():
+        if not any(claims.adapter_key(a) == card for a in adapters):
+            continue
+        if config.allowed_devices is not None and claims.mac_key(mac) not in config.allowed_devices:
+            continue
+        if _address_key(mac) not in seen:
+            continue
+        qual = "." + _mac_qualifier(mac)
+        # the qualifier is the last dot-segment BY CONSTRUCTION (_soft_path
+        # appends it), so an endswith here is exact, not the trailing-
+        # segment guess that bit a consumer
+        busy = any(o.endswith(qual) for e in snapshot.values() for o in e.get("soft_owners", []))
+        if busy:
+            continue
+        out.append(mac)
+    return out
+
+
+async def _probe_connect(adapter, address):
+    client = BLEConnection(
+        address, bluez={"adapter": adapter}, timeout=PROBE_CONNECT_SECONDS, _is_retry_client=True
+    )
+    try:
+        await asyncio.wait_for(client.connect(), timeout=PROBE_CONNECT_SECONDS + 5.0)
+        return bool(client.is_connected)
+    except Exception as e:
+        logger.warning(f"BLE scan: probe link to {address} on {adapter} failed: {repr(e)}")
+        return False
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
 async def _probe_adapter(adapter):
-    """Use the drained card once before cycling it (Clint, 2026-09-02).
+    """Use the drained card for real before cycling it (Clint, 2026-09-02).
 
     Emptying a card may itself release whatever was wedged - a stuck
     session, a stale discovery, a link the firmware would not let go of -
     so a card that has just drained gets one real use before the hardware
-    is touched: an explicit scan on that card, judged the way every scan
-    here is judged, by traffic. One real advertisement inside
-    PROBE_SECONDS and the card is back; the reset is skipped, and the
-    strikes that earned it clear through the normal path (the detection
-    callback's _scan_finished). No advertisement, or a scan the card will
-    not even start, and the cycle proceeds. Runs while our own drain claim
-    still steers everyone else off the card.
+    is touched, in two phases, both judged by traffic. First a scan on
+    that card: one real advertisement inside PROBE_SECONDS, or the cycle
+    proceeds. Then, because a scan only proves the radio hears, one link:
+    a device this process is configured for, pinned to this card, free
+    everywhere, and just seen advertising - connected once and dropped.
+    If it links, the card is back and its record clears through the
+    normal establish path. If it will not, the cycle proceeds. When no
+    such device is available to test, the scan verdict stands: a card
+    that scans is not cycled for want of a test subject. Runs while our
+    own drain claim still steers everyone else off the card.
     """
+    seen = set()
+
+    def _saw(device, _advertisement):
+        seen.add(_address_key(getattr(device, "address", device)))
+
     try:
-        scanner = BLEScanner(bluez={"adapter": adapter})
+        scanner = BLEScanner(_saw, bluez={"adapter": adapter})
         await scanner.start()
     except Exception as e:
         logger.warning(f"BLE scan: probe of {adapter} after draining could not start a scan: {repr(e)}")
         return False
+    heard = False
     try:
         deadline = _monotonic() + PROBE_SECONDS
         while _monotonic() < deadline:
             if scanner._catcher_last_detection != scanner._catcher_start_time:
-                logger.warning(f"BLE scan: {adapter} is advertising again after draining alone - not cycled")
-                return True
+                heard = True
+                break
             await asyncio.sleep(0.25)
-        logger.warning(
-            f"BLE scan: {adapter} accepted a scan but reported nothing for {PROBE_SECONDS:.0f}s "
-            "after draining - cycling it"
-        )
-        return False
     finally:
         try:
             await scanner.stop()
         except Exception:
             pass
-
+    if not heard:
+        logger.warning(
+            f"BLE scan: {adapter} accepted a scan but reported nothing for {PROBE_SECONDS:.0f}s "
+            "after draining - cycling it"
+        )
+        return False
+    candidates = _probe_candidates(adapter, seen)
+    if not candidates:
+        logger.warning(
+            f"BLE scan: {adapter} is advertising again after draining alone; no configured device "
+            "is free to test a link on it - accepting the scan, not cycled"
+        )
+        return True
+    address = candidates[0]
+    if await _probe_connect(adapter, address):
+        logger.warning(f"BLE scan: {adapter} scanned and linked to {address} after draining alone - not cycled")
+        return True
+    logger.warning(f"BLE scan: {adapter} scans but could not link to {address} after draining - cycling it")
+    return False
 
 async def _recover_adapter(adapter):
     """Drain the card and cycle it, with attempt accounting.
@@ -1524,7 +1599,7 @@ def _claim_explicit(adapter, address):
     # an explicit adapter is the last path that could still put new work onto
     # a card being emptied. The caller's choice is honoured about WHICH card,
     # never about whether a reset in progress may be walked into.
-    if _entry(config.claims.claims(), adapter).get("drain"):
+    if _draining_for_others(_entry(config.claims.claims(), adapter)):
         raise _all_draining_error(address, [adapter], config)
     cap = _cap_for(config, adapter)
     if cap:
@@ -2288,6 +2363,14 @@ def _scan_candidates(config, present):
     return []
 
 
+def _draining_for_others(entry):
+    """A drain claim held by ANOTHER process. Our own drain never steers our
+    own recovery probe off the card it is draining - the probe scans, and
+    then connects on, that card deliberately, while the drain keeps
+    everyone else off it."""
+    return bool(entry.get("drain")) and entry.get("drain_pid") != os.getpid()
+
+
 def _scan_placement(config, snapshot, explicit=None):
     """(every candidate, drain-free candidates best-first) for a scan.
 
@@ -2305,11 +2388,7 @@ def _scan_placement(config, snapshot, explicit=None):
     """
     if explicit:
         adapter = str(explicit)
-        entry = _entry(snapshot, adapter)
-        # a drain WE hold does not steer us off the card: the recovery
-        # probe scans the card we are draining, on purpose, once
-        draining = bool(entry.get("drain")) and entry.get("drain_pid") != os.getpid()
-        return [adapter], ([] if draining else [adapter])
+        return [adapter], ([] if _draining_for_others(_entry(snapshot, adapter)) else [adapter])
     present = present_adapters()
     candidates = _scan_candidates(config, present)
     if not candidates:
