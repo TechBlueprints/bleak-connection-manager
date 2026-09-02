@@ -436,3 +436,59 @@ def test_hciconfig_bounce_reports_a_failed_up(monkeypatch):
     monkeypatch.setattr(recovery.time, "sleep", lambda s: None)
 
     assert recovery._bounce_interface(0) is False
+
+
+
+def test_a_card_that_scans_after_draining_is_not_reset(tmp_path, monkeypatch):
+    """Probation (Clint, 2026-09-02): emptying the card may itself release
+    what was wedged, so it gets one real use before the hardware is
+    touched. It passes: no reset, drain released, reported as recovered."""
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+    probed = []
+
+    async def probe(adapter):
+        probed.append(adapter)
+        return True
+
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0, probe=probe)) is True
+    assert probed == ["hci1"]
+    assert calls == []                                                  # hardware untouched
+    assert not [n for n in os.listdir(tmp_path) if n.endswith(".drain")]  # drain released
+
+
+def test_a_card_that_still_cannot_scan_after_draining_is_reset(tmp_path, monkeypatch):
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+
+    async def probe(adapter):
+        return False
+
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0, probe=probe)) is True
+    assert calls == [(1, recovery.UNKNOWN_MAC, True)]
+
+
+def test_a_probe_that_raises_counts_as_failed(tmp_path, monkeypatch):
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+
+    async def probe(adapter):
+        raise RuntimeError("scan machinery broke")
+
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0, probe=probe)) is True
+    assert calls == [(1, recovery.UNKNOWN_MAC, True)]
+
+
+def test_a_card_that_filled_up_during_the_probe_is_not_reset(tmp_path, monkeypatch):
+    """The in-use veto applies at the moment of reset, not just at the
+    drain deadline: a link that landed while we were probing keeps its
+    card."""
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+
+    async def probe(adapter):
+        _foreign_file(tmp_path, "hci1.link.0")
+        return False
+
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0, probe=probe)) is False
+    assert calls == []

@@ -1321,7 +1321,7 @@ def test_the_watchdog_clock_only_counts_nonempty_advertisements(env):
 def test_a_quiet_scanner_restarts_without_a_hardware_reset(env, monkeypatch):
     resets = []
 
-    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False):
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
         resets.append(adapter)
         return True
 
@@ -1347,7 +1347,7 @@ def test_a_quiet_scanner_restarts_without_a_hardware_reset(env, monkeypatch):
 def test_a_scanner_quiet_past_escalation_hardware_resets_the_adapter(env, monkeypatch):
     resets = []
 
-    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False):
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
         resets.append((adapter, gone_silent, claims_manager is not None))
         return True
 
@@ -2924,6 +2924,8 @@ def test_a_wedged_card_stops_looking_attractive_to_scan_selection(env, monkeypat
     inputs."""
     env.install(adapters=("hci5", "hci6"), wrap_scanner=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5", "hci6"})
+    # the real reset_adapter runs here, probe included: keep probation short
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 0.2)
 
     async def scenario():
         scanner = sys.modules["bleak"].BleakScanner()
@@ -4293,3 +4295,66 @@ def test_no_allow_set_means_no_gate(env):
     catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
                                   allowed_devices="")
     assert catcher._config.allowed_devices is None       # empty means not configured, not deny-all
+
+
+
+def test_recovery_probes_the_drained_card_before_cycling(env, monkeypatch):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher.recovery, "is_bluetoothd_alive", lambda: True)
+    seen = {}
+
+    async def fake_reset(adapter, **kw):
+        seen.update(kw)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    asyncio.run(catcher._recover_adapter("hci5"))
+    assert seen["probe"] is catcher._probe_adapter
+
+
+def test_the_probe_passes_when_the_drained_card_advertises(env, monkeypatch):
+    """Judged the way every scan here is judged: by traffic. One real
+    advertisement and the card is back."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 2.0)
+
+    async def scenario():
+        task = asyncio.create_task(catcher._probe_adapter("hci5"))
+        await asyncio.sleep(0.05)
+        RECORDED_SCANNER_INITS[-1]["detection_callback"]("device", _adv(local_name="SmartShunt"))
+        return await task
+
+    assert asyncio.run(scenario()) is True
+    assert os.listdir(env.dir) == []          # the probe's scan claim released
+
+
+def test_the_probe_fails_when_the_drained_card_stays_silent(env, monkeypatch):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "PROBE_SECONDS", 0.3)
+    assert asyncio.run(catcher._probe_adapter("hci5")) is False
+    assert os.listdir(env.dir) == []
+
+
+def test_the_probe_fails_when_the_card_refuses_to_scan(env, monkeypatch):
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    SCANNER_START_RESULTS.append(RuntimeError("Set scan parameters failed"))
+    assert asyncio.run(catcher._probe_adapter("hci5")) is False
+
+
+def test_our_own_drain_does_not_block_our_probe_scan(env):
+    """The probe scans the card we are draining, on purpose. A drain held
+    by THIS process must not steer the explicit probe scan off it; a drain
+    held by anyone else still does."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    key = catcher.claims.adapter_key("hci5")
+    _live_claim_file(env.dir, f"{key}.drain")                     # our pid
+    snapshot = catcher._config.claims.claims()
+    assert catcher._scan_placement(catcher._config, snapshot, "hci5")[1] == ["hci5"]
+    with open(os.path.join(env.dir, f"{key}.drain"), "w") as f:
+        f.write(f"1 other-svc {int(time.time())}\n")                # pid 1: alive, foreign
+    snapshot = catcher._config.claims.claims()
+    assert catcher._scan_placement(catcher._config, snapshot, "hci5")[1] == []

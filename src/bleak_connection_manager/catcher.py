@@ -161,6 +161,12 @@ SCAN_FAILURES_BEFORE_RESET = 3
 # is the signal a human should act on.
 MAX_RECOVERY_ATTEMPTS = 3
 
+# Probation, after the drain and before the cycle: how long the emptied
+# card gets to show one real advertisement. Prod always has dozens of
+# advertisers in range, so a card that reports nothing for this long while
+# accepting the scan is the wedge the strikes were about, not a quiet room.
+PROBE_SECONDS = 10.0
+
 # Operator kill-switch for the drain-and-cycle path. A FILE rather than an
 # env var or a config argument on purpose: it must be flippable fleet-wide,
 # on a running box, without editing any consumer and WITHOUT RESTARTING
@@ -313,6 +319,45 @@ async def _recover_daemon(adapter):
     return ok
 
 
+async def _probe_adapter(adapter):
+    """Use the drained card once before cycling it (Clint, 2026-09-02).
+
+    Emptying a card may itself release whatever was wedged - a stuck
+    session, a stale discovery, a link the firmware would not let go of -
+    so a card that has just drained gets one real use before the hardware
+    is touched: an explicit scan on that card, judged the way every scan
+    here is judged, by traffic. One real advertisement inside
+    PROBE_SECONDS and the card is back; the reset is skipped, and the
+    strikes that earned it clear through the normal path (the detection
+    callback's _scan_finished). No advertisement, or a scan the card will
+    not even start, and the cycle proceeds. Runs while our own drain claim
+    still steers everyone else off the card.
+    """
+    try:
+        scanner = BLEScanner(bluez={"adapter": adapter})
+        await scanner.start()
+    except Exception as e:
+        logger.warning(f"BLE scan: probe of {adapter} after draining could not start a scan: {repr(e)}")
+        return False
+    try:
+        deadline = _monotonic() + PROBE_SECONDS
+        while _monotonic() < deadline:
+            if scanner._catcher_last_detection != scanner._catcher_start_time:
+                logger.warning(f"BLE scan: {adapter} is advertising again after draining alone - not cycled")
+                return True
+            await asyncio.sleep(0.25)
+        logger.warning(
+            f"BLE scan: {adapter} accepted a scan but reported nothing for {PROBE_SECONDS:.0f}s "
+            "after draining - cycling it"
+        )
+        return False
+    finally:
+        try:
+            await scanner.stop()
+        except Exception:
+            pass
+
+
 async def _recover_adapter(adapter):
     """Drain the card and cycle it, with attempt accounting.
 
@@ -359,10 +404,12 @@ async def _recover_adapter(adapter):
     manager = config.claims if config is not None else None
     logger.warning(
         f"BLE scan: attempting recovery of {adapter} "
-        f"(attempt {attempt}/{MAX_RECOVERY_ATTEMPTS}): draining, then cycling the card"
+        f"(attempt {attempt}/{MAX_RECOVERY_ATTEMPTS}): draining, probing once, then cycling the card"
     )
     try:
-        recovered = bool(await recovery.reset_adapter(adapter, claims_manager=manager, gone_silent=True))
+        recovered = bool(await recovery.reset_adapter(
+            adapter, claims_manager=manager, gone_silent=True, probe=_probe_adapter
+        ))
     except Exception:
         logger.exception(f"BLE scan: recovery of {adapter} raised")
         recovered = False
@@ -2258,7 +2305,11 @@ def _scan_placement(config, snapshot, explicit=None):
     """
     if explicit:
         adapter = str(explicit)
-        return [adapter], ([] if _entry(snapshot, adapter).get("drain") else [adapter])
+        entry = _entry(snapshot, adapter)
+        # a drain WE hold does not steer us off the card: the recovery
+        # probe scans the card we are draining, on purpose, once
+        draining = bool(entry.get("drain")) and entry.get("drain_pid") != os.getpid()
+        return [adapter], ([] if draining else [adapter])
     present = present_adapters()
     candidates = _scan_candidates(config, present)
     if not candidates:

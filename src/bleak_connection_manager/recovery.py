@@ -383,7 +383,7 @@ async def _drain_and_wait(adapter, claims_manager, drain_timeout):
         await asyncio.sleep(_DRAIN_POLL)
 
 
-async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT):
+async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT, probe=None):
     """Hardware-reset an adapter, coordinated through the claims convention.
 
     With a claims_manager, a drain claim is taken first: placement refuses to
@@ -411,7 +411,15 @@ async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=F
     prefers bluetooth-auto-recovery when installed and falls back to the
     stdlib-native sequence; after a success, bluetoothd is restarted if the
     reset killed it and bleak's cached D-Bus state is invalidated.
-    Returns True when a reset was performed and reported success.
+    probe, when given, is `async (adapter) -> bool`, run after the card has
+    emptied and before it is touched: probation. Emptying the card may
+    itself release what was wedged, so the card gets one real use first;
+    a truthy result means it came back on its own and the reset is
+    skipped. A card that fills up again during the probe is not reset
+    either - the in-use veto applies at the moment of reset, not just at
+    the drain deadline.
+    Returns True when a reset was performed and reported success, or when
+    the probe showed no reset was needed.
     """
     match = re.match(r"hci(\d+)$", str(adapter))
     if not match:
@@ -437,6 +445,25 @@ async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=F
             "other processes' links on this card cannot be seen, drained or honoured"
         )
     try:
+        if probe is not None:
+            try:
+                revived = bool(await probe(adapter))
+            except Exception as e:
+                logger.warning(f"bt-recovery: probe of {adapter} raised, treated as failed: {repr(e)}")
+                revived = False
+            if revived:
+                logger.warning(f"bt-recovery: {adapter} came back after draining alone - not reset")
+                try:
+                    from .catcher import forget_adapter_failures
+                    forget_adapter_failures(adapter)
+                except Exception:
+                    pass
+                return True
+            if claims_manager is not None and (
+                claims_manager.foreign_use(adapter) or claims_manager.own_use(adapter)
+            ):
+                logger.warning(f"bt-recovery: not resetting {adapter}: it filled up again during the probe")
+                return False
         logger.warning(f"bt-recovery: resetting {adapter}" + (" (gone silent)" if gone_silent else ""))
         try:
             if HAS_AUTO_RECOVERY:
