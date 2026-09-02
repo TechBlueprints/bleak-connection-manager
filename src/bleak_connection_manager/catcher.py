@@ -426,6 +426,21 @@ def _schedule_recovery(adapter):
         return
     if _recovery_attempts.get(key, 0) >= MAX_RECOVERY_ATTEMPTS:
         return
+    config = _config
+    if config is not None:
+        entry = config.claims.claims().get(key) or {}
+        held = entry.get("links", 0) + entry.get("soft", 0)
+        if held:
+            # A card is cycled only when it is EMPTY. Draining a card that
+            # carries links would steer every new placement off a card
+            # somebody is using for 60s and then be vetoed anyway - all
+            # cost, no reset. Placement already scores this card last for
+            # its strikes; that is the whole remedy while it holds links.
+            logger.info(
+                f"BLE scan: {adapter} has {_scan_failures.get(key, 0)} failed scans but carries "
+                f"{held} live claim(s) - not cycled; a card is cycled only when it is empty"
+            )
+            return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1028,19 +1043,15 @@ def _lost_claim_watch():
 
 
 def _drain_watch():
-    """Honor foreign drain claims: migrate our work off a draining card.
+    """Honor foreign drain claims: move our SCANS off a draining card.
 
-    Runs on the claim heartbeat thread (ClaimManager.on_beat). A connected
-    client on a draining adapter is disconnected - the driver's retry loop
-    above (bleak-retry-connector) reconnects it, selection steers the new
-    attempt elsewhere, and the released claims let the resetter proceed. A
-    running scanner is restarted the same way. "If possible" is literal:
-    a client on its only usable card, an operator-pinned device with every
-    pin draining, or a caller-chosen explicit adapter stays put - its live
-    claims keep vetoing the reset, which is the safe outcome. Each wrapper
-    is kicked at most once per adapter per connect, so a migration that
-    lands back on the draining card (nothing else worked) is not bounced
-    forever.
+    Runs on the claim heartbeat thread (ClaimManager.on_beat). A running
+    scanner on a draining adapter is restarted so selection lands it
+    elsewhere. Live links are never touched - see the comment below - so a
+    card carrying links simply keeps them, and its live claims keep vetoing
+    the reset, which is the safe outcome. Each scanner is kicked at most
+    once per adapter per start, so a rescan that lands back on the
+    draining card (nothing else worked) is not bounced forever.
     """
     config = _config
     if config is None:
@@ -1052,31 +1063,16 @@ def _drain_watch():
     if not draining:
         return
     present = present_adapters()
-    for client in list(_live_clients):
-        adapter = client._catcher_adapter_used
-        if adapter not in draining or client._catcher_settled:
-            continue
-        if client._catcher_drain_kicked == adapter or client._catcher_explicit:
-            continue
-        pins = config.pins.get(_address_key(client._catcher_address))
-        if pins:
-            alternatives = [a for a in pins if a not in draining]
-        else:
-            pool = list(config.pool) or sorted(present, key=_hci_sort_key)
-            alternatives = [a for a in pool if a not in draining]
-        if present:
-            alternatives = [a for a in alternatives if a in present] or alternatives
-        if not alternatives:
-            continue
-        loop = client._catcher_loop
-        if loop is None or loop.is_closed():
-            continue
-        client._catcher_drain_kicked = adapter
-        logger.warning(
-            f"BLE [{client._catcher_address}]: {adapter} is draining, migrating "
-            f"(will reconnect on one of {alternatives})"
-        )
-        loop.call_soon_threadsafe(_spawn_migration, client.disconnect, "migrate")
+    # Live LINKS are never kicked off a draining card (Clint, 2026-09-02: a
+    # card is cycled only when it is empty). The version this replaces
+    # disconnected connected clients here so the resetter could proceed -
+    # a forced mass teardown, which on BlueZ 5.72 is the detonation path of
+    # the gatt-client use-after-free and was the storm's rate amplifier.
+    # Now the drain claim only steers NEW placements away; a card holding
+    # links is not drained at all (_schedule_recovery refuses up front),
+    # and if links appear during a drain, reset_adapter's own veto holds.
+    # Scanners are still moved: a scan is a session, not a link, and moving
+    # it tears down no device.
     for scanner in list(_live_scanners):
         adapter = scanner._catcher_adapter
         if adapter not in draining or scanner._catcher_restarting:
@@ -1147,6 +1143,61 @@ def _warn_duplicate_claimant(address):
 # a reconnect loop hitting this every few seconds would flood the log
 _warned_bare_connect_addresses = set()
 
+# addresses already refused by the allow-set, and addresses already warned
+# for opting out of StartNotify - both once per process, for the same reason
+_warned_refused_addresses = set()
+_warned_acquire_notify_addresses = set()
+
+
+class DeviceNotPermitted(Exception):
+    """This process is not configured to talk to that device.
+
+    Deliberately NOT a BleakError: bleak-retry-connector retries every
+    BleakError up to max_attempts with backoff, and a policy refusal is
+    not a transient condition - it must reach the caller immediately and
+    unchanged. THE RULE (fleet root cause, 2026-08-26): a BLE peer set is
+    bounded by stored configuration, never by radio range. Advertisement-
+    seen is not consent to connect.
+    """
+
+
+def _parse_allowed_devices(entries):
+    """Raw config strings -> frozenset of canonical MAC keys, or None.
+
+    None, an empty string, or an empty iterable mean NOT CONFIGURED - no
+    gate - by analogy with `adapters =` empty meaning every card. A
+    frozenset, so it cannot be clobbered after load: the first silent
+    gate bug shipped by a consumer was exactly a set overwritten after
+    it was built. Keys are claims.mac_key so any spelling matches - the
+    second silent bug was MAC matched as a trailing segment, which fails
+    on indexed ids.
+    """
+    if entries is None:
+        return None
+    if isinstance(entries, str):
+        entries = [e for e in re.split(r"[,\s]+", entries) if e]
+    keys = set()
+    for raw in entries:
+        key = claims.mac_key(raw)
+        if key is None:
+            logger.warning(f"Ignoring allowed_devices entry '{raw}': not a MAC address")
+            continue
+        keys.add(key)
+    if not keys:
+        return None
+    return frozenset(keys)
+
+
+def _refuse_device(address, allowed):
+    akey = _address_key(address)
+    if akey not in _warned_refused_addresses:
+        _warned_refused_addresses.add(akey)
+        logger.warning(
+            f"BLE [{address}]: connect refused - not in this process's allowed_devices "
+            f"({len(allowed)} configured). A peer set is bounded by configuration, not radio range."
+        )
+    raise DeviceNotPermitted(f"{address} is not in this process's allowed_devices")
+
 
 class _CatcherConfig:
     def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None):
@@ -1154,6 +1205,9 @@ class _CatcherConfig:
         self.pins = pins
         self.pool = pool
         self.adapter_config_path = None
+        # frozenset of canonical MAC keys this process may connect to, or
+        # None for no gate - see _parse_allowed_devices
+        self.allowed_devices = None
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
@@ -1744,6 +1798,12 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
     async def connect(self, *, validate_connection=None, **kwargs):
         if not self._catcher_is_retry_client:
             self._warn_bare_connect()
+        allowed = _config.allowed_devices if _config is not None else None
+        if allowed is not None and claims.mac_key(self._catcher_address) not in allowed:
+            # before the backoff sleep, before claims, before a backend:
+            # construction and init must never open a session, and a
+            # refused device must not cost the card anything either
+            _refuse_device(self._catcher_address, allowed)
         address_or_ble_device, raw_callback, services = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
         streak = _quick_drop_streaks.get(_address_key(self._catcher_address), 0)
@@ -1890,6 +1950,23 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         return self._backend.address
 
     async def start_notify(self, char_specifier, callback, **kwargs):
+        bluez = kwargs.get("bluez")
+        if isinstance(bluez, dict) and bluez.get("use_start_notify") is False:
+            # Fleet policy (Clint, 2026-09-02): nobody opts out of
+            # StartNotify. bleak already defaults to it; AcquireNotify is
+            # reachable only through this explicit opt-out, and it is the
+            # ONLY path that creates the notify_io BlueZ 5.72 double-frees
+            # (the fleet root cause: ~63 uninvited connections' worth of
+            # them). Copied, not mutated - the caller's dict is theirs.
+            kwargs = dict(kwargs)
+            kwargs["bluez"] = {**bluez, "use_start_notify": True}
+            akey = _address_key(self._catcher_address)
+            if akey not in _warned_acquire_notify_addresses:
+                _warned_acquire_notify_addresses.add(akey)
+                logger.warning(
+                    f"BLE [{self._catcher_address}]: caller asked for AcquireNotify "
+                    "(use_start_notify=False) - overridden to StartNotify, fleet policy"
+                )
         if callable(callback):
             callback = self._make_notify_tap(callback)
         try:
@@ -2789,7 +2866,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -2834,7 +2911,11 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     It is the fallback, applying to every routed connect that does not
     carry its own `validate_connection=` client kwarg - which is how a
     driver validates connections made deep inside a library it does not
-    call directly. Idempotent.
+    call directly. allowed_devices, when given, is the closed set of device
+    MACs this process may connect to (any spelling, comma-separated string
+    or iterable); a connect to anything else raises DeviceNotPermitted
+    before a claim is taken or a backend built. Omit it for no gate.
+    Idempotent.
     """
     global _config
     import bleak
@@ -2866,6 +2947,12 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     _config.claims.on_beat = _drain_watch
     _config.claims.on_release = _wake_scan_waiters
     _config.adapter_config_path = adapter_config_path
+    _config.allowed_devices = _parse_allowed_devices(allowed_devices)
+    if _config.allowed_devices is not None:
+        logger.info(
+            f"bleak catcher: allowed_devices in force - {len(_config.allowed_devices)} device(s); "
+            "every other connect in this process is refused"
+        )
     _config.gatt_timeout = gatt_timeout
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)

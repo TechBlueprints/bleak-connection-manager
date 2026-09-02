@@ -1970,11 +1970,13 @@ def test_a_live_drain_steers_scans_away(env):
     assert asyncio.run(scenario()) == "hci6"
 
 
-def test_the_drain_watcher_migrates_a_movable_client(env):
-    """The cooperative half of a coordinated reset: a foreign drain appears
-    on the card this client is connected on, another card exists, so the
-    watcher disconnects it - releasing its claims for the resetter - and
-    the driver's retry loop above is what reconnects it elsewhere."""
+def test_the_drain_watcher_never_kicks_a_live_link(env):
+    """Clint, 2026-09-02: a card is cycled only when it is EMPTY. The
+    version this replaces disconnected a connected client so the resetter
+    could proceed - a forced mass teardown, which on BlueZ 5.72 is the
+    detonation path of the gatt-client use-after-free. A foreign drain now
+    steers new placements away and nothing more; this link stays up, its
+    claims stay live, and they keep vetoing the reset."""
     env.install(adapters=("hci5", "hci6"), link_caps={"hci5": 2, "hci6": 2})
 
     async def scenario():
@@ -1988,11 +1990,10 @@ def test_the_drain_watcher_migrates_a_movable_client(env):
         return client, adapter
 
     client, adapter = asyncio.run(scenario())
-    assert client.is_connected is False
-    assert client._catcher_drain_kicked == adapter
+    assert client.is_connected is True
+    assert client._catcher_drain_kicked is None
     remaining = [n for n in os.listdir(env.dir) if not n.endswith(".drain")]
-    assert remaining == []  # claims released for the resetter
-
+    assert remaining, "the link's claims were released for a reset it must veto"
 
 def test_the_drain_watcher_leaves_a_client_with_nowhere_to_go(env):
     """"If possible" is literal: on a one-card deployment the client stays,
@@ -4170,3 +4171,125 @@ def test_an_int_handle_specifier_passes_through_the_cache_retry_unchanged(env, m
 
     seen = asyncio.run(scenario())
     assert seen == [4, 4], "an int handle must be retried as itself"
+
+
+
+def _live_claim_file(claim_dir, name):
+    """A claim file that reads as LIVE to every liveness test: this pid,
+    fresh mtime. Stands in for some other process's link on the card."""
+    with open(os.path.join(claim_dir, name), "w") as f:
+        f.write(f"{os.getpid()} some-other-service {int(time.time())}\n")
+
+
+def test_a_card_carrying_links_is_not_drained_or_cycled(env, monkeypatch):
+    """The other half of "only when empty": a card that has earned its
+    three strikes but carries a live link is not even drained - draining
+    would steer every new placement off a card somebody is using for 60s
+    and then be vetoed anyway. Placement already scores it last."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append(adapter)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    _live_claim_file(env.dir, f"{catcher.claims.adapter_key('hci5')}.link.0")
+
+    async def scenario():
+        for i in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            if i == catcher.SCAN_FAILURES_BEFORE_RESET - 1:
+                key = catcher.claims.adapter_key("hci5")
+                catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
+            SCANNER_START_RESULTS.append(RuntimeError("Set scan parameters failed"))
+            scanner = sys.modules["bleak"].BleakScanner()
+            with pytest.raises(RuntimeError):
+                await scanner.start()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert attempts == [], "cycled a card that was carrying a live link"
+
+
+def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):
+    """Fleet policy: nobody opts out of StartNotify. bleak defaults to it;
+    AcquireNotify is reachable only via bluez={"use_start_notify": False},
+    and it is the only path that creates the notify_io BlueZ 5.72
+    double-frees - the fleet root cause."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = {}
+
+        async def capture(char_specifier, callback, **kwargs):
+            seen.update(kwargs)
+
+        client._backend.start_notify = capture
+        theirs = {"use_start_notify": False, "other": 1}
+        await client.start_notify("fff4", lambda *_: None, bluez=theirs)
+        return seen, theirs
+
+    seen, theirs = asyncio.run(scenario())
+    assert seen["bluez"]["use_start_notify"] is True
+    assert seen["bluez"]["other"] == 1                 # the rest of their args survive
+    assert theirs["use_start_notify"] is False         # their dict was copied, not mutated
+
+
+def test_no_bluez_args_means_none_are_invented(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        seen = {}
+
+        async def capture(char_specifier, callback, **kwargs):
+            seen.update(kwargs)
+
+        client._backend.start_notify = capture
+        await client.start_notify("fff4", lambda *_: None)
+        return seen
+
+    assert "bluez" not in asyncio.run(scenario())
+
+
+def test_a_device_outside_the_allow_set_is_refused_before_anything_is_spent(env):
+    """THE RULE from the fleet root cause: a BLE peer set is bounded by
+    stored configuration, never by radio range. sensors-py connected to
+    ~63 uninvited devices; the volume detonated a dormant BlueZ UAF. With
+    an allow-set in force, an unlisted device is refused before a claim is
+    taken or a backend built - and with a NON-BleakError, so
+    bleak-retry-connector does not burn four attempts on a policy."""
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  allowed_devices=("11:22:33:44:55:66",))
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    with pytest.raises(catcher.DeviceNotPermitted):
+        asyncio.run(client.connect())
+    assert os.listdir(env.dir) == []                           # nothing spent on the card
+    assert not issubclass(catcher.DeviceNotPermitted, catcher.BleakError)
+
+
+def test_the_allow_set_matches_any_spelling_and_cannot_be_clobbered(env):
+    """The two silent gate bugs a consumer already shipped: a set
+    overwritten after load, and a MAC matched as a trailing segment. The
+    catcher's set is a frozenset of canonical keys."""
+    spelled = ADDRESS.lower().replace(":", "-")
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  allowed_devices=f" {spelled}, not-a-mac ")
+    assert isinstance(catcher._config.allowed_devices, frozenset)
+    assert catcher._config.allowed_devices == frozenset({catcher.claims.mac_key(ADDRESS)})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert client.is_connected is True
+
+
+def test_no_allow_set_means_no_gate(env):
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    assert catcher._config.allowed_devices is None
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  allowed_devices="")
+    assert catcher._config.allowed_devices is None       # empty means not configured, not deny-all

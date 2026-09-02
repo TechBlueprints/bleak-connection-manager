@@ -585,6 +585,14 @@ class Claim:
     thing they account for (a connection that dropped without its callback
     ever firing, an abandoned scanner) - without it the heartbeat would keep
     such a claim live until process exit.
+
+    It is evaluated ONLY by the owner's own heartbeat thread (_beat_once
+    walks this process's held claims), so it cannot catch the owner's own
+    death: a dead process beats nothing. A dead owner's claims persist as
+    files until their mtime passes the TTL and another process's snapshot
+    reaps them, or an acquirer takes the slot over. That path - TTL plus
+    on-demand takeover - carries process death alone; validity covers only
+    in-process divergence (field 2026-09-02).
     """
 
     def __init__(self, adapter, path, exclusive, service=None, holder=None, purpose=None, seq=None):
