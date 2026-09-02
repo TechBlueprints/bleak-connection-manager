@@ -3060,9 +3060,10 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     the notify_io BlueZ 5.72 double-frees, and bleak's own default is
     changing to AcquireNotify, so this is the fleet's guard against both a
     library flip and a call site in code nobody here controls. None (the
-    default) reads BCM_FORCE_START_NOTIFY from the environment - the shim
-    sets it, so the deploy decides fleet-wide without touching any
-    consumer; pass True or False here to decide for this process alone.
+    default) reads BCM_FORCE_START_NOTIFY (true/false) from the environment
+    - the shim sets it to true, so the deploy decides fleet-wide without
+    touching any consumer; pass True or False here to decide for this
+    process alone.
     False changes nothing: bleak's default and every caller's choice stand.
     Idempotent.
     """
@@ -3100,7 +3101,8 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         # fleet-wide from the environment: the /data/bcm/python3 shim exports
         # BCM_FORCE_START_NOTIFY, so the deploy decides for every consumer it
         # launches and no consumer's source has to know
-        force_start_notify = os.environ.get("BCM_FORCE_START_NOTIFY", "").strip().lower() in ("1", "true", "yes", "on")
+        # true/false (case-insensitive); 1/0 and yes/no are tolerated
+        force_start_notify = os.environ.get("BCM_FORCE_START_NOTIFY", "").strip().lower() in ("true", "1", "yes", "on")
     _config.force_start_notify = bool(force_start_notify)
     if _config.force_start_notify:
         logger.info("bleak catcher: StartNotify is forced for every start_notify in this process")

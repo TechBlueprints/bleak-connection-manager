@@ -4520,12 +4520,10 @@ def test_when_not_forcing_an_explicit_opt_out_is_honoured(env, monkeypatch):
 def test_force_start_notify_resolves_from_the_environment(env, monkeypatch):
     """The shim exports BCM_FORCE_START_NOTIFY, so the deploy decides for
     every consumer it launches without touching any consumer's source."""
-    monkeypatch.setenv("BCM_FORCE_START_NOTIFY", "1")
-    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
-    assert catcher._config.force_start_notify is True
-    monkeypatch.setenv("BCM_FORCE_START_NOTIFY", "0")
-    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
-    assert catcher._config.force_start_notify is False
+    for value, expected in (("true", True), ("false", False), ("TRUE", True), ("1", True), ("0", False)):
+        monkeypatch.setenv("BCM_FORCE_START_NOTIFY", value)
+        catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
+        assert catcher._config.force_start_notify is expected, value
     # an explicit argument beats the environment either way
     catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
                                   force_start_notify=True)

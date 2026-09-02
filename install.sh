@@ -93,8 +93,8 @@ export BCM_AUTOWIRE=0
 # path is the BlueZ 5.72 notify_io double-free). Decided here, for every
 # consumer this shim launches, without touching any consumer's source; a
 # consumer passes install_bleak_catcher(force_start_notify=False) to opt
-# out for itself, or the launch environment presets this variable to 0
-export BCM_FORCE_START_NOTIFY="\${BCM_FORCE_START_NOTIFY:-1}"
+# out for itself, or the launch environment presets this variable to false
+export BCM_FORCE_START_NOTIFY="\${BCM_FORCE_START_NOTIFY:-true}"
 exec python3 "\$@"
 SHIM_EOF
 chmod 755 "$ROOT/python3.tmp"
