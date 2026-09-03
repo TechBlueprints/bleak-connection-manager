@@ -1979,11 +1979,26 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             # running event loop is guaranteed
             config.sweeper.ensure_running()
         adapter = None
-        explicit = (
-            init_kwargs.get("adapter")
-            or (init_kwargs.get("bluez") or {}).get("adapter")
-            or _device_path_adapter(address_or_ble_device)
-        )
+        requested = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
+        bound = _device_path_adapter(address_or_ble_device)
+        if bound and requested and claims.adapter_key(bound) != claims.adapter_key(requested):
+            # The device already carries a BlueZ path, and bleak connects
+            # via that path whatever adapter it is told - the adapter
+            # argument is honoured only when bleak has to scan. So the
+            # path names the card the link WILL be on, and the caller's
+            # request names a card it will not touch; claiming the request
+            # would put every claim, cap and drain decision on the wrong
+            # card. Field 2026-09-02, prod RS pack: bleak-retry-connector
+            # swaps a caller's BLEDevice for BlueZ's already-CONNECTED copy
+            # before building the client (an adopted link, on whatever
+            # card it lingered on) and passes the caller's adapter kwarg
+            # through unchanged - the claim named hci5, the link was on
+            # hci3, and the empty-card rule would have called hci3 free.
+            logger.warning(
+                f"BLE [{self._catcher_address}]: caller asked for {requested} but the device is "
+                f"already bound to {bound} (BlueZ path) - the link will be on {bound}; claiming there"
+            )
+        explicit = bound or requested
         if explicit:
             self._catcher_claims = _claim_explicit(explicit, self._catcher_address)
         else:

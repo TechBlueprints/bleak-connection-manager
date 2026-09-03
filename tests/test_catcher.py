@@ -4575,3 +4575,47 @@ def test_a_spontaneous_drop_still_logs_its_release_at_info(env, caplog):
     releases = [r for r in caplog.records if "releasing claims" in r.getMessage()]
     assert releases and all(r.levelno == logging.INFO for r in releases)
     assert "teardown requested" not in releases[-1].getMessage()
+
+
+
+def _bound_device(address, hci):
+    """A cache-resolved BLEDevice: bleak will connect via this path whatever
+    adapter it is told."""
+    return types.SimpleNamespace(address=address, details={"path": f"/org/bluez/{hci}/dev_" + address.replace(":", "_")})
+
+
+def test_a_device_bound_to_one_card_is_claimed_there_even_if_another_was_requested(env, caplog):
+    """Field 2026-09-02, prod RS pack: the driver asked for hci5, brc had
+    swapped its BLEDevice for BlueZ's already-connected copy on hci3, bleak
+    adopted the hci3 link, and BCM claimed hci5 - so every claim, cap and
+    drain decision sat on a card the link was not on, and the empty-card
+    rule would have called hci3 free. The path is where the link will be."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="bleak_connection_manager.catcher")
+    env.install(adapters=("hci3", "hci5"), link_caps={"hci3": 2, "hci5": 2})
+    client = sys.modules["bleak"].BleakClient(_bound_device(ADDRESS, "hci3"), adapter="hci5", _is_retry_client=True)
+    asyncio.run(client.connect())
+    held = os.listdir(env.dir)
+    assert held and all(n.startswith(catcher.claims.adapter_key("hci3")) for n in held), held
+    assert client._catcher_adapter_used == "hci3"
+    warnings = [r.getMessage() for r in caplog.records if "already bound to hci3" in r.getMessage()]
+    assert warnings and "asked for hci5" in warnings[0]
+
+
+def test_a_bare_address_still_honours_the_requested_adapter(env):
+    """No path, so bleak will scan on the requested card: the request is
+    the truth and nothing warns."""
+    env.install(adapters=("hci3", "hci5"), link_caps={"hci3": 2, "hci5": 2})
+    client = sys.modules["bleak"].BleakClient(ADDRESS, adapter="hci5", _is_retry_client=True)
+    asyncio.run(client.connect())
+    held = os.listdir(env.dir)
+    assert held and all(n.startswith(catcher.claims.adapter_key("hci5")) for n in held), held
+
+
+def test_matching_request_and_path_do_not_warn(env, caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="bleak_connection_manager.catcher")
+    env.install(adapters=("hci3",), link_caps={"hci3": 2})
+    client = sys.modules["bleak"].BleakClient(_bound_device(ADDRESS, "hci3"), adapter="hci3", _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert not [r for r in caplog.records if "already bound" in r.getMessage()]
