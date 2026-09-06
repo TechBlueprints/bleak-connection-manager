@@ -107,7 +107,19 @@ two fails loudly. The rules it implements:
    read and the `/data/bcm/python3` shim retire together once the last
    consumer is through.)
 
-7. **On the `vendored` path, touch nothing of BCM's.** No import from
+7. **Migrate the launcher `/service/<name>` actually resolves to.** On
+   Venus `/service/<name>` is a symlink, usually into the repo's root-level
+   `service/` directory, and `run` there is the real launcher; an in-tree
+   `service/run` under `src/opt/...` or a `start-<name>.sh` beside it may
+   never be reached. sensors-py (PR #9, 2026-09-06) migrated its start
+   script and left `exec /data/bcm/python3` in the run the symlink
+   resolves to; only the pre-restart check caught it, and deploying as-is
+   would have left prod on the shim while `ensure_ble_stack()` returned
+   `provided` and looked migrated. Follow the symlink, migrate that file,
+   and pin your test to the file the symlink resolves to, not an adjacent
+   launcher.
+
+8. **On the `vendored` path, touch nothing of BCM's.** No import from
    `bleak_connection_manager` (not `DeviceNotPermitted`, not `claims`),
    and no BCM-only adapter syntax handed to plain bleak/brc: degrade
    `MAC@hciN` and MAC-keyed pins to a bare `hciN` adapter kwarg, or drop
