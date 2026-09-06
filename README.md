@@ -373,7 +373,7 @@ drain claims it has never heard of). The supported alternative: the
 shared install IS a git checkout of this repository at `/data/bcm` — the
 one directory that survives a Venus firmware update — with bleak and
 bleak-retry-connector as submodules pinned to the field-validated
-upstream releases (v3.0.2 / v4.6.0) and `dbus_fast`, `bluetooth_adapters`
+upstream releases (v3.0.2 / v4.7.0) and `dbus_fast`, `bluetooth_adapters`
 and `aiooui` vendored in `ext/`. Each consumer's installer converges it:
 
 ```sh

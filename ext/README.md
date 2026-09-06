@@ -18,10 +18,11 @@ to take.
 
 ## bluetooth_adapters/ and aiooui/
 
-bluetooth-adapters 2.1.1 (Apache-2.0, see BLUETOOTH_ADAPTERS_LICENSE) and
+bluetooth-adapters 2.4.0 (Apache-2.0, see BLUETOOTH_ADAPTERS_LICENSE) and
 aiooui 0.1.9 (MIT, see AIOOUI_LICENSE), vendored verbatim from the PyPI
-wheels - byte-identical to the trees field-validated in the serialbattery
-deployment. Here because bleak-retry-connector hard-imports
+wheels (bluetooth-adapters re-vendored 2026-09-06 to meet bleak-retry-connector
+4.7.0's declared floor of >= 2.3.0; same third-party imports as 2.1.1, and
+still pure Python). Here because bleak-retry-connector hard-imports
 bluetooth_adapters on Linux (and it in turn needs aiooui); part of the
 shared-install stack served by /data/bcm.
 
@@ -33,7 +34,10 @@ shared-install stack served by /data/bcm.
   the exact tree the fleet field-validated (located by git tree-hash
   match against the serialbattery deployment's vendored copy).
 - upstream/bleak-retry-connector: github.com/Bluetooth-Devices/
-  bleak-retry-connector, pinned at v4.6.0 (2ef1db5).
+  bleak-retry-connector, pinned at v4.7.0 (84bda39); bumped from v4.6.0
+  2026-09-06 on Clint's ruling - 4.6.1-4.6.3 are fixes (clear_cache guard,
+  decorator retries EOFError/BrokenPipeError), 4.7.0 adds
+  restore_discoveries_sync; establish_connection's behaviour is unchanged.
 
 Per the standing rule, both pin UPSTREAM commits - never TechBlueprints
 fork branches. Bump pins deliberately, one at a time, with a fleet soak.
