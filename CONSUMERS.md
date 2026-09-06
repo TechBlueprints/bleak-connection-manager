@@ -117,7 +117,11 @@ two fails loudly. The rules it implements:
 ### Startup lines (part of the contract)
 
 Anchor `BLE coordination: `. The monitor greps for these across the fleet
-and the serialbattery overlay pins them verbatim, with levels, by test.
+and the serialbattery overlay pins them verbatim, with levels, by test (an
+AST test there pins every logger call in the install path to the anchor).
+Raise class for monitors: no-shared-install, DIR-empty,
+predates-force_start_notify, unusable, would-not-install. INFO loaded-from
+means active; manager off means silence.
 
 - `shared`, manager on — INFO once:
   `BLE coordination: bleak_connection_manager loaded from <dir-of-package>`
@@ -146,6 +150,12 @@ and the serialbattery overlay pins them verbatim, with levels, by test.
   signature (`inspect.signature`) and sets the environment variable
   instead. Operator action: update the install. The monitor treats this
   line as a raise.
+- import succeeded but `install_bleak_catcher` raised (bad kwarg, a
+  raising validator, a catcher bug) — ERROR once:
+  `BLE coordination: catcher would not install from <DIR>, running
+  uncoordinated: <repr(exc)>`. Operator action: fix the driver or the
+  catcher, NOT the install; deliberately distinct from "present but
+  unusable", which is the install.
 - manager deliberately off — no line at all. The consumer still calls
   `ensure_ble_stack()` and imports `bleak_connection_manager` (rule 4) but
   installs no catcher, and emits no INFO line, because on a box with
