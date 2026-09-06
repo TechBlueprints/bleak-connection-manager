@@ -107,17 +107,23 @@ two fails loudly. The rules it implements:
    read and the `/data/bcm/python3` shim retire together once the last
    consumer is through.)
 
-7. **Migrate the launcher `/service/<name>` actually resolves to.** On
-   Venus `/service/<name>` is a symlink, usually into the repo's root-level
-   `service/` directory, and `run` there is the real launcher; an in-tree
-   `service/run` under `src/opt/...` or a `start-<name>.sh` beside it may
-   never be reached. sensors-py (PR #9, 2026-09-06) migrated its start
+7. **Migrate the launcher `/service/<name>` actually resolves to, read
+   on the box.** The run that `/service/<name>` resolves to is the
+   launcher, whatever kind of entry it is: usually a symlink into the
+   repo's root-level `service/` directory, but on prod the packs'
+   `/service/dbus-blebattery.N` entries are real directories whose `run`
+   lives under `/service` itself, outside `/data/apps`, regenerated only by
+   the boot hook (`enable.sh --boot`), so a deploy of the app directory
+   never reaches them. An in-tree `service/run` under `src/opt/...`, a
+   `start-<name>.sh` beside it, or the generator template alone may never
+   be what runs. sensors-py (PR #9, 2026-09-06) migrated its start
    script and left `exec /data/bcm/python3` in the run the symlink
    resolves to; only the pre-restart check caught it, and deploying as-is
    would have left prod on the shim while `ensure_ble_stack()` returned
    `provided` and looked migrated. Follow the symlink, migrate that file,
-   and pin your test to the file the symlink resolves to, not an adjacent
-   launcher.
+   and pin the box-side pre-restart check to the resolved file (print its
+   exec line, stop on shim residue); a repo test may pin the template as
+   well, never instead.
 
 8. **On the `vendored` path, touch nothing of BCM's.** No import from
    `bleak_connection_manager` (not `DeviceNotPermitted`, not `claims`),
