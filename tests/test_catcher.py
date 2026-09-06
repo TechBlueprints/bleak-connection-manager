@@ -4215,6 +4215,49 @@ def test_a_card_carrying_links_is_not_drained_or_cycled(env, monkeypatch):
     assert attempts == [], "cycled a card that was carrying a live link"
 
 
+def test_our_own_soft_claim_does_not_keep_a_card_from_being_cycled(env, monkeypatch):
+    """Clint, 2026-09-06: the empty-card pre-check counts links and OTHER
+    processes' soft claims. Our own .use with no .link behind it is our own
+    connect attempt in flight, which on a card that earned a cycle fails
+    anyway - prod hci7 2026-09-04 carried exactly that and nothing else."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append(adapter)
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    key = catcher.claims.adapter_key("hci5")
+    own_owner = catcher._config.claims.owner
+    with open(os.path.join(env.dir, f"{key}.use.{own_owner}.AABB"), "w") as f:
+        f.write(f"{os.getpid()} {own_owner} {int(time.time())}\n")
+
+    def strike_out():
+        async def scenario():
+            for i in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+                if i == catcher.SCAN_FAILURES_BEFORE_RESET - 1:
+                    catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
+                SCANNER_START_RESULTS.append(RuntimeError("Set scan parameters failed"))
+                scanner = sys.modules["bleak"].BleakScanner()
+                with pytest.raises(RuntimeError):
+                    await scanner.start()
+            if catcher._recovery_tasks:
+                await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+        asyncio.run(scenario())
+
+    strike_out()
+    assert attempts == ["hci5"], "our own soft claim kept the card from being cycled"
+
+    # a foreign soft claim is another process's attempt: still not ours to fail
+    attempts.clear()
+    catcher._scan_failures.clear(); catcher._scan_failure_since.clear(); catcher._recovering.clear()
+    _live_claim_file(env.dir, f"{key}.use.other-svc-7.AABB")
+    strike_out()
+    assert attempts == [], "cycled a card carrying another process's soft claim"
+
+
 def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):
     """Fleet policy: nobody opts out of StartNotify. bleak defaults to it;
     AcquireNotify is reachable only via bluez={"use_start_notify": False},

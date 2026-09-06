@@ -56,7 +56,7 @@ def test_reset_proceeds_only_from_a_completely_empty_card(tmp_path, monkeypatch)
     assert calls == [(1, recovery.UNKNOWN_MAC, True)]
 
 
-def test_our_own_claim_vetoes_the_reset_exactly_like_a_foreign_one(tmp_path, monkeypatch):
+def test_our_own_link_vetoes_the_reset_exactly_like_a_foreign_one(tmp_path, monkeypatch):
     """R2, and the reversal of the rule this replaces. "Our own links are
     ours to kill" reads reasonably right up until you notice that a straggler
     is by definition a claim that COULD NOT MOVE - a device's only working
@@ -67,13 +67,37 @@ def test_our_own_claim_vetoes_the_reset_exactly_like_a_foreign_one(tmp_path, mon
     worth making."""
     calls = _fake_recovery(monkeypatch)
     manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
-    own = manager.claim_soft("hci1")
+    own = manager.claim_slot("hci1", 1)
+    assert own is not None
     try:
         assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0)) is False
         assert calls == []
         assert not os.path.exists(os.path.join(str(tmp_path), "hci1.drain"))
     finally:
         manager.release(own)
+
+
+def test_our_own_soft_claim_with_no_link_does_not_veto_the_reset(tmp_path, monkeypatch):
+    """Clint, 2026-09-06. A soft claim is taken BEFORE the connect and the
+    link slot only after it succeeds, so our own .use with no .link behind
+    it is our own attempt in flight - and on a card that has earned a cycle
+    that attempt fails anyway. Vetoing on it only delayed the cycle by one
+    attempt (prod hci7, 2026-09-04: easytouch's own .use sat on the card it
+    could not scan). A foreign soft claim still vetoes: another process's
+    attempt is not ours to fail."""
+    calls = _fake_recovery(monkeypatch)
+    manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
+    own = manager.claim_soft("hci1", "AA:BB")
+    try:
+        assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, gone_silent=True, drain_timeout=0)) is True
+        assert calls == [(1, recovery.UNKNOWN_MAC, True)]
+    finally:
+        manager.release(own)
+
+    calls.clear()
+    _foreign_file(tmp_path, "hci1.use.other-svc-7.AA:BB")
+    assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0)) is False
+    assert calls == []
 
 
 def test_force_still_respects_the_in_use_veto(tmp_path, monkeypatch):
@@ -271,7 +295,7 @@ def test_drain_refuses_at_the_deadline_for_our_own_unmigratable_claims(tmp_path,
     calls = _fake_recovery(monkeypatch)
     monkeypatch.setattr(recovery, "_DRAIN_POLL", 0.03)
     manager = ClaimManager(owner="svc", claim_dir=str(tmp_path))
-    manager.claim_soft("hci1")
+    assert manager.claim_slot("hci1", 1) is not None  # our own LINK: work that cannot move
     try:
         assert asyncio.run(recovery.reset_adapter("hci1", claims_manager=manager, drain_timeout=0.15)) is False
     finally:

@@ -954,6 +954,27 @@ class ClaimManager:
             count += 1
         return count
 
+    def own_links(self, adapter):
+        """Count of live LINK claims THIS manager holds on the adapter.
+
+        The reset veto's own-side test (Clint, 2026-09-06). An own soft claim
+        with no link behind it is a connect attempt in flight, and on a card
+        that has earned a cycle that attempt fails anyway - vetoing on it
+        only delays the cycle by one attempt. An own link is a device's
+        working card and vetoes exactly like a foreign one (R2).
+        """
+        with self._lock:
+            held = list(self._held)
+        wanted = adapter_key(adapter)
+        count = 0
+        for claim in held:
+            base = os.path.basename(claim.path)
+            prefix, _sep, rest = base.partition(".")
+            if prefix != wanted or claim.released or not rest.startswith("link."):
+                continue
+            count += 1
+        return count
+
     def drain_active(self, adapter):
         """Whether a live drain claim exists on the adapter (any process)."""
         path, legacy = self._names(adapter, "drain")

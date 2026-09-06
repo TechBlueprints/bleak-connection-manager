@@ -441,9 +441,11 @@ async def _recover_adapter(adapter):
     bearing. reset_adapter takes the exclusive drain claim, so only one
     process anywhere attempts a given card. New work cannot land on a
     draining card, from any path, so the drain converges instead of being
-    topped up. And the reset refuses outright while ANY claim is live -
-    foreign or our own - so a cycle can only ever fire on a card that emptied
-    voluntarily, which is precisely the wedged case and never the busy one.
+    topped up. And the reset refuses outright while any foreign claim or any
+    of our own LINKS is live - our own soft claim with no link is only our
+    own attempt in flight - so a cycle can only ever fire on a card that
+    emptied voluntarily, which is precisely the wedged case and never the
+    busy one.
     """
     key_early = claims.adapter_key(adapter)
     if card_cycling_disabled():
@@ -508,6 +510,21 @@ async def _recover_adapter(adapter):
     return recovered
 
 
+def _foreign_soft(entry, owner):
+    """Live soft claims on a card that are NOT this process's own.
+
+    Our own soft claim with no link behind it is a connect attempt in
+    flight (the .use is taken before the connect, the .link.k after it
+    succeeds); on a card that has earned a cycle that attempt fails
+    anyway, so it must not count as the card being in use (Clint,
+    2026-09-06). Soft owner strings are "<owner>" or "<owner>.<qualifier>".
+    """
+    return sum(
+        1 for name in entry.get("soft_owners", ())
+        if not (name == owner or name.startswith(owner + "."))
+    )
+
+
 def _schedule_recovery(adapter):
     """Queue a recovery if this card has failed enough to have earned one.
 
@@ -552,7 +569,7 @@ def _schedule_recovery(adapter):
     config = _config
     if config is not None:
         entry = config.claims.claims().get(key) or {}
-        held = entry.get("links", 0) + entry.get("soft", 0)
+        held = entry.get("links", 0) + _foreign_soft(entry, config.claims.owner)
         if held:
             # A card is cycled only when it is EMPTY. Draining a card that
             # carries links would steer every new placement off a card
@@ -561,7 +578,7 @@ def _schedule_recovery(adapter):
             # its strikes; that is the whole remedy while it holds links.
             logger.info(
                 f"BLE scan: {adapter} has {_scan_failures.get(key, 0)} failed scans but carries "
-                f"{held} live claim(s) - not cycled; a card is cycled only when it is empty"
+                f"{held} live claim(s) of others' or links - not cycled; a card is cycled only when it is empty"
             )
             return
     try:

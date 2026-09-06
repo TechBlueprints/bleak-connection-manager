@@ -362,14 +362,17 @@ async def _drain_and_wait(adapter, claims_manager, drain_timeout):
     logged = False
     while True:
         foreign = claims_manager.foreign_use(adapter)
-        own = claims_manager.own_use(adapter)
+        # own SOFT claims do not veto (Clint, 2026-09-06): a soft claim with
+        # no link is our own connect attempt in flight, which on a card
+        # that earned a cycle fails anyway; our own LINKS veto like foreign
+        own = claims_manager.own_links(adapter)
         if foreign == 0 and own == 0:
             return drain, True
         if time.monotonic() >= deadline:
             holders = (claims_manager.claims().get(claims.adapter_key(adapter)) or {}).get("soft_owners", [])
             logger.warning(
-                f"bt-recovery: not resetting {adapter}: {foreign} foreign and {own} own live "
-                f"claim(s) remain after a {drain_timeout:.0f}s drain ({holders or 'unnamed'}) - "
+                f"bt-recovery: not resetting {adapter}: {foreign} foreign live claim(s) and {own} own "
+                f"live link(s) remain after a {drain_timeout:.0f}s drain ({holders or 'unnamed'}) - "
                 "work that could not move keeps its card"
             )
             claims_manager.release(drain)
@@ -377,7 +380,7 @@ async def _drain_and_wait(adapter, claims_manager, drain_timeout):
         if not logged:
             logger.warning(
                 f"bt-recovery: draining {adapter} before reset "
-                f"({foreign} foreign / {own} own live claim(s))"
+                f"({foreign} foreign live claim(s) / {own} own live link(s))"
             )
             logged = True
         await asyncio.sleep(_DRAIN_POLL)
@@ -460,7 +463,7 @@ async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=F
                     pass
                 return True
             if claims_manager is not None and (
-                claims_manager.foreign_use(adapter) or claims_manager.own_use(adapter)
+                claims_manager.foreign_use(adapter) or claims_manager.own_links(adapter)
             ):
                 logger.warning(f"bt-recovery: not resetting {adapter}: it filled up again during the probe")
                 return False
