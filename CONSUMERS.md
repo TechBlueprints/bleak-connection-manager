@@ -139,12 +139,22 @@ and the serialbattery overlay pins them verbatim, with levels, by test (an
 AST test there pins every logger call in the install path to the anchor).
 Raise class for monitors: no-shared-install, DIR-empty,
 predates-force_start_notify, unusable, would-not-install. INFO loaded-from
-means active; manager off means silence.
+and catcher-installed mean active (presence tier); manager off means
+silence.
 
 - `shared`, manager on — INFO once:
   `BLE coordination: bleak_connection_manager loaded from <dir-of-package>`
   — the imported package's own directory (`bleak_connection_manager.__file__`),
   NOT the configured key, so the line proves which tree served.
+- `shared`, manager on, `install_bleak_catcher` returned — INFO once,
+  immediately after the line above:
+  `BLE coordination: catcher installed (force_start_notify=<True|False>,
+  adapters=<n> configured, <m> pinned)`. Emitted by the CONSUMER, because
+  BCM's own install-time INFO lines ("bleak catcher installed",
+  "StartNotify is forced") never reach a consumer whose root logger sits
+  at WARNING, and the ruling is not to open BCM's logger in consumer logs;
+  this is how the install and the StartNotify policy are visible per
+  consumer. Presence-tier for monitors.
 - `vendored`, no shared install — WARNING once:
   `BLE coordination: no shared install at <DIR>; running uncoordinated, no
   claims, no adapter routing, no card recovery`.
