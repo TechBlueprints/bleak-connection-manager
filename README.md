@@ -387,16 +387,14 @@ fi
 ```
 
 `--ff-only` means a stale consumer can never move the fleet backwards.
-`install.sh` initializes submodules, smoke-imports the whole stack, and
-writes the interpreter shim `/data/bcm/python3` — the ONE place the
-shared path is written down. A consumer's runit script uses it with a
-standalone fallback, so public repos keep working from a bare clone:
-
-```sh
-BCM_PY=/data/bcm/python3
-[ -x "$BCM_PY" ] || BCM_PY=python3
-exec "$BCM_PY" main.py
-```
+`install.sh` initializes submodules and smoke-imports the whole stack.
+Consumers source the shared install themselves, in process, from a folder
+they are configured with, and launch under plain `python3` — the contract
+is CONSUMERS.md section 2 (Clint, 2026-09-06: "all things should source
+the bcm in the same way, no shim"). The earlier interpreter shim
+`/data/bcm/python3` is retiring box by box: `install.sh` writes it only
+while some run script on that box still execs it, and removes it the first
+time none does.
 
 Rollback: `git -C /data/bcm checkout <hash> && /data/bcm/install.sh`.
 Canary: a second clone at a pinned hash plus `BCM_ROOT=<that-clone>` in

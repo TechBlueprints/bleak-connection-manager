@@ -103,9 +103,11 @@ two fails loudly. The rules it implements:
    The StartNotify policy is one key next to the location key,
    `BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY`, default `true`.
    (`install_bleak_catcher` still reads `BCM_FORCE_START_NOTIFY` from the
-   environment when the argument is None, only as the legacy path; that
-   read and the `/data/bcm/python3` shim retire together once the last
-   consumer is through.)
+   environment when the argument is None, only as the legacy path. The
+   `/data/bcm/python3` shim retires box by box: `install.sh` writes it only
+   while some run script on that box still execs it and removes it the
+   first time none does, printing which scripts still need it; the
+   environment read is removed from the code once no box needs the shim.)
 
 7. **Migrate the launcher `/service/<name>` actually resolves to, read
    on the box.** The run that `/service/<name>` resolves to is the

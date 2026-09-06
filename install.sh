@@ -78,9 +78,20 @@ if ! PYTHONPATH="$LIBPATH" python3 -c "import bleak_connection_manager, bleak, b
     exit 1
 fi
 
-# the interpreter shim: the ONE place the shared path is written down.
-# Consumers exec this instead of python3 (falling back to python3 when it
-# is absent). BCM_ROOT=<other-checkout> in a run script is the canary knob.
+# the interpreter shim, RETIRING (Clint, 2026-09-06: "all things should
+# source the bcm in the same way, no shim"). Consumers now source the
+# shared install in-process (CONSUMERS.md section 2) and launch under plain
+# python3; the shim is written only while some run script on THIS box still
+# execs it, and is removed the first time none does - so it retires box by
+# box as the last consumer there migrates, with no flag day.
+SHIM_USERS="$(grep -ls '/data/bcm/python3' /service/*/run /data/apps/*/service/run /data/apps/*/service-*/run 2>/dev/null | sort -u | tr '\n' ' ')"
+if [ -z "$SHIM_USERS" ]; then
+    if [ -e "$ROOT/python3" ]; then
+        rm -f "$ROOT/python3"
+        echo "bcm-install: shim retired - no run script on this box references $ROOT/python3 any more"
+    fi
+else
+    echo "bcm-install: shim still needed by: $SHIM_USERS"
 cat > "$ROOT/python3.tmp" <<SHIM_EOF
 #!/bin/sh
 # BCM interpreter shim - written by install.sh; do not edit.
@@ -99,6 +110,7 @@ exec python3 "\$@"
 SHIM_EOF
 chmod 755 "$ROOT/python3.tmp"
 mv "$ROOT/python3.tmp" "$ROOT/python3"
+fi
 
 VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # on-box deploy record, for whoever is attributing pid changes: every install
@@ -106,7 +118,11 @@ VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # appends a UTC line here (the night watch could not see BCM's restarts and
 # filed them as unexplained, 2026-09-02)
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') install $VERSION by ${SUDO_USER:-${USER:-?}}@${SSH_CLIENT%% *}" >> "$ROOT/deploy.log" 2>/dev/null || true
-echo "bcm-install: shim ready at $ROOT/python3 ($VERSION)"
+if [ -e "$ROOT/python3" ]; then
+    echo "bcm-install: shim ready at $ROOT/python3 ($VERSION)"
+else
+    echo "bcm-install: install ok, no shim ($VERSION)"
+fi
 
 # --autowire: sitewide hook. A .pth runs in EVERY python process on the
 # box, so this is opt-in and the module it loads is built to never raise.
