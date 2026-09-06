@@ -3283,7 +3283,12 @@ def test_inprogress_stops_never_reach_the_drain_and_cycle(env, monkeypatch):
     radio evidence is what power-cycled healthy adapters on 2026-08-26, and
     each cycle mass-disappeared that card's devices into the BlueZ 5.72
     gatt-client use-after-free. The card is still ranked down; it is never
-    charged for somebody else's protocol violation."""
+    charged for somebody else's protocol violation. 2026-09-06: the same
+    error is also how the BlueZ discovery DESYNC looks per call; what
+    separates that is Discovering staying true afterwards, which is the
+    property check's job (see test_discovering_stuck_after_a_quiet_stop_
+    counts_toward_recovery). Here the reading is None, so this stays the
+    ranking-only case."""
     env.install(adapters=("hci5",), wrap_scanner=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
     attempts = []
@@ -4213,6 +4218,140 @@ def test_a_card_carrying_links_is_not_drained_or_cycled(env, monkeypatch):
 
     asyncio.run(scenario())
     assert attempts == [], "cycled a card that was carrying a live link"
+
+
+def _settle_fast(monkeypatch):
+    monkeypatch.setattr(catcher, "DISCOVERY_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(catcher, "DISCOVERY_SETTLE_POLL", 0.01)
+
+
+def _quiet_windows(n, key, age_last=True):
+    """n scan windows that hear nothing: start, then stop."""
+    async def scenario():
+        for i in range(n):
+            if age_last and i == n - 1:
+                catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
+            scanner = sys.modules["bleak"].BleakScanner()
+            await scanner.start()
+            await scanner.stop()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+    asyncio.run(scenario())
+
+
+def test_discovering_stuck_after_a_quiet_stop_counts_toward_recovery(env, monkeypatch):
+    """Prod hci7, 2026-09-04 18:00Z to 09-05 15:12Z: bluetoothd believed
+    discovery was enabled while the kernel was stopped, so every window was
+    accepted, heard nothing, and left Discovering true with no client on
+    the card. No trigger saw it for 29 hours. The property, not the
+    InProgress exception, is the signal (bleak#2022 swallows the latter):
+    Discovering still true through the settle window after our stop, on a
+    session that heard nothing, is the desync and earns a strike toward
+    recovery under the usual gates."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    _settle_fast(monkeypatch)
+    monkeypatch.setattr(catcher, "_adapter_discovering", lambda adapter: True)
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append((adapter, gone_silent))
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    key = catcher.claims.adapter_key("hci5")
+
+    _quiet_windows(catcher.SCAN_FAILURES_BEFORE_RESET, key)
+    assert catcher._scan_failures.get(key, 0) >= catcher.SCAN_FAILURES_BEFORE_RESET
+    assert attempts == [("hci5", True)], "a stuck Discovering after quiet windows did not reach recovery"
+
+
+def test_inprogress_plus_stuck_discovering_reaches_recovery(env, monkeypatch):
+    """The two observables of the desync together, as prod hci7 showed
+    them: every stop rejected AND Discovering held true. The exception
+    path falls through to the property check instead of returning early,
+    so the strike is charged once and goes toward recovery."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    _settle_fast(monkeypatch)
+    monkeypatch.setattr(catcher, "_adapter_discovering", lambda adapter: True)
+    attempts = []
+
+    async def fake_reset(adapter, claims_manager=None, force=False, gone_silent=False, **kw):
+        attempts.append((adapter, gone_silent))
+        return False
+
+    monkeypatch.setattr(catcher.recovery, "reset_adapter", fake_reset)
+    key = catcher.claims.adapter_key("hci5")
+
+    async def scenario():
+        for i in range(catcher.SCAN_FAILURES_BEFORE_RESET):
+            if i == catcher.SCAN_FAILURES_BEFORE_RESET - 1:
+                catcher._scan_failure_since[key] -= catcher.RECOVERY_STRIKE_SPAN + 1
+            scanner = sys.modules["bleak"].BleakScanner()
+            await scanner.start()
+
+            async def rejected_by_kernel():
+                raise _inprogress()
+
+            scanner._backend.stop = rejected_by_kernel
+            await scanner.stop()
+        if catcher._recovery_tasks:
+            await asyncio.gather(*list(catcher._recovery_tasks), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert catcher._scan_failures[key] == catcher.SCAN_FAILURES_BEFORE_RESET  # once per window, not twice
+    assert attempts == [("hci5", True)]
+
+
+def test_discovering_that_clears_late_is_the_healthy_stop(env, monkeypatch):
+    """5.72's stop_discovery_complete replies BEFORE emitting Discovering=
+    false, so the first read after our stop can still say true. One false
+    reading inside the settle window is the healthy path: no strike."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    _settle_fast(monkeypatch)
+    readings = iter([True, True, False])
+    monkeypatch.setattr(catcher, "_adapter_discovering", lambda adapter: next(readings, False))
+    key = catcher.claims.adapter_key("hci5")
+
+    _quiet_windows(1, key, age_last=False)
+    assert catcher._scan_failures.get(key, 0) == 0
+
+
+def test_no_manager_means_no_discovering_reading_and_no_strike(env, monkeypatch):
+    """A stub bleak, or a loop no scan has run on, has no BlueZ manager: the
+    reading is None, never a guess, and a quiet window is just a quiet
+    window. Also proves the check adds no settle delay in that case."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    monkeypatch.setattr(catcher, "DISCOVERY_SETTLE_SECONDS", 5.0)
+    key = catcher.claims.adapter_key("hci5")
+    assert catcher._adapter_discovering("hci5") is None
+
+    started = time.monotonic()
+    _quiet_windows(1, key, age_last=False)
+    assert time.monotonic() - started < 1.0
+    assert catcher._scan_failures.get(key, 0) == 0
+
+
+def test_a_session_that_heard_something_is_not_charged_for_discovering(env, monkeypatch):
+    """The second lock: a card that delivered an advertisement WAS scanning
+    this session, whatever the property says a moment after the stop. The
+    desync is charged on the first quiet session that follows."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    _settle_fast(monkeypatch)
+    monkeypatch.setattr(catcher, "_adapter_discovering", lambda adapter: True)
+    key = catcher.claims.adapter_key("hci5")
+
+    async def scenario():
+        scanner = sys.modules["bleak"].BleakScanner()
+        await scanner.start()
+        scanner._catcher_last_detection = catcher._monotonic() + 1  # heard something
+        await scanner.stop()
+    asyncio.run(scenario())
+    assert catcher._scan_failures.get(key, 0) == 0
 
 
 def test_our_own_soft_claim_does_not_keep_a_card_from_being_cycled(env, monkeypatch):

@@ -510,6 +510,62 @@ async def _recover_adapter(adapter):
     return recovered
 
 
+# After our StopDiscovery returns, BlueZ's Discovering property for the card
+# should read false: either bluetoothd answered the stop from its idle phase
+# (the kernel's own 10.24s LE timeout had already ended the scan) and emitted
+# the change before replying, or the kernel stop succeeded and the change is
+# emitted right AFTER the reply (5.72 stop_discovery_complete: reply at
+# discovery_complete(), then discovering = false and the emit), so a reader
+# needs a moment. What never clears on its own is the desync: bluetoothd
+# believing discovery is enabled while the kernel is stopped. Its rejected
+# stop returns without clearing that belief, every later start takes the
+# "queue up a stop" branch whose completion is discarded, and Discovering
+# stays true with zero clients until the adapter object is reset (prod hci7
+# 2026-09-04, 29 hours). That state is invisible to every other trigger.
+DISCOVERY_SETTLE_SECONDS = 1.5
+DISCOVERY_SETTLE_POLL = 0.25
+
+
+def _adapter_discovering(adapter):
+    """BlueZ's Discovering for the card, from bleak's property cache.
+
+    bleak's BlueZManager mirrors every PropertiesChanged under /org/bluez
+    into _properties, Adapter1 included, so this costs no bus round trip.
+    None when there is no manager on this loop (a stub bleak, or no scan
+    has ever run here) or the card is unknown to it - never a guess.
+    """
+    try:
+        from bleak.backends.bluezdbus.manager import _global_instances
+    except Exception:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    manager = _global_instances.get(loop)
+    if manager is None:
+        return None
+    name = str(adapter)
+    if not name.startswith("hci"):
+        name = claims.hci_for(adapter, fresh=False) or name
+    props = getattr(manager, "_properties", None) or {}
+    value = props.get(f"/org/bluez/{name}", {}).get("org.bluez.Adapter1", {}).get("Discovering")
+    return None if value is None else bool(value)
+
+
+async def _discovery_stuck(adapter):
+    """True when Discovering stays true for the whole settle window after
+    our stop - the desync signature. A single false or unknown reading
+    clears it: the property arriving late is the healthy stop path."""
+    deadline = _monotonic() + DISCOVERY_SETTLE_SECONDS
+    while True:
+        if _adapter_discovering(adapter) is not True:
+            return False
+        if _monotonic() >= deadline:
+            return True
+        await asyncio.sleep(DISCOVERY_SETTLE_POLL)
+
+
 def _foreign_soft(entry, owner):
     """Live soft claims on a card that are NOT this process's own.
 
@@ -2970,8 +3026,11 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             self._catcher_scanning = False
             self._release_scan_claim()
             return
+        result = None
+        in_progress = False
+        never_saw = self._catcher_last_detection == self._catcher_start_time
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 _ORIGINAL_BLEAK_SCANNER.stop(self), timeout=SCAN_OP_TIMEOUT
             )
         except asyncio.TimeoutError:
@@ -3013,16 +3072,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             # violation is how the fleet melted. Not retried: bleak's stop()
             # nulls its _stop closure before invoking it, so a second call is
             # a silent no-op.
-            adapter = self._catcher_adapter
-            logger.warning(
-                f"BLE scan: StopDiscovery on {adapter or 'the default adapter'} answered "
-                f"InProgress - the kernel had already stopped scanning and BlueZ had detached "
-                f"the session. With the scan claim gating every start this should be "
-                f"unreachable: a scan escaped the claim convention. Treating the scan as "
-                f"stopped and ranking this card down, but NOT counting it as radio evidence"
-            )
-            _scan_finished(adapter, False)
-            return None
+            in_progress = True
         finally:
             # cleared HERE, not at entry: while bleak's stop is in flight
             # the scan claim is still deliberately held, and a flag cleared
@@ -3033,6 +3083,38 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             # diverged. finally, so cancellation clears it too.
             self._catcher_scanning = False
             self._release_scan_claim()
+        adapter = self._catcher_adapter
+        if adapter and never_saw and await _discovery_stuck(adapter):
+            # Discovering held true through the settle window on a card whose
+            # only client just left, after a session that heard nothing:
+            # bluetoothd's discovery state is desynchronised from the kernel
+            # and will stay so until the card is reset. Counted as radio
+            # evidence and put toward recovery under the usual gates (three
+            # over a minute, daemon check, empty card, probation, kill
+            # switch). Reading the PROPERTY rather than the InProgress
+            # exception keeps this independent of whether bleak raises or
+            # swallows that error (hbldh/bleak#2022 swallows it).
+            logger.warning(
+                f"BLE scan: {adapter}: BlueZ still reports Discovering {DISCOVERY_SETTLE_SECONDS:.1f}s "
+                f"after our stop, with no client left on the card and no advertisement heard this "
+                f"session - bluetoothd's discovery state is desynchronised from the kernel (a rejected "
+                f"stop that cleared nothing); it will not clear on its own. Counting toward recovery"
+            )
+            _scan_finished(adapter, False)
+            _schedule_recovery(adapter)
+        elif in_progress:
+            # the one-off race: a stop landing after the kernel's own timeout
+            # while bluetoothd was between the Discovering=false event and
+            # its restart. Harmless and self-clearing - bleak#958, our #2021
+            # - so it is a ranking hint only, never radio evidence.
+            logger.warning(
+                f"BLE scan: StopDiscovery on {adapter or 'the default adapter'} answered "
+                f"InProgress and Discovering cleared afterwards - the kernel had already stopped "
+                f"scanning and BlueZ had detached the session. Treating the scan as stopped and "
+                f"ranking this card down, but NOT counting it as radio evidence"
+            )
+            _scan_finished(adapter, False)
+        return result
 
     @property
     def discovered_devices(self):
