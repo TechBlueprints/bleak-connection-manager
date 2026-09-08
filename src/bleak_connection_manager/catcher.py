@@ -124,6 +124,15 @@ SCAN_CLAIM_WAIT = 30.0
 # PROCESS fires no event here, and neither does one released by a thread the
 # event plumbing has not reached, so nothing may depend on an event arriving.
 SCAN_CLAIM_POLL = 1.0
+# A waiter's first poll routinely lands inside the previous scan's teardown
+# (this process's own, or a neighbour's): the claim is released within a
+# second and the waiter takes it on the next tick. Warning on the first poll
+# named that hand-over as contention every time (dev 2026-09-08: 99 lines of
+# "held by <own pid>" for a driver retrying a 10s scan; prod 2026-09-04:
+# "claimed by someone this process cannot name" for easytouch's two loops),
+# and twice sent careful readers after a deadlock that was not there. So the
+# warning waits: a wait shorter than this is a hand-over, not a problem.
+SCAN_WAIT_WARN_AFTER = 3.0
 
 # Default ceiling for GATT operations and disconnects that arrive with no
 # deadline of their own. This is NOT primarily about protecting the caller:
@@ -2622,7 +2631,13 @@ def _scan_wait_detail(manager, snapshot, candidates, ticket, queued_on):
         info = manager.holder_info(adapter)
         if info is not None:
             age = f"{info['age']:.0f}s" if info.get("age") is not None else "unknown age"
-            parts.append(f"{adapter} scanned by {info['service']} (pid {info['pid']}, held {age})")
+            if info.get("pid") == os.getpid():
+                # our own previous scan session, still releasing (a cancelled
+                # scan's stop() is in flight) - contention with ourselves is a
+                # hand-over, and naming it as a foreign holder misleads
+                parts.append(f"{adapter} held by this process's own previous scan, still releasing (held {age})")
+            else:
+                parts.append(f"{adapter} scanned by {info['service']} (pid {info['pid']}, held {age})")
         elif entry.get("drain"):
             parts.append(f"{adapter} draining (pid {entry.get('drain_pid')})")
         else:
@@ -2655,7 +2670,8 @@ async def _acquire_scan_adapter(explicit=None):
         return None, None
     manager = config.claims
     event = _scan_wake_event()
-    deadline = _monotonic() + SCAN_CLAIM_WAIT
+    started = _monotonic()
+    deadline = started + SCAN_CLAIM_WAIT
     ticket = None
     queued_on = None
     announced = False
@@ -2692,11 +2708,12 @@ async def _acquire_scan_adapter(explicit=None):
                     if ticket is not None:
                         manager.release(ticket)
                     ticket, queued_on = fresh, target
-            if not announced:
+            if not announced and _monotonic() - started >= SCAN_WAIT_WARN_AFTER:
+                # not on the first poll: see SCAN_WAIT_WARN_AFTER
                 announced = True
                 logger.warning(
-                    f"BLE scan: all {len(candidates)} scan-eligible adapter(s) are held, waiting up to "
-                    f"{SCAN_CLAIM_WAIT:.0f}s for one - "
+                    f"BLE scan: all {len(candidates)} scan-eligible adapter(s) have been held for "
+                    f"{_monotonic() - started:.0f}s, waiting up to {SCAN_CLAIM_WAIT:.0f}s for one - "
                     f"{_scan_wait_detail(manager, snapshot, candidates, ticket, queued_on)}"
                 )
             remaining = deadline - _monotonic()

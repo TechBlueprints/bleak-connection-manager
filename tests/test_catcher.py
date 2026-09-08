@@ -49,6 +49,7 @@ answers, then ask whether that is the question you meant.
 import asyncio
 import contextlib
 import gc
+import logging
 import os
 import sys
 import time
@@ -3815,6 +3816,54 @@ def test_a_waiting_scan_queues_on_the_shortest_queue(env, monkeypatch):
 
     assert [n.partition(".")[0] for n in asyncio.run(scenario())] == ["hci6"]
     assert _our_waits(env.dir) == [], "a ticket outlived the scanner waiting on it"
+
+
+def test_a_wait_that_ends_inside_the_grace_logs_no_contention(env, monkeypatch, caplog):
+    """dev 2026-09-08: a driver retrying a 10s scan logged 99 "all held by
+    <own pid>" warnings because each retry's first poll landed inside the
+    previous scan's sub-second teardown. A hand-over is not contention: a
+    wait shorter than SCAN_WAIT_WARN_AFTER says nothing."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    holder = _foreign_file(env.dir, "hci5.scan")
+    monkeypatch.setattr(catcher, "SCAN_WAIT_WARN_AFTER", 0.2)
+
+    async def scenario():
+        with _short_wait(monkeypatch):
+            task = await _start_waiting()
+            await asyncio.sleep(0.05)
+            os.unlink(holder)                  # released well inside the grace
+            await asyncio.sleep(0.1)
+            done = task.done()
+            await _abandon(task)
+            return done
+
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(scenario()) is True
+    assert "scan-eligible adapter(s) have been held" not in caplog.text
+
+
+def test_a_wait_past_the_grace_warns_once_and_names_our_own_previous_scan(env, monkeypatch, caplog):
+    """Past the grace the warning fires exactly once, and a holder that is
+    this very process (a cancelled scan's stop() still in flight) is named
+    as our own previous scan rather than as a foreign holder."""
+    env.install(adapters=("hci5",), wrap_scanner=True)
+    key = catcher.claims.adapter_key("hci5")
+    with open(os.path.join(env.dir, f"{key}.scan"), "w") as f:      # held by OUR pid
+        f.write(f"{os.getpid()} {OWNER} {int(time.time())}\n")
+    monkeypatch.setattr(catcher, "SCAN_WAIT_WARN_AFTER", 0.05)
+
+    async def scenario():
+        with _short_wait(monkeypatch, wait=0.4):
+            task = await _start_waiting()
+            await asyncio.sleep(0.3)
+            await _abandon(task)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    lines = [r.getMessage() for r in caplog.records if "have been held" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "held by this process's own previous scan, still releasing" in lines[0]
+    assert "cannot name" not in lines[0]
 
 
 def test_a_younger_waiter_does_not_steal_the_card_it_frees(env, monkeypatch):
