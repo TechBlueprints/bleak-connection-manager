@@ -3832,13 +3832,13 @@ def test_a_wait_that_ends_inside_the_grace_logs_no_contention(env, monkeypatch, 
             task = await _start_waiting()
             await asyncio.sleep(0.05)
             os.unlink(holder)                  # released well inside the grace
-            await asyncio.sleep(0.1)
-            done = task.done()
-            await _abandon(task)
-            return done
+            adapter, claim = await asyncio.wait_for(task, 1.0)   # the hand-over completes
+            if claim is not None:
+                catcher._config.claims.release(claim)
+            return adapter
 
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(scenario()) is True
+        assert asyncio.run(scenario()) == "hci5"
     assert "scan-eligible adapter(s) have been held" not in caplog.text
 
 
