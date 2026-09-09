@@ -1623,6 +1623,27 @@ def _all_draining_error(address, adapters, config):
     )
 
 
+def _all_absent_error(address, entries):
+    """The typed error for "every card this device is configured for is
+    absent from the kernel right now". Same class and "connection slot"
+    substring as slot exhaustion so bleak-retry-connector paces its retries
+    (4s) instead of hammering; a card mid-USB-reset is back within seconds.
+
+    Prod 2026-09-09 13:17:55Z: easytouch's pool is one card (hci7), BCM's
+    own recovery had just USB-reset it, the MAC resolved to no hciN for a
+    few seconds, placement returned no candidates and passed the connect
+    through unclaimed - bleak scanned on BlueZ's default adapter and the
+    thermostat landed on hci8, outside the allocation. The pool is an
+    allowlist (this function's docstring says so); an empty resolution is
+    "not now", never "anywhere".
+    """
+    return OutOfConnectionSlotsError(
+        f"connection slot unavailable for {address}: none of its configured adapters "
+        f"({', '.join(str(e) for e in entries) or 'none'}) is present right now - "
+        f"waiting for one rather than connecting on an unconfigured card"
+    )
+
+
 def _score_order(eligible, address_key, snapshot, config, rssi=None):
     """Candidates best-first, by habluetooth-parity connect scoring.
 
@@ -1689,13 +1710,19 @@ def _acquire_adapter(address):
     present = present_adapters()
     if pins:
         candidates = _resolve_entries(pins)
+        if not candidates:
+            raise _all_absent_error(address, pins)
     elif config.pool:
         candidates = _resolve_entries(config.pool)
+        if not candidates:
+            raise _all_absent_error(address, config.pool)
     elif present:
         candidates = sorted(present, key=_hci_sort_key)
     else:
         candidates = []
     if not candidates:
+        # unconfigured install with no card the kernel admits to: the
+        # passthrough the wrapper has always had (nothing to claim)
         return None, []
     usable = [a for a in candidates if a in present] if present else candidates
     if not usable:
@@ -2158,6 +2185,22 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 f"BLE [{self._catcher_address}]: caller asked for {requested} but the device is "
                 f"already bound to {bound} (BlueZ path) - the link will be on {bound}; claiming there"
             )
+        if bound and config is not None:
+            configured = config.pins.get(_address_key(self._catcher_address)) or config.pool
+            if configured:
+                allowed = {claims.adapter_key(a) for a in _resolve_entries(configured)}
+                if allowed and claims.adapter_key(bound) not in allowed:
+                    # claimed where it landed (a claim anywhere else would be
+                    # a lie to every cap and drain decision, ee25056), but
+                    # this is a device outside its allocation, and the
+                    # operator should hear it: prod 2026-09-09, AC Front on
+                    # hci8 while easytouch's pool is hci7 alone
+                    logger.warning(
+                        f"BLE [{self._catcher_address}]: device arrived bound to {bound}, which is "
+                        f"OUTSIDE its configured adapters ({', '.join(str(e) for e in configured)}); "
+                        f"claiming {bound} because that is where the link is - a stale BlueZ "
+                        f"object or a lingering link on that card put it there"
+                    )
         explicit = bound or requested
         if explicit:
             self._catcher_claims = _claim_explicit(explicit, self._catcher_address)

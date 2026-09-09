@@ -1093,6 +1093,61 @@ def test_a_resolved_ble_devices_path_adapter_is_treated_as_explicit(env):
     assert os.listdir(env.dir) == []
 
 
+def test_a_pool_whose_cards_are_all_absent_refuses_rather_than_passing_through(env, monkeypatch):
+    """Prod 2026-09-09 13:17:55Z: easytouch's one-card pool was mid-USB-reset
+    (BCM's own recovery), the MAC resolved to no hciN, placement returned
+    no candidates and the connect went through UNCLAIMED on BlueZ's default
+    adapter - AC Front landed on hci8, outside the allocation. A pool is an
+    allowlist: an empty resolution is "not now", paced like slot
+    exhaustion, never "anywhere"."""
+    env.install(adapters=("00:01:95:C9:B4:C8",))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
+    inits = len(RECORDED_INITS)
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+        asyncio.run(client.connect())
+    assert "connection slot" in str(excinfo.value) and "00:01:95:C9:B4:C8" in str(excinfo.value)
+    assert len(RECORDED_INITS) == inits, "a backend was built for an unclaimed connect"
+    assert os.listdir(env.dir) == [], "a claim was taken with no card to take it on"
+
+
+def test_pins_whose_cards_are_all_absent_refuse_the_same_way(env, monkeypatch):
+    env.install(adapters=(f"{ADDRESS}@00:01:95:C9:B4:C8",))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    with pytest.raises(catcher.OutOfConnectionSlotsError):
+        asyncio.run(client.connect())
+    assert os.listdir(env.dir) == []
+
+
+def test_an_unconfigured_install_with_no_cards_still_passes_through(env, monkeypatch):
+    """The passthrough the wrapper has always had is for the UNCONFIGURED
+    case only: nothing to claim, nothing to refuse."""
+    env.install(adapters=())
+    monkeypatch.setattr(catcher, "present_adapters", lambda: set())
+
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert RECORDED_INITS[-1]["adapter"] is None
+    asyncio.run(client.disconnect())
+
+
+def test_a_device_bound_outside_its_configured_cards_is_claimed_there_and_named(env, caplog):
+    env.install(adapters=("hci5",), link_caps={"hci9": 2})
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(client.connect())
+    assert "OUTSIDE its configured adapters (hci5)" in caplog.text
+    assert "hci9.link.0" in os.listdir(env.dir)   # still claimed where the link is
+    asyncio.run(client.disconnect())
+
+
 def test_a_resolved_ble_device_on_a_full_adapter_raises_the_typed_error(env):
     env.install(adapters=(), link_caps={"hci9": 1})
     _foreign_file(env.dir, "hci9.link.0")
