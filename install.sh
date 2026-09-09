@@ -99,7 +99,7 @@ if [ -z "$SHIM_REFS" ]; then
     fi
 else
     echo "bcm-install: shim still needed by: $SHIM_USERS"
-    printf '%s\n' "$SHIM_REFS" | sed 's/^/bcm-install:   /"
+    printf '%s\n' "$SHIM_REFS" | sed 's/^/bcm-install:   /'
 cat > "$ROOT/python3.tmp" <<SHIM_EOF
 #!/bin/sh
 # BCM interpreter shim - written by install.sh; do not edit.
