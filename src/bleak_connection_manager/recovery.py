@@ -225,7 +225,16 @@ async def _native_recover(dev_id, adapter, gone_silent):
     loop = asyncio.get_running_loop()
     _rfkill_unblock(adapter)
     bounced = await loop.run_in_executor(None, _bounce_interface, dev_id)
-    if gone_silent:
+    if gone_silent or not bounced:
+        # A card whose interface will not come back up is dead BELOW HCI
+        # (dev-cerbo 2026-09-08: an RTL8761BU after a sysfs unbind/bind,
+        # firmware "Read reg16 failed", all-zero MAC, HCIDEVUP timing out);
+        # no amount of ioctl reaches it, and the USB port reset is what
+        # revives it (firmware reload, MAC back in 2s). So a failed bounce
+        # falls through to the port reset whether or not the caller said
+        # gone_silent - a bounce that fails IS the card gone silent.
+        if not gone_silent:
+            logger.warning(f"bt-recovery: {adapter} did not come back up after the interface bounce - trying a USB port reset")
         usb = await loop.run_in_executor(None, _usb_reset, adapter)
         if usb:
             # the reset re-enumerates the device; give the kernel and
@@ -233,8 +242,6 @@ async def _native_recover(dev_id, adapter, gone_silent):
             await asyncio.sleep(3.5)
         elif usb is None and not bounced:
             return False  # not USB and the bounce failed: nothing worked
-    elif not bounced:
-        return False
     claims.invalidate_adapter_mac(adapter)
     alive = claims.adapter_mac(adapter) != UNKNOWN_MAC
     if not alive:

@@ -20,6 +20,10 @@ def _foreign_file(tmp_path, name, pid=1):
     return path
 
 
+async def _no_sleep(_seconds):
+    return None
+
+
 def _fake_recovery(monkeypatch):
     calls = []
 
@@ -393,6 +397,35 @@ def test_native_recover_succeeds_on_a_bounced_uart_card(tmp_path, monkeypatch):
     claims_mod.invalidate_adapter_mac()
 
     assert asyncio.run(recovery._native_recover(0, "hci0", True)) is True
+
+
+def test_a_failed_bounce_falls_through_to_the_usb_reset_even_when_not_gone_silent(monkeypatch):
+    """dev-cerbo 2026-09-08: an RTL8761BU dead below HCI (HCIDEVUP timing
+    out after a sysfs unbind/bind) failed reset_adapter(force=True) because
+    the USB port reset was gated on gone_silent; the port reset was what
+    brought it back. A bounce that fails IS the card gone silent."""
+    from bleak_connection_manager import claims as claims_mod
+    calls = []
+    monkeypatch.setattr(recovery, "_rfkill_unblock", lambda adapter: False)
+    monkeypatch.setattr(recovery, "_bounce_interface", lambda dev_id: False)
+    monkeypatch.setattr(recovery, "_usb_reset", lambda adapter: calls.append(adapter) or True)
+    monkeypatch.setattr(recovery.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(claims_mod, "_read_adapter_mac", lambda adapter: "AA:BB:CC:DD:EE:FF")
+    claims_mod.invalidate_adapter_mac()
+    assert asyncio.run(recovery._native_recover(0, "hci0", False)) is True
+    assert calls == ["hci0"]
+
+
+def test_a_successful_bounce_without_gone_silent_does_not_touch_usb(monkeypatch):
+    from bleak_connection_manager import claims as claims_mod
+    calls = []
+    monkeypatch.setattr(recovery, "_rfkill_unblock", lambda adapter: False)
+    monkeypatch.setattr(recovery, "_bounce_interface", lambda dev_id: True)
+    monkeypatch.setattr(recovery, "_usb_reset", lambda adapter: calls.append(adapter) or True)
+    monkeypatch.setattr(claims_mod, "_read_adapter_mac", lambda adapter: "AA:BB:CC:DD:EE:FF")
+    claims_mod.invalidate_adapter_mac()
+    assert asyncio.run(recovery._native_recover(0, "hci0", False)) is True
+    assert calls == []
 
 
 def test_native_recover_fails_when_nothing_answers(monkeypatch):
