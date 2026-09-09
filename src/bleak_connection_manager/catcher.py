@@ -921,16 +921,21 @@ def _device_not_found(adapter, address):
     _not_found_streaks[key] = n
     if n != NOT_FOUND_BEFORE_KERNEL_CHECK or key in _kernel_list_warned:
         return
+    config = _config
+    if config is not None and not config.kernel_list_check:
+        return
     where = _kernel_lists_hold(adapter, address)
     if where is None or _bluez_has_object(adapter, address) is True:
         return
     _kernel_list_warned.add(key)
     logger.warning(
         f"BLE [{address}]: not found by {n} consecutive scans on {adapter}, and the kernel's "
-        f"{where} for {adapter} still holds this address with no BlueZ device object for it - "
-        f"a stale auto-connect entry (left behind when BlueZ removed the device) makes the "
-        f"controller consume this device's advertisements before discovery can see them; "
-        f"clear it with a management-socket Remove Device for {address} on {adapter}, or reset the card"
+        f"{where} for {adapter} holds this address with no BlueZ device object for it. Either a "
+        f"stale auto-connect entry left behind when BlueZ removed the device (the controller then "
+        f"consumes this device's advertisements before discovery can see them; clear it with a "
+        f"management-socket Remove Device for {address} on {adapter}, or reset the card), or a "
+        f"filter this box programmed on purpose - a consumer that programs its own accept list "
+        f"should install the catcher with kernel_list_check=False"
     )
 
 
@@ -1483,10 +1488,14 @@ def _refuse_device(address, allowed):
 
 
 class _CatcherConfig:
-    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None):
+    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None, kernel_list_check=True):
         self.owner = owner
         self.pins = pins
         self.pool = pool
+        # a consumer that programs the controller's accept list itself
+        # (sensors-py's name-routed passive scanning) turns this off: its own
+        # entries are indistinguishable from BlueZ leftovers in debugfs
+        self.kernel_list_check = kernel_list_check
         self.adapter_config_path = None
         # frozenset of canonical MAC keys this process may connect to, or
         # None for no gate - see _parse_allowed_devices
@@ -3267,7 +3276,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None, kernel_list_check=True):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -3355,6 +3364,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         claims=ClaimManager(owner=f"{owner}-{os.getpid()}", claim_dir=claim_dir),
         tune_conn_params=tune_conn_params,
         validate_connection=validate_connection,
+        kernel_list_check=kernel_list_check,
     )
     _config.claims.on_beat = _drain_watch
     _config.claims.on_release = _wake_scan_waiters

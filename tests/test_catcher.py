@@ -4539,8 +4539,31 @@ def test_a_stale_kernel_accept_list_entry_is_named_on_the_third_not_found(env, m
         asyncio.run(attempt())
         assert warned() == 1
         assert "accept list for hci5" in caplog.text and "Remove Device" in caplog.text
+        assert "kernel_list_check=False" in caplog.text     # the other reading is named too
         asyncio.run(attempt())
         assert warned() == 1, "warned more than once per streak"
+
+
+def test_a_consumer_that_programs_its_own_accept_list_can_switch_the_check_off(env, monkeypatch, tmp_path, caplog):
+    """sensors-py injects its name-routed devices' last-heard addresses into
+    every scanning card's accept list on purpose (the EasyStarts, silent
+    while the compressors are off). From debugfs that is indistinguishable
+    from a BlueZ leftover, so the owner of the list opts out."""
+    catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
+                                  kernel_list_check=False)
+    monkeypatch.setattr(catcher, "BT_DEBUGFS", _fake_debugfs(tmp_path, "hci5", accept=[ADDRESS.lower()]))
+    monkeypatch.setattr(catcher, "_bluez_has_object", lambda adapter, address: False)
+
+    async def attempt():
+        CONNECT_RESULTS.append(_not_found())
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(Exception):
+            await client.connect()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            asyncio.run(attempt())
+    assert "auto-connect entry" not in caplog.text
 
 
 def test_a_not_found_with_clean_kernel_lists_says_nothing(env, monkeypatch, tmp_path, caplog):
