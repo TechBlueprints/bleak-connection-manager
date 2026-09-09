@@ -333,6 +333,8 @@ def env(tmp_path, monkeypatch):
     catcher._recovery_attempts.clear()
     catcher._recovering.clear()
     catcher._quick_drop_streaks.clear()
+    catcher._not_found_streaks.clear()
+    catcher._kernel_list_warned.clear()
     catcher._connect_failures.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
@@ -4444,6 +4446,81 @@ def test_our_own_soft_claim_does_not_keep_a_card_from_being_cycled(env, monkeypa
     _live_claim_file(env.dir, f"{key}.use.other-svc-7.AABB")
     strike_out()
     assert attempts == [], "cycled a card carrying another process's soft claim"
+
+
+def _not_found():
+    return sys.modules["bleak"].exc.BleakDeviceNotFoundError("not found")
+
+
+def _fake_debugfs(tmp_path, hci, accept=(), auto=()):
+    d = tmp_path / "debugfs" / hci
+    d.mkdir(parents=True)
+    (d / "white_list").write_text("".join(f"{a} (type 0)\n" for a in accept))
+    (d / "device_list").write_text("".join(f"{a} (type 0) 5\n" for a in auto))
+    return str(tmp_path / "debugfs")
+
+
+def test_a_stale_kernel_accept_list_entry_is_named_on_the_third_not_found(env, monkeypatch, tmp_path, caplog):
+    """dev 2026-09-08: a pack 'not found' for 16 h by a card that heard 32
+    neighbours, because /sys/kernel/debug/bluetooth/hci0/white_list still
+    held its address after BlueZ removed the device (Blocked -> RemoveDevice)
+    and the controller consumed its advertisements as connect attempts.
+    Invisible from D-Bus; read from debugfs on the third consecutive
+    not-found, warned once, remedy named."""
+    env.install(adapters=("hci5",), wrap_scanner=False)
+    monkeypatch.setattr(catcher, "BT_DEBUGFS", _fake_debugfs(tmp_path, "hci5", accept=[ADDRESS.lower()]))
+    monkeypatch.setattr(catcher, "_bluez_has_object", lambda adapter, address: False)
+    warned = lambda: sum(1 for r in caplog.records if "stale auto-connect entry" in r.getMessage())
+
+    async def attempt():
+        CONNECT_RESULTS.append(_not_found())
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(Exception):
+            await client.connect()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(attempt()); asyncio.run(attempt())
+        assert warned() == 0, "warned before the streak threshold"
+        asyncio.run(attempt())
+        assert warned() == 1
+        assert "accept list for hci5" in caplog.text and "Remove Device" in caplog.text
+        asyncio.run(attempt())
+        assert warned() == 1, "warned more than once per streak"
+
+
+def test_a_not_found_with_clean_kernel_lists_says_nothing(env, monkeypatch, tmp_path, caplog):
+    env.install(adapters=("hci5",), wrap_scanner=False)
+    monkeypatch.setattr(catcher, "BT_DEBUGFS", _fake_debugfs(tmp_path, "hci5", accept=["11:22:33:44:55:66"]))
+    monkeypatch.setattr(catcher, "_bluez_has_object", lambda adapter, address: False)
+
+    async def attempt():
+        CONNECT_RESULTS.append(_not_found())
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(Exception):
+            await client.connect()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            asyncio.run(attempt())
+    assert "stale auto-connect entry" not in caplog.text
+
+
+def test_a_successful_connect_resets_the_not_found_streak(env, monkeypatch, tmp_path):
+    env.install(adapters=("hci5",), wrap_scanner=False)
+    key = (catcher.claims.adapter_key("hci5"), catcher._address_key(ADDRESS))
+
+    async def scenario():
+        CONNECT_RESULTS.append(_not_found())
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(Exception):
+            await client.connect()
+        assert catcher._not_found_streaks[key] == 1
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        assert key not in catcher._not_found_streaks
+        await client.disconnect()
+
+    asyncio.run(scenario())
 
 
 def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):

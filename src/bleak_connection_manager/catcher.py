@@ -858,6 +858,82 @@ QUICK_REDROP_BACKOFF_MAX = 30.0
 _quick_drop_streaks = {}
 
 
+# A device that is "not found" by a card that demonstrably scans has TWO
+# possible causes, and the second is invisible from D-Bus: the kernel's own
+# accept list / auto-connect list for that card can still hold the address
+# after BlueZ removed the device object (Device1 Blocked -> RemoveDevice
+# leaves the params behind; so did the pre-2026-08-27 card allocation on
+# prod), and while it does the controller consumes that address's
+# advertisements as connect attempts, so discovery never yields it. Dev
+# 2026-09-08: a pack "silent" for 16 h while its card heard 32 neighbours;
+# /sys/kernel/debug/bluetooth/hci0/white_list had its address. Read on a
+# not-found streak, warn once, name the remedy; clearing is a separate act.
+BT_DEBUGFS = "/sys/kernel/debug/bluetooth"
+NOT_FOUND_BEFORE_KERNEL_CHECK = 3
+_not_found_streaks = {}
+_kernel_list_warned = set()
+
+
+def _kernel_lists_hold(adapter, address):
+    """Which of the card's kernel lists names this address: "accept list",
+    "auto-connect list", or None (absent, or debugfs unreadable)."""
+    hci = claims.hci_for(adapter, fresh=False) if not str(adapter).startswith("hci") else str(adapter)
+    if not hci:
+        return None
+    needle = _address_key(address).replace(":", "").lower()
+    for fname, label in (("white_list", "accept list"), ("device_list", "auto-connect list")):
+        try:
+            with open(os.path.join(BT_DEBUGFS, hci, fname)) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if needle in text.replace(":", "").lower():
+            return label
+    return None
+
+
+def _bluez_has_object(adapter, address):
+    """True/False from bleak's BlueZ property cache; None when no manager
+    exists on this loop (never a guess)."""
+    try:
+        from bleak.backends.bluezdbus.manager import _global_instances
+        manager = _global_instances.get(asyncio.get_running_loop())
+    except Exception:
+        return None
+    if manager is None:
+        return None
+    hci = claims.hci_for(adapter, fresh=False) if not str(adapter).startswith("hci") else str(adapter)
+    if not hci:
+        return None
+    key = _address_key(address).replace(":", "").upper()
+    dev = "_".join(key[i:i + 2] for i in range(0, 12, 2))
+    props = getattr(manager, "_properties", None) or {}
+    return f"/org/bluez/{hci}/dev_{dev}" in props
+
+
+def _device_not_found(adapter, address):
+    """A connect-by-address that found nothing: count the streak and, at the
+    threshold, check the kernel lists once and say so."""
+    if not adapter:
+        return
+    key = (claims.adapter_key(adapter), _address_key(address))
+    n = _not_found_streaks.get(key, 0) + 1
+    _not_found_streaks[key] = n
+    if n != NOT_FOUND_BEFORE_KERNEL_CHECK or key in _kernel_list_warned:
+        return
+    where = _kernel_lists_hold(adapter, address)
+    if where is None or _bluez_has_object(adapter, address) is True:
+        return
+    _kernel_list_warned.add(key)
+    logger.warning(
+        f"BLE [{address}]: not found by {n} consecutive scans on {adapter}, and the kernel's "
+        f"{where} for {adapter} still holds this address with no BlueZ device object for it - "
+        f"a stale auto-connect entry (left behind when BlueZ removed the device) makes the "
+        f"controller consume this device's advertisements before discovery can see them; "
+        f"clear it with a management-socket Remove Device for {address} on {adapter}, or reset the card"
+    )
+
+
 def _connect_finished(adapter, address, connected):
     if not adapter:
         return
@@ -873,6 +949,8 @@ def _connect_finished(adapter, address, connected):
         # this device does.
         _recovery_attempts.pop(key[0], None)
         _scan_failures.pop(key[0], None)
+        _not_found_streaks.pop(key, None)
+        _kernel_list_warned.discard(key)
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
         # a failed connect is also the moment a connect-only consumer
@@ -2139,6 +2217,8 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 # for pinned devices, walk to the next pin
                 _connect_finished(adapter_used, self._catcher_address, False)
                 _rotation.connect_failed(self._catcher_address)
+                if type(e).__name__ == "BleakDeviceNotFoundError":
+                    _device_not_found(adapter_used, self._catcher_address)
             raise
         finally:
             # no longer in flight, whatever the outcome
