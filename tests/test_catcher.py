@@ -357,9 +357,10 @@ def env(tmp_path, monkeypatch):
     catcher._cycle_suppressed.clear()
     monkeypatch.setattr(catcher, "present_adapters", lambda: set())
 
-    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=catcher.GATT_OP_TIMEOUT):
+    def install(adapters=(), link_caps=None, wrap_scanner=False, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=catcher.GATT_OP_TIMEOUT, **extra):
         catcher.install_bleak_catcher(
             OWNER,
+            **extra,
             adapters=adapters,
             link_caps=link_caps,
             adapter_config_path=adapter_config_path,
@@ -4629,10 +4630,9 @@ def test_an_acquire_notify_opt_out_is_overridden_to_start_notify(env):
 
 
 def test_when_not_forcing_nothing_is_invented(env, monkeypatch):
-    """force_start_notify off (the default with no environment): bleak's own
-    default stands, nothing is injected."""
-    monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
-    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    """force_start_notify off (asked for explicitly; the default is the fleet
+    policy, on): bleak's own default stands, nothing is injected."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2}, force_start_notify=False)
     assert catcher._config.force_start_notify is False
 
     async def scenario():
@@ -4885,8 +4885,7 @@ def test_when_forcing_start_notify_is_supplied_to_a_silent_caller(env):
 def test_when_not_forcing_an_explicit_opt_out_is_honoured(env, monkeypatch):
     """Clint, 2026-09-02: an option to not change the default behaviour.
     Off means off - a caller's explicit AcquireNotify request passes through."""
-    monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
-    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    env.install(adapters=("hci5",), link_caps={"hci5": 2}, force_start_notify=False)
 
     async def scenario():
         client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
@@ -4903,17 +4902,17 @@ def test_when_not_forcing_an_explicit_opt_out_is_honoured(env, monkeypatch):
     assert asyncio.run(scenario())["bluez"]["use_start_notify"] is False
 
 
-def test_force_start_notify_resolves_from_the_environment(env, monkeypatch):
-    """The shim exports BCM_FORCE_START_NOTIFY, so the deploy decides for
-    every consumer it launches without touching any consumer's source."""
-    for value, expected in (("true", True), ("false", False), ("TRUE", True), ("1", True), ("0", False)):
+def test_force_start_notify_defaults_to_the_fleet_policy_and_ignores_the_environment(env, monkeypatch):
+    """The launcher shim that exported BCM_FORCE_START_NOTIFY is retired
+    (2026-09-09). None means the fleet policy, True; the environment is not
+    consulted; a consumer's explicit value is honoured either way."""
+    for value in ("false", "0", "true"):
         monkeypatch.setenv("BCM_FORCE_START_NOTIFY", value)
         catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False)
-        assert catcher._config.force_start_notify is expected, value
-    # an explicit argument beats the environment either way
+        assert catcher._config.force_start_notify is True, value
     catcher.install_bleak_catcher(OWNER, adapters=("hci5",), claim_dir=env.dir, tune_conn_params=False,
-                                  force_start_notify=True)
-    assert catcher._config.force_start_notify is True
+                                  force_start_notify=False)
+    assert catcher._config.force_start_notify is False
 
 
 

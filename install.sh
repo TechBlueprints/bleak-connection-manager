@@ -78,46 +78,22 @@ if ! PYTHONPATH="$LIBPATH" python3 -c "import bleak_connection_manager, bleak, b
     exit 1
 fi
 
-# the interpreter shim, RETIRING (Clint, 2026-09-06: "all things should
-# source the bcm in the same way, no shim"). Consumers now source the
-# shared install in-process (CONSUMERS.md section 2) and launch under plain
-# python3; the shim is written only while some run script on THIS box still
-# execs it, and is removed the first time none does - so it retires box by
-# box as the last consumer there migrates, with no flag day.
-# Match the shim by any spelling a launcher can use, not the literal path:
-# shyion's launcher built it as "${BCM_ROOT:-/data/bcm}/python3" and a grep
-# for /data/bcm/python3 saw nothing (2026-09-08), which would have retired
-# the shim under a live launcher. So: any .../python3 whose path contains
-# "bcm", or the BCM_PY variable the run scripts conventionally use, and
-# print the matching LINES so an operator sees the form each one takes.
+# The interpreter shim /data/bcm/python3 is RETIRED (Clint, 2026-09-06:
+# "all things should source the bcm in the same way, no shim"; retired on
+# both boxes 2026-09-09 once the last consumer launched plain). Consumers
+# source the shared install in-process from their own configured folder
+# (CONSUMERS.md section 2). The installer removes any shim it finds and
+# names, loudly, any launcher that still execs one in any spelling
+# (literal path, BCM_PY, or "${BCM_ROOT:-/data/bcm}/python3"): that
+# launcher will fail to exec at its next restart until it is migrated.
+if [ -e "$ROOT/python3" ]; then
+    rm -f "$ROOT/python3"
+    echo "bcm-install: removed the retired interpreter shim $ROOT/python3"
+fi
 SHIM_REFS="$(grep -nE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY' /service/*/run /data/apps/*/service/run /data/apps/*/service-*/run 2>/dev/null | sort -u)"
-SHIM_USERS="$(printf '%s\n' "$SHIM_REFS" | cut -d: -f1 | sort -u | tr '\n' ' ')"
-if [ -z "$SHIM_REFS" ]; then
-    if [ -e "$ROOT/python3" ]; then
-        rm -f "$ROOT/python3"
-        echo "bcm-install: shim retired - no run script on this box references $ROOT/python3 any more"
-    fi
-else
-    echo "bcm-install: shim still needed by: $SHIM_USERS"
-    printf '%s\n' "$SHIM_REFS" | sed 's/^/bcm-install:   /'
-cat > "$ROOT/python3.tmp" <<SHIM_EOF
-#!/bin/sh
-# BCM interpreter shim - written by install.sh; do not edit.
-R="\${BCM_ROOT:-$ROOT}"
-export PYTHONPATH="\$R/src:\$R/ext:\$R/ext/upstream/bleak:\$R/ext/upstream/bleak-retry-connector/src\${PYTHONPATH:+:\$PYTHONPATH}"
-# shim-launched processes are deliberate BCM consumers: they install the
-# catcher explicitly, so the sitewide autowire must stand down for them
-export BCM_AUTOWIRE=0
-# fleet policy: every start_notify uses BlueZ StartNotify (the AcquireNotify
-# path is the BlueZ 5.72 notify_io double-free). Decided here, for every
-# consumer this shim launches, without touching any consumer's source; a
-# consumer passes install_bleak_catcher(force_start_notify=False) to opt
-# out for itself, or the launch environment presets this variable to false
-export BCM_FORCE_START_NOTIFY="\${BCM_FORCE_START_NOTIFY:-true}"
-exec python3 "\$@"
-SHIM_EOF
-chmod 755 "$ROOT/python3.tmp"
-mv "$ROOT/python3.tmp" "$ROOT/python3"
+if [ -n "$SHIM_REFS" ]; then
+    echo "bcm-install: WARNING - these launchers still exec the retired shim and will fail to start until migrated (CONSUMERS.md section 2):" >&2
+    printf '%s\n' "$SHIM_REFS" | sed 's/^/bcm-install:   /' >&2
 fi
 
 VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -126,11 +102,7 @@ VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # appends a UTC line here (the night watch could not see BCM's restarts and
 # filed them as unexplained, 2026-09-02)
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') install $VERSION by ${SUDO_USER:-${USER:-?}}@${SSH_CLIENT%% *}" >> "$ROOT/deploy.log" 2>/dev/null || true
-if [ -e "$ROOT/python3" ]; then
-    echo "bcm-install: shim ready at $ROOT/python3 ($VERSION)"
-else
-    echo "bcm-install: install ok, no shim ($VERSION)"
-fi
+echo "bcm-install: install ok ($VERSION)"
 
 # --autowire: sitewide hook. A .pth runs in EVERY python process on the
 # box, so this is opt-in and the module it loads is built to never raise.

@@ -392,9 +392,9 @@ Consumers source the shared install themselves, in process, from a folder
 they are configured with, and launch under plain `python3` — the contract
 is CONSUMERS.md section 2 (Clint, 2026-09-06: "all things should source
 the bcm in the same way, no shim"). The earlier interpreter shim
-`/data/bcm/python3` is retiring box by box: `install.sh` writes it only
-while some run script on that box still execs it, and removes it the first
-time none does.
+`/data/bcm/python3` is retired (both boxes, 2026-09-09): `install.sh`
+removes one if it finds it and warns loudly about any launcher that still
+execs it.
 
 Rollback: `git -C /data/bcm checkout <hash> && /data/bcm/install.sh`.
 Canary: a second clone at a pinned hash plus `BCM_ROOT=<that-clone>` in
@@ -427,8 +427,7 @@ consumer's own explicit `install_bleak_catcher` call supersedes the
 autowired one — and a process that imports `bleak_connection_manager`
 itself is never autowired at all: the finder stands down the moment the
 package appears in `sys.modules` (a deliberate consumer installs
-explicitly, with its own owner and config), and the `/data/bcm/python3`
-shim exports the kill switch for the same reason. Kill switch:
+explicitly, with its own owner and config). Kill switch:
 `BCM_AUTOWIRE=0` in the environment.
 
 Scope honesty: this covers Python+bleak only — C programs talking to

@@ -25,8 +25,9 @@ environment.
 Never from inside BCM: a process that imports bleak_connection_manager
 itself is a deliberate consumer - it installs the catcher explicitly,
 and the finder stands down the moment the package appears in
-sys.modules. The /data/bcm/python3 shim also exports BCM_AUTOWIRE=0,
-because every shim-launched process is by definition such a consumer.
+sys.modules - every contract consumer imports it before bleak, which is
+what stands this hook down for them (the retired launcher shim used to
+export BCM_AUTOWIRE=0 for the same reason).
 """
 
 import os
