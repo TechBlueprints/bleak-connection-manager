@@ -84,14 +84,22 @@ fi
 # python3; the shim is written only while some run script on THIS box still
 # execs it, and is removed the first time none does - so it retires box by
 # box as the last consumer there migrates, with no flag day.
-SHIM_USERS="$(grep -ls '/data/bcm/python3' /service/*/run /data/apps/*/service/run /data/apps/*/service-*/run 2>/dev/null | sort -u | tr '\n' ' ')"
-if [ -z "$SHIM_USERS" ]; then
+# Match the shim by any spelling a launcher can use, not the literal path:
+# shyion's launcher built it as "${BCM_ROOT:-/data/bcm}/python3" and a grep
+# for /data/bcm/python3 saw nothing (2026-09-08), which would have retired
+# the shim under a live launcher. So: any .../python3 whose path contains
+# "bcm", or the BCM_PY variable the run scripts conventionally use, and
+# print the matching LINES so an operator sees the form each one takes.
+SHIM_REFS="$(grep -nE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY' /service/*/run /data/apps/*/service/run /data/apps/*/service-*/run 2>/dev/null | sort -u)"
+SHIM_USERS="$(printf '%s\n' "$SHIM_REFS" | cut -d: -f1 | sort -u | tr '\n' ' ')"
+if [ -z "$SHIM_REFS" ]; then
     if [ -e "$ROOT/python3" ]; then
         rm -f "$ROOT/python3"
         echo "bcm-install: shim retired - no run script on this box references $ROOT/python3 any more"
     fi
 else
     echo "bcm-install: shim still needed by: $SHIM_USERS"
+    printf '%s\n' "$SHIM_REFS" | sed 's/^/bcm-install:   /"
 cat > "$ROOT/python3.tmp" <<SHIM_EOF
 #!/bin/sh
 # BCM interpreter shim - written by install.sh; do not edit.
