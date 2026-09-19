@@ -872,6 +872,9 @@ BT_DEBUGFS = "/sys/kernel/debug/bluetooth"
 NOT_FOUND_BEFORE_KERNEL_CHECK = 3
 _not_found_streaks = {}
 _kernel_list_warned = set()
+# addresses warned about arriving bound to a card while none of their
+# configured cards exist (once per outage; cleared by a successful connect)
+_absent_warned = set()
 
 
 def _kernel_lists_hold(adapter, address):
@@ -956,6 +959,7 @@ def _connect_finished(adapter, address, connected):
         _scan_failures.pop(key[0], None)
         _not_found_streaks.pop(key, None)
         _kernel_list_warned.discard(key)
+        _absent_warned.discard(key[1])
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
         # a failed connect is also the moment a connect-only consumer
@@ -2198,7 +2202,31 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             configured = config.pins.get(_address_key(self._catcher_address)) or config.pool
             if configured:
                 allowed = {claims.adapter_key(a) for a in _resolve_entries(configured)}
-                if allowed and claims.adapter_key(bound) not in allowed:
+                if not allowed:
+                    # The device arrived bound to a card and NONE of its
+                    # configured cards exists right now. dev 2026-09-18: the
+                    # pinned dongle was physically swapped; the pack driver,
+                    # resolving its MAC pin against live BlueZ each attempt
+                    # and finding nothing, fell back to the default adapter
+                    # by its own design and handed us a device bound to the
+                    # replacement card at the same index. This branch then
+                    # claimed it there in silence for 18 hours (the
+                    # "outside" warning below was gated on a non-empty
+                    # allowed set). Same rule as the bare-address path
+                    # (87c5b8e): a configured device with no present card
+                    # waits, paced, and says so.
+                    key = _address_key(self._catcher_address)
+                    if key not in _absent_warned:
+                        _absent_warned.add(key)
+                        logger.warning(
+                            f"BLE [{self._catcher_address}]: device arrived bound to {bound}, but NONE of "
+                            f"its configured adapters ({', '.join(str(e) for e in configured)}) is present "
+                            f"on this box - the card was swapped, unplugged or renumbered away. Refusing to "
+                            f"connect on {bound} rather than on an unconfigured card; fix the pin or "
+                            f"restore the card (repeats once per outage)"
+                        )
+                    raise _all_absent_error(self._catcher_address, configured)
+                if claims.adapter_key(bound) not in allowed:
                     # claimed where it landed (a claim anywhere else would be
                     # a lie to every cap and drain decision, ee25056), but
                     # this is a device outside its allocation, and the
@@ -2269,7 +2297,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 # for pinned devices, walk to the next pin
                 _connect_finished(adapter_used, self._catcher_address, False)
                 _rotation.connect_failed(self._catcher_address)
-                if type(e).__name__ == "BleakDeviceNotFoundError":
+                # bleak raises the typed BleakDeviceNotFoundError when its
+                # own scan finds nothing, but a plain BleakError("device
+                # 'dev_..' not found") when a resolved path is gone from its
+                # cache by connect time (manager._check_device) - the shape
+                # the pack driver's resolve-then-connect path produces.
+                # bleak-retry-connector string-matches the same text; so do we.
+                if type(e).__name__ == "BleakDeviceNotFoundError" or (
+                    isinstance(e, BleakError) and "not found" in str(e)
+                ):
                     _device_not_found(adapter_used, self._catcher_address)
             raise
         finally:

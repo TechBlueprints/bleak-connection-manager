@@ -335,6 +335,7 @@ def env(tmp_path, monkeypatch):
     catcher._quick_drop_streaks.clear()
     catcher._not_found_streaks.clear()
     catcher._kernel_list_warned.clear()
+    catcher._absent_warned.clear()
     catcher._connect_failures.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
@@ -1135,6 +1136,54 @@ def test_an_unconfigured_install_with_no_cards_still_passes_through(env, monkeyp
     asyncio.run(client.connect())
     assert RECORDED_INITS[-1]["adapter"] is None
     asyncio.run(client.disconnect())
+
+
+def test_a_device_bound_to_a_card_while_none_of_its_configured_cards_exist_is_refused(env, monkeypatch, caplog):
+    """dev 2026-09-18 21:33Z: the pinned dongle was physically swapped (same
+    hci index, new MAC). The pack driver resolved its MAC pin against live
+    BlueZ, found nothing, fell back to the default adapter by design, and
+    handed BCM a BLEDevice bound to hci0. BCM claimed hci0 in silence for
+    18 hours: the "outside its configured adapters" warning was gated on a
+    non-empty allowed set, and no refusal ran because placement never runs
+    for a bound device. Now: the same paced refusal as the bare-address
+    path, with one WARNING per outage naming the bound card."""
+    env.install(adapters=(f"{ADDRESS}@8A:88:4B:E3:48:F7",))
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])   # the pinned MAC answers to no hciN
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci0/dev_C8_47_8C_00_00_00"})
+    inits = len(RECORDED_INITS)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+            with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+                asyncio.run(client.connect())
+    assert "connection slot" in str(excinfo.value) and "8A:88:4B:E3:48:F7" in str(excinfo.value)
+    assert len(RECORDED_INITS) == inits, "a backend was built on the unconfigured card"
+    assert os.listdir(env.dir) == [], "a claim was taken on the unconfigured card"
+    lines = [r.getMessage() for r in caplog.records if "NONE of its configured adapters" in r.getMessage()]
+    assert len(lines) == 1, lines                     # once per outage, not 1 Hz
+    assert "bound to hci0" in lines[0]
+
+
+def test_bleaks_untyped_not_found_counts_toward_the_kernel_list_check(env, monkeypatch, tmp_path, caplog):
+    """bleak's manager._check_device raises a plain BleakError("device
+    'dev_..' not found") when a resolved path is gone by connect time; the
+    detector listened only for the typed BleakDeviceNotFoundError and so
+    slept through 2,498 of them on dev (2026-09-18/19)."""
+    env.install(adapters=("hci5",), wrap_scanner=False)
+    monkeypatch.setattr(catcher, "BT_DEBUGFS", _fake_debugfs(tmp_path, "hci5", auto=[ADDRESS.lower()]))
+    monkeypatch.setattr(catcher, "_bluez_has_object", lambda adapter, address: False)
+
+    async def attempt():
+        CONNECT_RESULTS.append(sys.modules["bleak"].exc.BleakError("device 'dev_C8_47_8C_00_00_00' not found"))
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        with pytest.raises(Exception):
+            await client.connect()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            asyncio.run(attempt())
+    assert "auto-connect list for hci5" in caplog.text
 
 
 def test_a_device_bound_outside_its_configured_cards_is_claimed_there_and_named(env, caplog):
