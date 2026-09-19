@@ -959,7 +959,10 @@ def _connect_finished(adapter, address, connected):
         _scan_failures.pop(key[0], None)
         _not_found_streaks.pop(key, None)
         _kernel_list_warned.discard(key)
-        _absent_warned.discard(key[1])
+        if _configured_cards_present(key[1]):
+            # the outage is over only when a configured card is back; a
+            # connect on the fallback card is the outage continuing
+            _absent_warned.discard(key[1])
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
         # a failed connect is also the moment a connect-only consumer
@@ -1492,7 +1495,7 @@ def _refuse_device(address, allowed):
 
 
 class _CatcherConfig:
-    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None, kernel_list_check=True):
+    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None, kernel_list_check=True, pin_strict=False):
         self.owner = owner
         self.pins = pins
         self.pool = pool
@@ -1500,6 +1503,15 @@ class _CatcherConfig:
         # (sensors-py's name-routed passive scanning) turns this off: its own
         # entries are indistinguishable from BlueZ leftovers in debugfs
         self.kernel_list_check = kernel_list_check
+        # What a pin MEANS when none of a device's configured cards exists
+        # (Clint, 2026-09-19: "If the mac doesn't resolve, we should warn
+        # loudly and then fallback to any available adapter ... that should
+        # be the default, but it should be configurable"). False: warn once
+        # per outage, then place on any present card. True: no attempt on a
+        # card the pin does not name (the paced refusal). One key in the
+        # consumer's config (BLUETOOTH_ADAPTER_PIN_STRICT), read by the
+        # driver and passed here, so both layers agree on a box.
+        self.pin_strict = pin_strict
         self.adapter_config_path = None
         # frozenset of canonical MAC keys this process may connect to, or
         # None for no gate - see _parse_allowed_devices
@@ -1636,6 +1648,34 @@ def _all_draining_error(address, adapters, config):
     )
 
 
+def _configured_cards_present(address_key):
+    """Whether at least one of the device's configured cards (its pins, else
+    the pool) currently resolves to a card; True for an unconfigured device."""
+    config = _config
+    if config is None:
+        return True
+    configured = config.pins.get(address_key) or config.pool
+    if not configured:
+        return True
+    return bool(_resolve_entries(configured))
+
+
+def _warn_absent_once(address, entries, present, then):
+    """The loud warning when none of a device's configured cards exists:
+    once per outage (cleared by a successful connect), naming the pin, the
+    cards that ARE present, and what happens next."""
+    key = _address_key(address)
+    if key in _absent_warned:
+        return
+    _absent_warned.add(key)
+    logger.warning(
+        f"BLE [{address}]: NONE of its configured adapters ({', '.join(str(e) for e in entries)}) is "
+        f"present on this box (present: {', '.join(sorted(present, key=_hci_sort_key)) or 'none'}) - the "
+        f"card was swapped, unplugged or renumbered away; {then}. Fix the pin or restore the card "
+        f"(this warning repeats once per outage)"
+    )
+
+
 def _all_absent_error(address, entries):
     """The typed error for "every card this device is configured for is
     absent from the kernel right now". Same class and "connection slot"
@@ -1698,6 +1738,19 @@ def _score_order(eligible, address_key, snapshot, config, rssi=None):
     return [adapter for _, _, adapter in scored]
 
 
+def _absent_fallback(address, entries, present, config):
+    """None of the device's configured cards exists. pin_strict: refuse,
+    paced. Default: warn once, then every present card in number order,
+    scored like an unconfigured install - placed WITH a claim, never
+    passed through unclaimed (that pass-through is what put AC Front on
+    hci8 unrecorded on 2026-09-09)."""
+    if config.pin_strict:
+        _warn_absent_once(address, entries, present, "pin_strict is set, so no attempt is made on any other card")
+        raise _all_absent_error(address, entries)
+    _warn_absent_once(address, entries, present, "falling back to any available adapter (pin_strict is off)")
+    return sorted(present, key=_hci_sort_key)
+
+
 def _acquire_adapter(address):
     """Select an adapter for the next attempt and take its claims.
 
@@ -1724,11 +1777,11 @@ def _acquire_adapter(address):
     if pins:
         candidates = _resolve_entries(pins)
         if not candidates:
-            raise _all_absent_error(address, pins)
+            candidates = _absent_fallback(address, pins, present, config)
     elif config.pool:
         candidates = _resolve_entries(config.pool)
         if not candidates:
-            raise _all_absent_error(address, config.pool)
+            candidates = _absent_fallback(address, config.pool, present, config)
     elif present:
         candidates = sorted(present, key=_hci_sort_key)
     else:
@@ -2210,23 +2263,19 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                     # and finding nothing, fell back to the default adapter
                     # by its own design and handed us a device bound to the
                     # replacement card at the same index. This branch then
-                    # claimed it there in silence for 18 hours (the
-                    # "outside" warning below was gated on a non-empty
-                    # allowed set). Same rule as the bare-address path
-                    # (87c5b8e): a configured device with no present card
-                    # waits, paced, and says so.
-                    key = _address_key(self._catcher_address)
-                    if key not in _absent_warned:
-                        _absent_warned.add(key)
-                        logger.warning(
-                            f"BLE [{self._catcher_address}]: device arrived bound to {bound}, but NONE of "
-                            f"its configured adapters ({', '.join(str(e) for e in configured)}) is present "
-                            f"on this box - the card was swapped, unplugged or renumbered away. Refusing to "
-                            f"connect on {bound} rather than on an unconfigured card; fix the pin or "
-                            f"restore the card (repeats once per outage)"
-                        )
-                    raise _all_absent_error(self._catcher_address, configured)
-                if claims.adapter_key(bound) not in allowed:
+                    # claimed it there in SILENCE for 18 hours (the "outside"
+                    # warning below was gated on a non-empty allowed set).
+                    # Now it says so, once per outage, and does what the
+                    # pin_strict setting says: place here with a claim
+                    # (default) or refuse, paced.
+                    present = present_adapters()
+                    if config.pin_strict:
+                        _warn_absent_once(self._catcher_address, configured, present,
+                                          f"the device arrived bound to {bound}; pin_strict is set, so no attempt is made there")
+                        raise _all_absent_error(self._catcher_address, configured)
+                    _warn_absent_once(self._catcher_address, configured, present,
+                                      f"the device arrived bound to {bound}, claiming it there (pin_strict is off)")
+                elif claims.adapter_key(bound) not in allowed:
                     # claimed where it landed (a claim anywhere else would be
                     # a lie to every cap and drain decision, ee25056), but
                     # this is a device outside its allocation, and the
@@ -3312,7 +3361,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None, kernel_list_check=True):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None, kernel_list_check=True, pin_strict=False):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -3401,6 +3450,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         tune_conn_params=tune_conn_params,
         validate_connection=validate_connection,
         kernel_list_check=kernel_list_check,
+        pin_strict=bool(pin_strict),
     )
     _config.claims.on_beat = _drain_watch
     _config.claims.on_release = _wake_scan_waiters

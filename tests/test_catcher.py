@@ -1102,7 +1102,7 @@ def test_a_pool_whose_cards_are_all_absent_refuses_rather_than_passing_through(e
     adapter - AC Front landed on hci8, outside the allocation. A pool is an
     allowlist: an empty resolution is "not now", paced like slot
     exhaustion, never "anywhere"."""
-    env.install(adapters=("00:01:95:C9:B4:C8",))
+    env.install(adapters=("00:01:95:C9:B4:C8",), pin_strict=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
     monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
     inits = len(RECORDED_INITS)
@@ -1116,7 +1116,7 @@ def test_a_pool_whose_cards_are_all_absent_refuses_rather_than_passing_through(e
 
 
 def test_pins_whose_cards_are_all_absent_refuse_the_same_way(env, monkeypatch):
-    env.install(adapters=(f"{ADDRESS}@00:01:95:C9:B4:C8",))
+    env.install(adapters=(f"{ADDRESS}@00:01:95:C9:B4:C8",), pin_strict=True)
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
     monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
 
@@ -1124,6 +1124,34 @@ def test_pins_whose_cards_are_all_absent_refuse_the_same_way(env, monkeypatch):
     with pytest.raises(catcher.OutOfConnectionSlotsError):
         asyncio.run(client.connect())
     assert os.listdir(env.dir) == []
+
+
+def test_by_default_a_pool_whose_cards_are_all_absent_warns_once_and_falls_back_with_a_claim(env, monkeypatch, caplog):
+    """Clint, 2026-09-19: "If the mac doesn't resolve, we should warn loudly
+    and then fallback to any available adapter ... that should be the
+    default, but it should be configurable." So pin_strict=False (default):
+    one WARNING per outage naming the pin and the present cards, then a
+    present card by number order, WITH a claim - placed, never the
+    unclaimed pass-through of 2026-09-09."""
+    env.install(adapters=("00:01:95:C9:B4:C8",))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
+    monkeypatch.setattr(catcher, "_responsive_adapters", lambda usable: usable)
+
+    async def scenario():
+        for _ in range(2):
+            client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+            await client.connect()
+            claimed = os.listdir(env.dir)
+            await client.disconnect()
+        return claimed
+
+    with caplog.at_level(logging.WARNING):
+        claimed = asyncio.run(scenario())
+    assert RECORDED_INITS[-1]["adapter"] == "hci8"
+    assert any(n.startswith("hci8.") for n in claimed), claimed
+    lines = [r.getMessage() for r in caplog.records if "NONE of its configured adapters" in r.getMessage()]
+    assert len(lines) == 1 and "present: hci8" in lines[0] and "falling back" in lines[0], lines
 
 
 def test_an_unconfigured_install_with_no_cards_still_passes_through(env, monkeypatch):
@@ -1147,7 +1175,7 @@ def test_a_device_bound_to_a_card_while_none_of_its_configured_cards_exist_is_re
     non-empty allowed set, and no refusal ran because placement never runs
     for a bound device. Now: the same paced refusal as the bare-address
     path, with one WARNING per outage naming the bound card."""
-    env.install(adapters=(f"{ADDRESS}@8A:88:4B:E3:48:F7",))
+    env.install(adapters=(f"{ADDRESS}@8A:88:4B:E3:48:F7",), pin_strict=True)
     monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])   # the pinned MAC answers to no hciN
     device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci0/dev_C8_47_8C_00_00_00"})
     inits = len(RECORDED_INITS)
@@ -1163,6 +1191,30 @@ def test_a_device_bound_to_a_card_while_none_of_its_configured_cards_exist_is_re
     lines = [r.getMessage() for r in caplog.records if "NONE of its configured adapters" in r.getMessage()]
     assert len(lines) == 1, lines                     # once per outage, not 1 Hz
     assert "bound to hci0" in lines[0]
+
+
+def test_by_default_a_device_bound_to_a_card_while_none_of_its_configured_cards_exist_is_claimed_there_and_named(env, monkeypatch, caplog):
+    """The dev 2026-09-18 swap under the ruled default: the same one loud
+    WARNING per outage, then the device is claimed on the card it arrived
+    bound to - never silence, never an unclaimed connect."""
+    env.install(adapters=(f"{ADDRESS}@8A:88:4B:E3:48:F7",), link_caps={"hci0": 2})
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci0"})
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci0/dev_C8_47_8C_00_00_00"})
+
+    async def scenario():
+        for _ in range(2):
+            client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+            await client.connect()
+            claimed = os.listdir(env.dir)
+            await client.disconnect()
+        return claimed
+
+    with caplog.at_level(logging.WARNING):
+        claimed = asyncio.run(scenario())
+    assert "hci0.link.0" in claimed, claimed
+    lines = [r.getMessage() for r in caplog.records if "NONE of its configured adapters" in r.getMessage()]
+    assert len(lines) == 1 and "bound to hci0" in lines[0] and "claiming it there" in lines[0], lines
 
 
 def test_bleaks_untyped_not_found_counts_toward_the_kernel_list_check(env, monkeypatch, tmp_path, caplog):

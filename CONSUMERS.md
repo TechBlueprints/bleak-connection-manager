@@ -102,6 +102,17 @@ two fails loudly. The rules it implements:
    consumer's own config; there is no shared or central BCM config file.
    The StartNotify policy is one key next to the location key,
    `BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY`, default `true`.
+   A device whose configured cards are ALL absent (swapped, unplugged,
+   renumbered away) is governed by `BLUETOOTH_ADAPTER_PIN_STRICT`, one
+   driver-side key passed through as `pin_strict=` so both layers read the
+   same setting (Clint, 2026-09-19: "warn loudly and then fallback to any
+   available adapter ... that should be the default, but it should be
+   configurable"). `false` (default): one WARNING per outage naming the pin
+   and the present cards, then placement on any present card with a claim
+   (a device that arrived already bound to a card is claimed there).
+   `true`: no attempt on any card the pin does not name, the paced
+   "connection slot unavailable" refusal. Grep anchor: `NONE of its
+   configured adapters`.
    (When the argument is None, `install_bleak_catcher` uses the fleet
    policy, True; no environment is consulted. The `/data/bcm/python3` shim
    is retired on both boxes as of 2026-09-09: `install.sh` removes one it
