@@ -1676,6 +1676,17 @@ def _warn_absent_once(address, entries, present, then):
     )
 
 
+def _bound_outside_error(address, bound, entries):
+    """pin_strict: the device arrived bound to a card its pin does not name
+    while a configured card IS present. Same class and "connection slot"
+    substring as the other refusals, for bleak-retry-connector's pacing."""
+    return OutOfConnectionSlotsError(
+        f"connection slot unavailable for {address}: the device is bound to {bound}, which its "
+        f"configured adapters ({', '.join(str(e) for e in entries)}) do not name, and pin_strict is "
+        f"set - no attempt is made there; it connects when it appears on a configured card"
+    )
+
+
 def _all_absent_error(address, entries):
     """The typed error for "every card this device is configured for is
     absent from the kernel right now". Same class and "connection slot"
@@ -2276,6 +2287,21 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                     _warn_absent_once(self._catcher_address, configured, present,
                                       f"the device arrived bound to {bound}, claiming it there (pin_strict is off)")
                 elif claims.adapter_key(bound) not in allowed:
+                    if config.pin_strict:
+                        # a configured card IS present and the device arrived
+                        # bound elsewhere: strict means no attempt off the pin,
+                        # here too (dev 2026-09-20, the integration chat: this
+                        # arm did not consult pin_strict, so strict could not
+                        # keep a battery off a card another service owns)
+                        key = _address_key(self._catcher_address)
+                        if key not in _absent_warned:
+                            _absent_warned.add(key)
+                            logger.warning(
+                                f"BLE [{self._catcher_address}]: device arrived bound to {bound}, which is "
+                                f"OUTSIDE its configured adapters ({', '.join(str(e) for e in configured)}); "
+                                f"pin_strict is set, so no attempt is made there (repeats once per outage)"
+                            )
+                        raise _bound_outside_error(self._catcher_address, bound, configured)
                     # claimed where it landed (a claim anywhere else would be
                     # a lie to every cap and drain decision, ee25056), but
                     # this is a device outside its allocation, and the

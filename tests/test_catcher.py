@@ -1238,6 +1238,28 @@ def test_bleaks_untyped_not_found_counts_toward_the_kernel_list_check(env, monke
     assert "auto-connect list for hci5" in caplog.text
 
 
+def test_under_pin_strict_a_device_bound_outside_its_configured_cards_is_refused(env, caplog):
+    """dev 2026-09-20 (integration chat): the bound-outside arm did not
+    consult pin_strict, so strict could not keep a battery off a card
+    another service owns when its pinned card was present but the link
+    landed elsewhere - the case strict exists for. Now: one WARNING per
+    outage, then the paced refusal; nothing claimed, no backend built."""
+    env.install(adapters=("hci5",), link_caps={"hci9": 2}, pin_strict=True)
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
+    inits = len(RECORDED_INITS)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+            with pytest.raises(catcher.OutOfConnectionSlotsError) as excinfo:
+                asyncio.run(client.connect())
+    assert "connection slot" in str(excinfo.value) and "bound to hci9" in str(excinfo.value)
+    assert len(RECORDED_INITS) == inits
+    assert os.listdir(env.dir) == []
+    lines = [r.getMessage() for r in caplog.records if "OUTSIDE its configured adapters" in r.getMessage()]
+    assert len(lines) == 1 and "pin_strict is set" in lines[0], lines
+
+
 def test_a_device_bound_outside_its_configured_cards_is_claimed_there_and_named(env, caplog):
     env.install(adapters=("hci5",), link_caps={"hci9": 2})
     device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
