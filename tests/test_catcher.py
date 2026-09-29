@@ -1126,6 +1126,37 @@ def test_pins_whose_cards_are_all_absent_refuse_the_same_way(env, monkeypatch):
     assert os.listdir(env.dir) == []
 
 
+def test_present_adapters_ignores_connection_objects_in_the_bluetooth_class(monkeypatch, tmp_path):
+    """dev 2026-09-29: /sys/class/bluetooth listed hci0, hci0:16 (an ACL
+    connection object) and hci2; startswith("hci") took hci0:16 for a card."""
+    for name in ("hci0", "hci0:16", "hci2", "rfkill0"):
+        (tmp_path / name).mkdir()
+    real_listdir = os.listdir
+    monkeypatch.setattr(catcher.os, "listdir", lambda path: real_listdir(tmp_path) if path == "/sys/class/bluetooth" else real_listdir(path))
+    assert catcher.present_adapters() == {"hci0", "hci2"}
+
+
+def test_the_absent_warning_names_dead_cards_as_dead(env, monkeypatch, caplog):
+    """dev 2026-09-29 00:42:45Z: "present: hci2", the DOWN all-zero onboard
+    UART, as if a placement could use it. Live cards first; dead ones named
+    as dead."""
+    env.install(adapters=("00:01:95:C3:C0:F6",))
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci0", "hci2"})
+    monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
+    monkeypatch.setattr(catcher.recovery, "adapter_mac", lambda a: "8A:88:4B:E3:48:F7" if a == "hci0" else catcher.recovery.UNKNOWN_MAC)
+    monkeypatch.setattr(catcher, "_responsive_adapters", lambda usable: [a for a in usable if a == "hci0"])
+
+    async def scenario():
+        client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+        await client.connect()
+        await client.disconnect()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    line = next(r.getMessage() for r in caplog.records if "NONE of its configured adapters" in r.getMessage())
+    assert "present: hci0; dead (all-zero MAC): hci2" in line, line
+
+
 def test_by_default_a_pool_whose_cards_are_all_absent_warns_once_and_falls_back_with_a_claim(env, monkeypatch, caplog):
     """Clint, 2026-09-19: "If the mac doesn't resolve, we should warn loudly
     and then fallback to any available adapter ... that should be the
@@ -1137,6 +1168,7 @@ def test_by_default_a_pool_whose_cards_are_all_absent_warns_once_and_falls_back_
     monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci8"})
     monkeypatch.setattr(catcher, "_resolve_entries", lambda entries: [])
     monkeypatch.setattr(catcher, "_responsive_adapters", lambda usable: usable)
+    monkeypatch.setattr(catcher.recovery, "adapter_mac", lambda a: "00:01:95:00:00:08")   # hci8 is a live card
 
     async def scenario():
         for _ in range(2):

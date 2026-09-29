@@ -778,7 +778,10 @@ def present_adapters():
     fallback, for parity with the dbus-serialbattery fork's production code.
     """
     try:
-        names = {name for name in os.listdir("/sys/class/bluetooth") if name.startswith("hci")}
+        # adapters only: the class also lists connection objects as
+        # "hciN:<handle>" (dev 2026-09-29: hci0:16 beside hci0), which
+        # startswith("hci") accepted as a card name
+        names = {name for name in os.listdir("/sys/class/bluetooth") if re.fullmatch(r"hci\d+", name)}
     except OSError:
         names = set()
     if names:
@@ -1668,9 +1671,18 @@ def _warn_absent_once(address, entries, present, then):
     if key in _absent_warned:
         return
     _absent_warned.add(key)
+    # name the cards a placement could actually use, and the dead ones as
+    # dead: dev 2026-09-29 printed "present: hci2" for the DOWN all-zero
+    # onboard UART, which no placement would ever choose
+    ordered = sorted(present, key=_hci_sort_key)
+    live = [a for a in ordered if recovery.adapter_mac(a) != recovery.UNKNOWN_MAC]
+    dead = [a for a in ordered if a not in live]
+    shown = ", ".join(live) or "none"
+    if dead:
+        shown += f"; dead (all-zero MAC): {', '.join(dead)}"
     logger.warning(
         f"BLE [{address}]: NONE of its configured adapters ({', '.join(str(e) for e in entries)}) is "
-        f"present on this box (present: {', '.join(sorted(present, key=_hci_sort_key)) or 'none'}) - the "
+        f"present on this box (present: {shown}) - the "
         f"card was swapped, unplugged or renumbered away; {then}. Fix the pin or restore the card "
         f"(this warning repeats once per outage)"
     )
