@@ -878,6 +878,9 @@ _kernel_list_warned = set()
 # addresses warned about arriving bound to a card while none of their
 # configured cards exist (once per outage; cleared by a successful connect)
 _absent_warned = set()
+# addresses whose stale binding (a BlueZ path on a card no longer in sysfs)
+# was discarded; once per outage, cleared by a successful connect
+_stale_binding_warned = set()
 
 
 def _kernel_lists_hold(adapter, address):
@@ -966,6 +969,7 @@ def _connect_finished(adapter, address, connected):
             # the outage is over only when a configured card is back; a
             # connect on the fallback card is the outage continuing
             _absent_warned.discard(key[1])
+        _stale_binding_warned.discard(key[1])
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
         # a failed connect is also the moment a connect-only consumer
@@ -2257,6 +2261,29 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         adapter = None
         requested = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
         bound = _device_path_adapter(address_or_ble_device)
+        if bound:
+            present_now = present_adapters()
+            if present_now and bound not in present_now:
+                # A BlueZ path on a card the kernel no longer lists cannot be
+                # connected: bleak would call Connect on a ghost object and
+                # fail "device not found" every time. dev 2026-10-06 (running
+                # monitor): the RTL was pulled, the driver kept re-presenting
+                # its stale BLEDevice bound to hci3, and this branch claimed
+                # the nonexistent card 36 times in 6 minutes with four pinned
+                # cards present and UP. The binding is discarded: the bare
+                # address goes to bleak instead, placement runs by
+                # configuration as for any unresolved device, and bleak scans
+                # for the device on the card it is placed on.
+                key = _address_key(self._catcher_address)
+                if key not in _stale_binding_warned:
+                    _stale_binding_warned.add(key)
+                    logger.warning(
+                        f"BLE [{self._catcher_address}]: device arrived bound to {bound}, which no longer "
+                        f"exists on this box (present: {', '.join(sorted(present_now, key=_hci_sort_key))}) - "
+                        f"discarding the stale binding and placing by configuration (repeats once per outage)"
+                    )
+                address_or_ble_device = self._catcher_address
+                bound = None
         if bound and requested and claims.adapter_key(bound) != claims.adapter_key(requested):
             # The device already carries a BlueZ path, and bleak connects
             # via that path whatever adapter it is told - the adapter

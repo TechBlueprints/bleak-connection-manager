@@ -336,6 +336,7 @@ def env(tmp_path, monkeypatch):
     catcher._not_found_streaks.clear()
     catcher._kernel_list_warned.clear()
     catcher._absent_warned.clear()
+    catcher._stale_binding_warned.clear()
     catcher._connect_failures.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
@@ -1290,6 +1291,54 @@ def test_under_pin_strict_a_device_bound_outside_its_configured_cards_is_refused
     assert os.listdir(env.dir) == []
     lines = [r.getMessage() for r in caplog.records if "OUTSIDE its configured adapters" in r.getMessage()]
     assert len(lines) == 1 and "pin_strict is set" in lines[0], lines
+
+
+def test_a_binding_to_a_card_the_kernel_no_longer_lists_is_discarded_and_placed_by_configuration(env, monkeypatch, caplog):
+    """dev 2026-10-06 (running monitor): the RTL was pulled, hci3 left sysfs,
+    the driver kept re-presenting its stale BLEDevice bound to
+    /org/bluez/hci3, and the catcher claimed the nonexistent card 36 times
+    in 6 minutes while four pinned cards sat present and UP - each connect
+    then failing "device not found" on the ghost object. A path on a card
+    that does not exist cannot be connected: discard it, hand bleak the
+    bare address, place by configuration, warn once per outage."""
+    env.install(adapters=("hci5",), link_caps={"hci5": 2})
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci5"})
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci3/dev_C8_47_8C_00_00_00"})
+
+    async def scenario():
+        # two attempts that fail on the radio, then one that succeeds: one
+        # outage, one warning (a success ends the outage and re-arms it)
+        for _ in range(2):
+            CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+            client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+            with pytest.raises(RuntimeError):
+                await client.connect()
+        client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+        await client.connect()
+        claimed = os.listdir(env.dir)
+        await client.disconnect()
+        return claimed
+
+    with caplog.at_level(logging.WARNING):
+        claimed = asyncio.run(scenario())
+    assert RECORDED_INITS[-1]["adapter"] == "hci5"             # placed on the pin, bleak scans there
+    assert RECORDED_INITS[-1]["address"] == ADDRESS            # bare address, not the ghost path
+    assert any(n.startswith("hci5.") for n in claimed) and not any(n.startswith("hci3.") for n in claimed), claimed
+    lines = [r.getMessage() for r in caplog.records if "no longer exists on this box" in r.getMessage()]
+    assert len(lines) == 1 and "bound to hci3" in lines[0] and "present: hci5" in lines[0], lines
+    assert "OUTSIDE its configured adapters" not in caplog.text   # the stale path never reached that arm
+
+
+def test_a_binding_to_a_present_card_is_kept_when_sysfs_is_unreadable(env, monkeypatch):
+    """No kernel answer is no evidence: an empty present set must not
+    discard a binding."""
+    env.install(adapters=("hci5",), link_caps={"hci9": 2})
+    monkeypatch.setattr(catcher, "present_adapters", lambda: set())
+    device = types.SimpleNamespace(address=ADDRESS, details={"path": "/org/bluez/hci9/dev_C8_47_8C_00_00_00"})
+    client = sys.modules["bleak"].BleakClient(device, _is_retry_client=True)
+    asyncio.run(client.connect())
+    assert "hci9.link.0" in os.listdir(env.dir)
+    asyncio.run(client.disconnect())
 
 
 def test_a_device_bound_outside_its_configured_cards_is_claimed_there_and_named(env, caplog):
