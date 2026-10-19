@@ -925,8 +925,11 @@ def _bluez_has_object(adapter, address):
 
 
 def _device_not_found(adapter, address):
-    """A connect-by-address that found nothing: count the streak and, at the
-    threshold, check the kernel lists once and say so."""
+    """A connect attempt that ended "not found" - whether the device came
+    from a scan or from BlueZ's cache - counts toward the streak; at the
+    threshold, check the kernel lists once and say so. (The log line said
+    "consecutive scans" until 2026-10-19: prod's CS pack showed those were
+    cache-path connects, zero scans.)"""
     if not adapter:
         return
     key = (claims.adapter_key(adapter), _address_key(address))
@@ -942,7 +945,7 @@ def _device_not_found(adapter, address):
         return
     _kernel_list_warned.add(key)
     logger.warning(
-        f"BLE [{address}]: not found by {n} consecutive scans on {adapter}, and the kernel's "
+        f"BLE [{address}]: not found on {n} consecutive connect attempts on {adapter}, and the kernel's "
         f"{where} for {adapter} holds this address with no BlueZ device object for it. Either a "
         f"stale auto-connect entry left behind when BlueZ removed the device (the controller then "
         f"consumes this device's advertisements before discovery can see them; clear it with a "
