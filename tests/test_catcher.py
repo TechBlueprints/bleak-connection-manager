@@ -1331,10 +1331,41 @@ def test_the_shared_bluez_default_no_longer_pins_every_scanner_to_the_first_adap
     assert Hardened.__init__ is _Bleak302Shim.__init__
 
 
-def test_install_hardens_the_original_bleak_classes_and_uninstall_restores_them(env):
+def test_the_vendored_bleak_still_carries_the_shared_bluez_default_bug():
+    """TRIPWIRE for hbldh/bleak#2028. Fails the day ext/upstream/bleak is
+    bumped to a release that builds a fresh dict instead of writing into
+    the shared default. When it fails: remove the workaround (catcher's
+    REMOVE WHEN block around _harden_bluez_default) and its tests, then
+    delete this test."""
+    path = os.path.join(os.path.dirname(__file__), "..", "ext", "upstream", "bleak", "bleak", "__init__.py")
+    source = open(path).read()
+    assert "bluez: BlueZScannerArgs = {}" in source and "bluez: BlueZClientArgs = {}" in source
+    assert len(catcher._BLUEZ_INPLACE_WRITE.findall(source)) == 2, (
+        "the vendored bleak no longer writes the adapter keyword into its shared bluez default: "
+        "hbldh/bleak#2028 has landed - remove BCM's _harden_bluez_default workaround")
+
+
+def test_a_bleak_that_no_longer_writes_its_default_is_left_alone_and_says_so_once(caplog):
+    """The runtime tripwire: on a fixed bleak the hardening does nothing and
+    logs one INFO line naming the workaround as removable."""
+    class Fixed:
+        def __init__(self, *args, bluez={}, **kwargs):  # noqa: B006 - mirrors upstream's signature
+            bluez = {"adapter": kwargs.get("adapter"), **bluez}
+    original = Fixed.__init__
+    catcher._bluez_idle_noted = False
+    with caplog.at_level(logging.INFO):
+        catcher._harden_bluez_default(Fixed)
+        catcher._harden_bluez_default(type("Fixed2", (), {"__init__": Fixed.__dict__["__init__"]}))
+    assert Fixed.__init__ is original and Fixed not in catcher._bluez_hardened
+    assert caplog.text.count("workaround is idle and can be removed") == 1
+
+
+def test_install_hardens_the_original_bleak_classes_and_uninstall_restores_them(env, monkeypatch):
     """It must reach consumers whose scanners never pass through BCM's
     wrapper (the packs run wrap_scanner=False), so it applies to the
-    ORIGINAL classes, and it must be undone cleanly."""
+    ORIGINAL classes, and it must be undone cleanly. (The test stubs carry
+    no bleak source, so the bug detector is told they are 3.0.2.)"""
+    monkeypatch.setattr(catcher, "_bleak_mutates_shared_bluez", lambda init: True)
     scanner_cls, client_cls = catcher._ORIGINAL_BLEAK_SCANNER, catcher._ORIGINAL_BLEAK_CLIENT
     before = (scanner_cls.__dict__["__init__"], client_cls.__dict__["__init__"])
     env.install(adapters=("hci5",))

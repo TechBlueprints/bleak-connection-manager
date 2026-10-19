@@ -3502,10 +3502,38 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
 # on uninstall. Every call gets a fresh dict; the caller's bluez["adapter"]
 # wins over the keyword, as upstream; the keyword still reaches bleak, so
 # its warning and older backends that read it are unchanged.
+#
+# REMOVE WHEN: the bleak in use is a release that contains hbldh/bleak#2028
+# (the first release after 3.0.2 that carries the develop fix). Remove
+# _bluez_hardened, _bleak_mutates_shared_bluez, _harden_bluez_default,
+# _restore_bluez_default and their four calls in install_bleak_catcher /
+# uninstall_bleak_catcher, and the tests that exercise them. Two tripwires
+# say when: tests/test_catcher.py's test_the_vendored_bleak_still_carries_
+# the_shared_bluez_default_bug fails the day ext/upstream/bleak is bumped
+# to a fixed release, and at install this logs once at INFO, and does
+# nothing, when the bleak in the process no longer writes into its default.
 _bluez_hardened = {}
+_bluez_idle_noted = False
+
+# the in-place write the bug consists of: `bluez["adapter"] = ...` inside
+# the constructor, against the parameter whose default is the shared {}
+_BLUEZ_INPLACE_WRITE = re.compile(r"""bluez\[\s*["']adapter["']\s*\]\s*=""")
+
+
+def _bleak_mutates_shared_bluez(init):
+    """True when this constructor still writes into its bluez default in
+    place (bleak 3.0.2). Unreadable source counts as True: hardening is
+    harmless on a fixed bleak, a missed hardening is an outage."""
+    try:
+        source = inspect.getsource(init)
+    except (OSError, TypeError):
+        return True
+    return bool(_BLUEZ_INPLACE_WRITE.search(source))
 
 
 def _harden_bluez_default(cls):
+    # REMOVE WHEN the bleak in use contains hbldh/bleak#2028 (see above)
+    global _bluez_idle_noted
     if cls is None or cls in _bluez_hardened:
         return
     original = cls.__dict__.get("__init__")
@@ -3515,6 +3543,15 @@ def _harden_bluez_default(cls):
         if "bluez" not in inspect.signature(original).parameters:
             return
     except (TypeError, ValueError):
+        return
+    if not _bleak_mutates_shared_bluez(original):
+        if not _bluez_idle_noted:
+            _bluez_idle_noted = True
+            logger.info(
+                "bleak catcher: this bleak no longer writes the adapter keyword into its shared "
+                "bluez default (hbldh/bleak#2028 is in it) - the BCM workaround is idle and can be "
+                "removed (catcher._harden_bluez_default)"
+            )
         return
 
     @functools.wraps(original)
@@ -3530,6 +3567,7 @@ def _harden_bluez_default(cls):
 
 
 def _restore_bluez_default(cls):
+    # REMOVE WHEN the bleak in use contains hbldh/bleak#2028 (see above)
     original = _bluez_hardened.pop(cls, None)
     if original is not None:
         cls.__init__ = original
@@ -3645,6 +3683,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     _config.gatt_timeout = gatt_timeout
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
+    # REMOVE WHEN the bleak in use contains hbldh/bleak#2028
     _harden_bluez_default(_ORIGINAL_BLEAK_SCANNER)
     _harden_bluez_default(_ORIGINAL_BLEAK_CLIENT)
     bleak.BleakClient = BLEConnection
@@ -3660,6 +3699,7 @@ def uninstall_bleak_catcher():
     global _config
     import bleak
 
+    # REMOVE WHEN the bleak in use contains hbldh/bleak#2028
     _restore_bluez_default(_ORIGINAL_BLEAK_SCANNER)
     _restore_bluez_default(_ORIGINAL_BLEAK_CLIENT)
     bleak.BleakClient = _ORIGINAL_BLEAK_CLIENT
