@@ -337,6 +337,7 @@ def env(tmp_path, monkeypatch):
     catcher._kernel_list_warned.clear()
     catcher._absent_warned.clear()
     catcher._stale_binding_warned.clear()
+    catcher._request_honoured_warned.clear()
     catcher._connect_failures.clear()
     catcher._daemon_dead_at = None
     catcher._last_daemon_check = None
@@ -1291,6 +1292,104 @@ def test_under_pin_strict_a_device_bound_outside_its_configured_cards_is_refused
     assert os.listdir(env.dir) == []
     lines = [r.getMessage() for r in caplog.records if "OUTSIDE its configured adapters" in r.getMessage()]
     assert len(lines) == 1 and "pin_strict is set" in lines[0], lines
+
+
+class _Bleak302Shim:
+    """A faithful replica of bleak 3.0.2's BleakScanner.__init__ shim: the
+    mutable `bluez={}` default and the in-place `bluez["adapter"] =`."""
+    seen = []
+
+    def __init__(self, detection_callback=None, *, bluez={}, **kwargs):  # noqa: B006 - the bug under test
+        adapter = kwargs.get("adapter")
+        if adapter is not None and "adapter" not in bluez:
+            bluez["adapter"] = adapter
+        type(self).seen.append(bluez.get("adapter"))
+
+
+def test_the_shared_bluez_default_no_longer_pins_every_scanner_to_the_first_adapter():
+    """bleak 3.0.2 (hbldh/bleak#2028, fixed on develop, unreleased): asked
+    hci0, hci8, hci8, hci5, all four scanned hci0. Prod CS pack 2026-10-18/
+    19: asked hci8 for 18+ hours, discovered on hci0 every time."""
+    class Poisoned(_Bleak302Shim):
+        seen = []
+    for a in ("hci0", "hci8", "hci8", "hci5"):
+        Poisoned(adapter=a)
+    assert Poisoned.seen == ["hci0", "hci0", "hci0", "hci0"]          # the bug, reproduced
+
+    class Hardened(_Bleak302Shim):
+        seen = []
+        __init__ = _Bleak302Shim.__init__
+    catcher._harden_bluez_default(Hardened)
+    try:
+        for a in ("hci0", "hci8", "hci8", "hci5"):
+            Hardened(adapter=a)
+        Hardened(bluez={"adapter": "hci3"}, adapter="hci9")             # the caller's bluez wins, as upstream
+        Hardened()                                                      # no adapter: the shared default is never consulted
+        assert Hardened.seen == ["hci0", "hci8", "hci8", "hci5", "hci3", None]
+    finally:
+        catcher._restore_bluez_default(Hardened)
+    assert Hardened.__init__ is _Bleak302Shim.__init__
+
+
+def test_install_hardens_the_original_bleak_classes_and_uninstall_restores_them(env):
+    """It must reach consumers whose scanners never pass through BCM's
+    wrapper (the packs run wrap_scanner=False), so it applies to the
+    ORIGINAL classes, and it must be undone cleanly."""
+    scanner_cls, client_cls = catcher._ORIGINAL_BLEAK_SCANNER, catcher._ORIGINAL_BLEAK_CLIENT
+    before = (scanner_cls.__dict__["__init__"], client_cls.__dict__["__init__"])
+    env.install(adapters=("hci5",))
+    assert scanner_cls.__dict__["__init__"] is not before[0] and client_cls.__dict__["__init__"] is not before[1]
+    env.install(adapters=("hci5",))                                     # idempotent: no double wrap
+    assert catcher._bluez_hardened[scanner_cls] is before[0]
+    catcher.uninstall_bleak_catcher()
+    assert (scanner_cls.__dict__["__init__"], client_cls.__dict__["__init__"]) == before
+
+
+def test_a_not_connected_binding_to_another_card_yields_to_the_callers_present_card(env, monkeypatch, caplog):
+    """Prod 2026-10-18/19: the CS pack asked for hci8; its device object was
+    bound to hci0 (discovery ran there), NOT connected; the catcher followed
+    the binding 2,358 times into a controller failing every Create
+    Connection. A binding that is not a live link is a discovery artifact:
+    the caller's present card wins, bleak gets the bare address."""
+    env.install(adapters=("hci8", "hci0"), link_caps={"hci8": 2, "hci0": 2})
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci0", "hci8"})
+    device = types.SimpleNamespace(address=ADDRESS, details={
+        "path": "/org/bluez/hci0/dev_C8_47_8C_00_00_00", "props": {"Connected": False}})
+
+    async def scenario():
+        for _ in range(2):
+            CONNECT_RESULTS.append(RuntimeError("le-connection-abort-by-local"))
+            client = sys.modules["bleak"].BleakClient(device, bluez={"adapter": "hci8"}, _is_retry_client=True)
+            with pytest.raises(RuntimeError):
+                await client.connect()
+        client = sys.modules["bleak"].BleakClient(device, bluez={"adapter": "hci8"}, _is_retry_client=True)
+        await client.connect()
+        claimed = os.listdir(env.dir)
+        await client.disconnect()
+        return claimed
+
+    with caplog.at_level(logging.WARNING):
+        claimed = asyncio.run(scenario())
+    assert RECORDED_INITS[-1]["address"] == ADDRESS and RECORDED_INITS[-1]["adapter"] == "hci8"
+    assert "hci8.link.0" in claimed and not any(n.startswith("hci0.") for n in claimed), claimed
+    lines = [r.getMessage() for r in caplog.records if "where it is NOT connected" in r.getMessage()]
+    assert len(lines) == 1 and "honouring hci8" in lines[0], lines
+    assert "the link will be on hci0" not in caplog.text
+
+
+def test_a_connected_binding_on_another_card_is_still_followed(env, monkeypatch, caplog):
+    """ee25056 unchanged: brc swapped in BlueZ's CONNECTED copy, the link IS
+    on that card, the claim goes there."""
+    env.install(adapters=("hci8", "hci0"), link_caps={"hci8": 2, "hci0": 2})
+    monkeypatch.setattr(catcher, "present_adapters", lambda: {"hci0", "hci8"})
+    device = types.SimpleNamespace(address=ADDRESS, details={
+        "path": "/org/bluez/hci0/dev_C8_47_8C_00_00_00", "props": {"Connected": True}})
+    client = sys.modules["bleak"].BleakClient(device, bluez={"adapter": "hci8"}, _is_retry_client=True)
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(client.connect())
+    assert "hci0.link.0" in os.listdir(env.dir)
+    assert "the link will be on hci0" in caplog.text
+    asyncio.run(client.disconnect())
 
 
 def test_a_binding_to_a_card_the_kernel_no_longer_lists_is_discarded_and_placed_by_configuration(env, monkeypatch, caplog):

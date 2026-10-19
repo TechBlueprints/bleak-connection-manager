@@ -24,6 +24,7 @@ can never recurse into the wrapper.
 """
 
 import asyncio
+import functools
 import inspect
 import logging
 import os
@@ -881,6 +882,9 @@ _absent_warned = set()
 # addresses whose stale binding (a BlueZ path on a card no longer in sysfs)
 # was discarded; once per outage, cleared by a successful connect
 _stale_binding_warned = set()
+# addresses whose not-connected binding was overridden by the caller's
+# requested card (once per outage, cleared by a successful connect)
+_request_honoured_warned = set()
 
 
 def _kernel_lists_hold(adapter, address):
@@ -970,6 +974,7 @@ def _connect_finished(adapter, address, connected):
             # connect on the fallback card is the outage continuing
             _absent_warned.discard(key[1])
         _stale_binding_warned.discard(key[1])
+        _request_honoured_warned.discard(key[1])
     else:
         _connect_failures[key] = _connect_failures.get(key, 0) + 1
         # a failed connect is also the moment a connect-only consumer
@@ -1012,6 +1017,30 @@ def _link_ended(adapter, address, lived, ours):
 def _hci_sort_key(name):
     match = re.match(r"hci(\d+)$", name)
     return (0, int(match.group(1))) if match else (1, name)
+
+
+def _binding_connected(address_or_ble_device):
+    """Whether BlueZ reports the bound device object Connected: True,
+    False, or None when nothing says (never a guess). bleak's manager cache
+    first - it tracks PropertiesChanged - then the props snapshot the
+    BLEDevice was built from."""
+    details = getattr(address_or_ble_device, "details", None)
+    if not isinstance(details, dict):
+        return None
+    path = details.get("path")
+    try:
+        from bleak.backends.bluezdbus.manager import _global_instances
+
+        manager = _global_instances.get(asyncio.get_running_loop())
+        props = (getattr(manager, "_properties", None) or {}).get(path, {}).get("org.bluez.Device1")
+        if props is not None and "Connected" in props:
+            return bool(props["Connected"])
+    except Exception:
+        pass
+    snapshot = details.get("props")
+    if isinstance(snapshot, dict) and "Connected" in snapshot:
+        return bool(snapshot["Connected"])
+    return None
 
 
 def _device_path_adapter(address_or_ble_device):
@@ -2285,6 +2314,34 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 address_or_ble_device = self._catcher_address
                 bound = None
         if bound and requested and claims.adapter_key(bound) != claims.adapter_key(requested):
+            requested_hci = _resolve_adapter_entry(requested)
+            if (
+                _binding_connected(address_or_ble_device) is False
+                and requested_hci
+                and requested_hci in present_adapters()
+            ):
+                # The binding names a card where the device is NOT connected:
+                # a discovery artifact, not a link, so it carries no claim to
+                # "where the link will be" and the caller's present card
+                # wins. Prod 2026-10-18/19: the CS pack asked for hci8 every
+                # attempt, a poisoned scanner default (see
+                # _harden_bluez_default) ran discovery on hci0, the object
+                # landed there, this branch followed it 2,358 times, and
+                # every Create Connection on hci0 failed Connection Limit
+                # Exceeded against a ghost link in that controller. The
+                # adopted-link case this branch exists for (ee25056: brc
+                # swapped in BlueZ's CONNECTED copy) is unchanged.
+                key = _address_key(self._catcher_address)
+                if key not in _request_honoured_warned:
+                    _request_honoured_warned.add(key)
+                    logger.warning(
+                        f"BLE [{self._catcher_address}]: caller asked for {requested} but the device object "
+                        f"is bound to {bound}, where it is NOT connected - honouring {requested}; the binding "
+                        f"is a discovery artifact, not a link (repeats once per outage)"
+                    )
+                address_or_ble_device = self._catcher_address
+                bound = None
+        if bound and requested and claims.adapter_key(bound) != claims.adapter_key(requested):
             # The device already carries a BlueZ path, and bleak connects
             # via that path whatever adapter it is told - the adapter
             # argument is honoured only when bleak has to scan. So the
@@ -3426,6 +3483,55 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
+# bleak 3.0.2's BleakScanner and BleakClient declare `bluez: ...Args = {}`
+# and their deprecation shim for the old `adapter=` keyword writes it into
+# that dict in place - the ONE shared default object - only if it carries no
+# adapter yet. So the first scanner (or client) a process builds with a bare
+# `adapter=` fixes the adapter for every later one built without `bluez=`:
+# asked hci0, hci8, hci8, hci5, all four scanned hci0 (reproduced on the
+# vendored tree, 2026-10-19). Prod 2026-10-18/19: the CS pack driver asked
+# for hci8 on every attempt, every discovery ran on hci0, and its link was
+# down 18+ hours. Upstream hbldh/bleak#2028 fixes it on develop
+# (`bluez = {"adapter": adapter_kwarg, **bluez}`), unreleased. Until a
+# release carries it, BCM applies the same semantics to the ORIGINAL classes
+# at install - so the fix reaches consumers whose scanners never pass
+# through BCM's wrapper (wrap_scanner=False, the packs) - and puts them back
+# on uninstall. Every call gets a fresh dict; the caller's bluez["adapter"]
+# wins over the keyword, as upstream; the keyword still reaches bleak, so
+# its warning and older backends that read it are unchanged.
+_bluez_hardened = {}
+
+
+def _harden_bluez_default(cls):
+    if cls is None or cls in _bluez_hardened:
+        return
+    original = cls.__dict__.get("__init__")
+    if original is None:
+        return
+    try:
+        if "bluez" not in inspect.signature(original).parameters:
+            return
+    except (TypeError, ValueError):
+        return
+
+    @functools.wraps(original)
+    def __init__(self, *args, bluez=None, **kwargs):
+        merged = dict(bluez or {})
+        adapter = kwargs.get("adapter")
+        if adapter is not None:
+            merged.setdefault("adapter", adapter)
+        return original(self, *args, bluez=merged, **kwargs)
+
+    _bluez_hardened[cls] = original
+    cls.__init__ = __init__
+
+
+def _restore_bluez_default(cls):
+    original = _bluez_hardened.pop(cls, None)
+    if original is not None:
+        cls.__init__ = original
+
+
 def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None, gatt_timeout=GATT_OP_TIMEOUT, allowed_devices=None, force_start_notify=None, kernel_list_check=True, pin_strict=False):
     """Route every bleak client in this process through the catcher.
 
@@ -3536,6 +3642,8 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     _config.gatt_timeout = gatt_timeout
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
+    _harden_bluez_default(_ORIGINAL_BLEAK_SCANNER)
+    _harden_bluez_default(_ORIGINAL_BLEAK_CLIENT)
     bleak.BleakClient = BLEConnection
     bleak.BleakScanner = BLEScanner if wrap_scanner else _ORIGINAL_BLEAK_SCANNER
     if _brc_module is not None:
@@ -3549,6 +3657,8 @@ def uninstall_bleak_catcher():
     global _config
     import bleak
 
+    _restore_bluez_default(_ORIGINAL_BLEAK_SCANNER)
+    _restore_bluez_default(_ORIGINAL_BLEAK_CLIENT)
     bleak.BleakClient = _ORIGINAL_BLEAK_CLIENT
     bleak.BleakScanner = _ORIGINAL_BLEAK_SCANNER
     if _brc_module is not None:
