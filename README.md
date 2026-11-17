@@ -143,9 +143,12 @@ adapter-bound, hard-claiming scanner. At `start()` it ranks the shared pool
 (or, with no pool, the union of pinned adapters) by live occupancy — fewest
 soft claims plus held link slots first — skips cards another live process is
 scanning on, and takes the winner's exclusive `hciN.scan` claim, held per
-scan activity: released at `stop()` or on a failed start. When every card is
-claimed it scans on the best-ranked one anyway, unclaimed. A caller-chosen
-adapter is never overridden (its claim is still taken, best effort). Opt-in
+scan activity: released at `stop()` or on a failed start. The claim is a
+gate, not a hint (convention 0.5): a scanner never scans on a card it does not
+hold. When every card is claimed it waits in a queue (`<MAC>.scanwait.*`
+tickets, shortest queue first, oldest ticket first) for one to free, up to
+30s, then raises `ScanSlotWaitTimeout` naming the holders. A caller-chosen
+adapter is never overridden: the scanner waits on that card alone. Opt-in
 because it changes which adapter unrelated code scans on.
 
 A wrapped scanner also carries habluetooth's watchdog: checked every 30s,
@@ -155,15 +158,16 @@ hardware reset**. Empty advertisements don't count as signs of life.
 
 A reset kills every link on the card, so it is never sprung on the card's
 other users. The resetter takes the adapter's exclusive `hciN.drain` claim
-(convention 0.3): placement in every participating process steers new work
-elsewhere, and each process's drain watcher — run on its claim heartbeat —
-disconnects its own clients on the card *when they have somewhere else to
-go*, letting their retry loops reconnect on another adapter. A holder that
-cannot move (its only working card, an operator pin, a caller-chosen
-explicit adapter) stays put, and its live claims veto the reset: the
-resetter waits up to `drain_timeout` (default 60s) for the card to empty
-and gives up rather than pulling it out from under a holder. `force` skips
-every gate, for an operator who knows the card is dead.
+(convention 0.3, a gate since 0.5): placement in every participating process
+refuses to put new work on the card (a scan waits in the queue; a connect
+raises the "connection slot" error bleak-retry-connector backs off on), and
+each process's drain watcher — run on its claim heartbeat — disconnects its
+own clients on the card *when they have somewhere else to go*, letting their
+retry loops reconnect on another adapter. The reset only proceeds from a card
+that is completely empty: any live claim at the deadline, foreign or the
+resetter's own, vetoes it. The resetter waits up to `drain_timeout` (default
+60s) and gives up rather than pulling the card out from under a holder.
+`force` does not skip this veto.
 
 The reset primitive itself is native and stdlib-only — rfkill unblock,
 `HCIDEVDOWN`/`HCIDEVUP` bounce over a raw `AF_BLUETOOTH` socket, and
@@ -183,7 +187,8 @@ bleak's cached D-Bus manager state is invalidated so the next connect
 rebuilds from `GetManagedObjects`. `reset_adapter(adapter,
 claims_manager=None, force=False, gone_silent=False,
 drain_timeout=DRAIN_TIMEOUT)` is exported for consumers' own recovery
-paths; `drain_timeout=0` is the old immediate foreign-claims gate.
+paths; `drain_timeout=0` is an immediate gate: no waiting, and any live claim,
+foreign or our own, refuses the reset.
 
 ## Connection parameters
 
@@ -277,7 +282,12 @@ claim keyed by number can come to name a different radio than its writer
 meant. Kinds: `<MAC>.scan` (hard, exclusive), `<MAC>.use.<owner>[.<qualifier>]`
 (soft, ranks placement), `<MAC>.link.<k>` (numbered exclusive slots),
 `<MAC>.drain` (exclusive: "this card is about to be reset — place elsewhere,
-and move your links off it if you can"). Readers canonicalize pre-0.4 `hciN.*`
+and move your links off it if you can"), and, from 0.5,
+`<MAC>.scanwait.<owner>-<pid>-<seq>` (a queue ticket: claims nothing, only
+publishes who is waiting for the scan claim). The exclusive `.scan` and
+`.drain` names are hardlinks to the holder's own
+`<MAC>.<kind>.holder.<owner>-<pid>-<seq>` file, which says who holds the card
+and why; ownership is the shared inode. Readers canonicalize pre-0.4 `hciN.*`
 files, and exclusive claims check the legacy name before taking one, so a
 fleet mid-upgrade cannot double-book a slot.
 
@@ -442,7 +452,7 @@ itself has soaked on the fleet.
 | Name | Purpose |
 | --- | --- |
 | `install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir="/run/bt-claims", wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None)` | Rebind `bleak.BleakClient` and, when importable, `bleak_retry_connector.BleakClient` / `.BleakClientWithServiceCache`; with `wrap_scanner=True`, also `bleak.BleakScanner`. Idempotent. The pid is appended to `owner` in claim files. |
-| `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT)` | Drain-coordinated hardware reset, stdlib-native (the `recovery` extra is optional and preferred when installed). Takes the `hciN.drain` claim, waits for holders to migrate, refuses if foreign claims remain at the deadline; `drain_timeout=0` is an immediate foreign-claims gate. |
+| `reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT)` | Drain-coordinated hardware reset, stdlib-native (the `recovery` extra is optional and preferred when installed). Takes the `hciN.drain` claim, waits for holders to migrate, refuses if any live claim, foreign or our own, remains at the deadline (`force` does not override this); `drain_timeout=0` is an immediate gate. |
 | `uninstall_bleak_catcher()` | Restore the originals and release all held claims. |
 | `BLEConnection` | The wrapper client (subclass of `BleakClient`, deferred init, routes at `connect()`). |
 | `BLEConnectionWithServiceCache` | Adds bleak-retry-connector's service-cache surface (`set_cached_services` no-op, guarded `clear_cache`). |
