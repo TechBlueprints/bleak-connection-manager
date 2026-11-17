@@ -1,7 +1,7 @@
 # Scan-claim detail: declaring what a passive scan listens for
 
 **Status: UNIMPLEMENTED proposal.** Nothing described here exists in the code.
-Tracking issue: see the link at the bottom (filled in when filed).
+Tracking issue: https://github.com/TechBlueprints/bleak-connection-manager/issues/2
 
 ## Problem
 
